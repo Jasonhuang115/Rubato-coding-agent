@@ -1,0 +1,201 @@
+// ============================================================
+// Core type definitions — shared across all modules
+// ============================================================
+
+// ---- Message types (Anthropic-compatible format) ----
+
+export type TextBlock = {
+  type: "text";
+  text: string;
+};
+
+export type ToolUseBlock = {
+  type: "tool_use";
+  id: string;
+  name: string;
+  input: Record<string, unknown>;
+};
+
+export type ToolResultBlock = {
+  type: "tool_result";
+  tool_use_id: string;
+  content: string;
+  is_error?: boolean;
+};
+
+export type ContentBlock = TextBlock | ToolUseBlock | ToolResultBlock;
+
+export type Message = {
+  role: "user" | "assistant";
+  content: string | ContentBlock[];
+};
+
+// ---- Tool system ----
+
+export type ToolType = "read" | "write";
+
+export interface ToolDefinition {
+  name: string;
+  description: string;
+  inputSchema: {
+    type: "object";
+    properties: Record<string, unknown>;
+    required?: string[];
+  };
+  type: ToolType;
+  requiresApproval?: boolean;
+  handler: (input: Record<string, unknown>, ctx: AgentContext) => Promise<ToolResult>;
+  isConcurrencySafe?: boolean; // true = 可并行（Read/Grep/Glob）
+}
+
+export interface ToolResult {
+  content: string;
+  isError?: boolean;
+}
+
+// ---- Agent context (passed to every tool) ----
+
+export interface AgentContext {
+  workingDir: string;
+  sessionId: string;
+  readGuard: ReadGuardState;
+  permissionManager: PermissionManager;
+  config: AgentConfig;
+}
+
+export interface ReadGuardState {
+  hasRead(filePath: string): boolean;
+  markAsRead(filePath: string, content: string): void;
+  serialize(): ReadGuardSnapshot;
+}
+
+export interface ReadGuardSnapshot {
+  files: Record<string, { timestamp: number; hash: string }>;
+}
+
+export interface PermissionManager {
+  check(toolName: string, input: Record<string, unknown>): PermissionResult;
+}
+
+export type PermissionResult =
+  | { allowed: true }
+  | { allowed: false; reason: string; mode: "confirm" | "manual" };
+
+// ---- Agent config ----
+
+export interface AgentConfig {
+  model: {
+    provider: string;       // "deepseek" | "openai" | "anthropic"
+    model: string;          // "deepseek-chat" | "claude-sonnet-4-20250514" | ...
+    baseURL?: string;       // 自定义 API 端点
+    apiKey?: string;        // 覆盖环境变量
+    maxRetries?: number;
+  };
+  permissions: {
+    bash: PermissionMode;
+    read: PermissionMode;
+    write: PermissionMode;
+    edit: PermissionMode;
+    web: PermissionMode;
+    rules?: PermissionRule[];
+  };
+  embedding: {
+    source: "local_onnx" | "api";
+    model?: string;
+  };
+  mnemosyne: {
+    bootstrap_on_first_open: boolean;
+    bootstrap_max_files: number;
+  };
+  session: {
+    cleanupPeriodDays: number;
+  };
+}
+
+export type PermissionMode = "auto" | "confirm" | "manual";
+
+export interface PermissionRule {
+  tool: string;
+  pattern: string;
+  action: "allow" | "deny" | "ask";
+}
+
+// ---- Model Provider ----
+
+export interface ChatParams {
+  model: string;
+  system: string;
+  messages: Message[];
+  tools: ToolDefinition[];
+  maxTokens: number;
+  signal?: AbortSignal;
+}
+
+export type StreamEvent =
+  | { type: "text_delta"; text: string }
+  | { type: "thinking_delta"; text: string }
+  | { type: "tool_use_start"; id: string; name: string }
+  | { type: "tool_use_delta"; id: string; partialJson: string }
+  | { type: "tool_use_end"; id: string; input: Record<string, unknown> }
+  | { type: "content_block_stop"; index: number }
+  | { type: "message_stop"; stopReason: "end_turn" | "tool_use" | "max_tokens"; usage: TokenUsage }
+  | { type: "error"; message: string; retryable: boolean };
+
+export interface TokenUsage {
+  inputTokens: number;
+  outputTokens: number;
+}
+
+export interface ModelProvider {
+  readonly name: string;
+  chat(params: ChatParams): AsyncIterable<StreamEvent>;
+  supportsPromptCaching(): boolean;
+  countTokens(messages: Message[], system: string): Promise<number>;
+}
+
+// ---- Context Source ----
+
+export interface ContextBlock {
+  content: string;
+  priority: number;
+  source: string;
+}
+
+export interface ContextSource {
+  readonly name: string;
+  readonly priority: number;
+  fetch(query: string, ctx: AgentContext): Promise<ContextBlock | null>;
+}
+
+// ---- Stream Renderer ----
+
+export interface StreamRenderer {
+  renderUserMessage(text: string): void;
+  renderAssistantMessage(text: string): void;
+  renderThinking(text: string): void;
+  renderSystemMessage(text: string): void;
+  renderToolUse(tool: string, input: unknown): void;
+  renderToolResult(result: string): void;
+  renderError(error: string): void;
+  renderWarning(warning: string): void;
+  clear(): void;
+}
+
+// ---- Session ----
+
+export interface SessionMeta {
+  id: string;
+  timestamp: number;
+  model: string;
+  totalTokens: number;
+  duration: number;
+  branch: string;
+  fileHistory: string[];
+  summary?: string;
+}
+
+export interface SessionRecord {
+  type: "session_meta" | "message" | "tool_event" | "compaction";
+  timestamp: number;
+  data: unknown;
+}
