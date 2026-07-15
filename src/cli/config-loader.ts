@@ -3,7 +3,7 @@
 import fs from "fs";
 import path from "path";
 import YAML from "yaml";
-import type { AgentConfig } from "../core-types.js";
+import type { AgentConfig, Tempo } from "../core-types.js";
 import { DEFAULT_PERMISSIONS } from "../permissions/config.js";
 
 const CONFIG_FILE_NAMES = [
@@ -134,6 +134,7 @@ export function loadConfig(workingDir: string): AgentConfig {
         fileConfig.model?.apiKey,
       maxRetries: fileConfig.model?.maxRetries ?? 3,
     },
+    tempo: (process.env.RUBATO_TEMPO as Tempo) ?? (fileConfig.tempo as Tempo) ?? "andante",
     permissions: {
       ...DEFAULT_PERMISSIONS,
       ...fileConfig.permissions,

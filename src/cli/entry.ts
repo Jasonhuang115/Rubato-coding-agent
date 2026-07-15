@@ -152,6 +152,50 @@ Config:
 `);
 }
 
+// ---- Tempo command handler ----
+
+function handleTempoCommand(input: string, pm: PlanManager): void {
+  const args = input.split(/\s+/).slice(1);
+  const validTempos = ["presto", "andante", "adagio", "grave"];
+
+  if (args.length === 0) {
+    const cfg = pm.getGrillMeConfig();
+    console.log(`\n  🎵 当前 Tempo：${process.env.RUBATO_TEMPO ?? "andante"}`);
+    console.log(`     Grill Me：${cfg.enabled ? "🟢" : "🔴"} ${cfg.sensitivity}`);
+    console.log("");
+    console.log("  可用级别：");
+    console.log("  presto  ⚡ 急板 — 最快，跳过 plan，直接写代码");
+    console.log("  andante 🚶 行板 — 默认，平衡速度与审慎");
+    console.log("  adagio  🐢 柔板 — 凡事都先 plan 再执行");
+    console.log("  grave   🏛️  庄板 — 极致审慎，自我质疑 + 对立审查");
+    return;
+  }
+
+  const level = args[0].toLowerCase();
+  if (!validTempos.includes(level)) {
+    console.log(`\n  无效 Tempo：「${level}」。可选：presto / andante / adagio / grave`);
+    return;
+  }
+
+  process.env.RUBATO_TEMPO = level;
+  console.log(`\n  🎵 Tempo 已设为：${level}`);
+
+  // Auto-adjust Grill Me sensitivity
+  if (level === "presto") {
+    pm.setGrillMeSensitivity("loose");
+    console.log("  → Grill Me 自动设为：loose");
+  } else if (level === "adagio") {
+    pm.setGrillMeSensitivity("strict");
+    console.log("  → Grill Me 自动设为：strict");
+  } else if (level === "grave") {
+    pm.setGrillMeSensitivity("strict");
+    console.log("  → Grill Me 自动设为：strict");
+  } else {
+    pm.setGrillMeSensitivity("normal");
+    console.log("  → Grill Me 自动设为：normal");
+  }
+}
+
 // ---- Git command handler ----
 
 async function handleGitCommand(input: string, workdir: string): Promise<void> {
@@ -317,6 +361,8 @@ function createRepl(
           console.log("  /plan done        — Mark plan as completed");
           console.log("  /grillme on/off   — Toggle Grill Me tracking");
           console.log("  /grillme strict|normal|loose — Set sensitivity");
+          console.log("  /tempo            — Show current effort level");
+          console.log("  /tempo presto|andante|adagio|grave — Set effort");
           console.log("  /git              — Show current git status");
           console.log("  /git health       — Show branch health summary");
           console.log("  /journal search <q> — Search personal knowledge base");
@@ -330,6 +376,9 @@ function createRepl(
           resolve(createRepl(rl, planManager, workdir)());
         } else if (trimmed.startsWith("/grillme")) {
           handleGrillMeCommand(trimmed, planManager);
+          resolve(createRepl(rl, planManager, workdir)());
+        } else if (trimmed.startsWith("/tempo")) {
+          handleTempoCommand(trimmed, planManager);
           resolve(createRepl(rl, planManager, workdir)());
         } else if (trimmed.startsWith("/git")) {
           handleGitCommand(trimmed, workdir);
