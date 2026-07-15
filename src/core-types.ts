@@ -61,6 +61,14 @@ export interface AgentContext {
   readGuard: ReadGuardState;
   permissionManager: PermissionManager;
   config: AgentConfig;
+  planManager?: PlanManager;
+}
+
+export interface PlanManager {
+  getActivePlan(): { title: string; status: string; goal: string } | null;
+  getPlanSummary(): string;
+  onUserMessage(message: string): string | null;
+  onToolCall(toolName: string, input: Record<string, unknown>): string | null;
 }
 
 export interface ReadGuardState {
@@ -179,6 +187,7 @@ export interface StreamRenderer {
   renderError(error: string): void;
   renderWarning(warning: string): void;
   clear(): void;
+  flush(): void;
 }
 
 // ---- Session ----

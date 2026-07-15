@@ -20,12 +20,16 @@ import { ContextChain } from "../context/sources.js";
 import { ClaudeMdSource } from "../context/claude-md.js";
 import { MemoryMdSource } from "../context/memory-md.js";
 import { GitStatusSource } from "../context/git-status.js";
+import { MnemosyneSource } from "../context/mnemosyne-source.js";
 import { buildSystemPrompt } from "../context/system-prompt.js";
 import { microCompact } from "../context/compression.js";
 import { PolicyEngine } from "../permissions/policy.js";
 import { ReadGuard } from "./read-guard.js";
 import { SessionStore } from "../session/storage.js";
 import { createSessionMeta, finalizeSessionMeta } from "../session/meta.js";
+import { PlanManager } from "../plan/manager.js";
+import { sessionStartRecall } from "../journal/recall.js";
+import { persistKnowledge } from "../journal/extractor.js";
 
 // ---- Configuration constants ----
 
@@ -49,7 +53,8 @@ export type AgentEvent =
   | { type: "turn_start"; turn: number }
   | { type: "turn_end"; turn: number; usage?: { input: number; output: number } }
   | { type: "done"; reason: string }
-  | { type: "compacting"; reason: string };
+  | { type: "compacting"; reason: string }
+  | { type: "waiting_for_input" };
 
 // ---- Main loop ----
 
@@ -59,6 +64,10 @@ export interface AgentLoopOptions {
   prompt: string;
   renderer: StreamRenderer;
   sessionId?: string;
+  /** If set, the agent enters interactive mode: when it finishes a turn,
+   *  it calls this callback to get the next user message instead of exiting.
+   *  Return empty string or null to end the session. */
+  getNextUserMessage?: () => Promise<string | null>;
 }
 
 export async function* agentLoop(
@@ -82,10 +91,14 @@ export async function* agentLoop(
     undefined
   );
 
+  // ---- Plan Manager ----
+  const planManager = new PlanManager(workingDir);
+
   // Build context chain
   const contextChain = new ContextChain();
   contextChain.register(new ClaudeMdSource());
   contextChain.register(new MemoryMdSource());
+  contextChain.register(new MnemosyneSource());
   contextChain.register(new GitStatusSource());
 
   // Agent context passed to every tool
@@ -95,6 +108,7 @@ export async function* agentLoop(
     readGuard,
     permissionManager,
     config,
+    planManager,
   };
 
   // ---- Build messages ----
@@ -102,8 +116,12 @@ export async function* agentLoop(
   const contextBlocks = await contextChain.fetchAll(prompt, ctx);
   const contextText = contextBlocks.map((b) => b.content).join("\n\n");
 
+  // Journal recall: inject relevant past knowledge
+  const journalRecall = sessionStartRecall(workingDir);
+
   const systemPrompt = buildSystemPrompt(ctx, tools) +
-    (contextText ? `\n\n## Project Context\n${contextText}` : "");
+    (contextText ? `\n\n## Project Context\n${contextText}` : "") +
+    (journalRecall ? `\n\n${journalRecall}` : "");
 
   const messages: Message[] = [
     { role: "user", content: prompt },
@@ -235,6 +253,26 @@ export async function* agentLoop(
 
     // ---- End turn? ----
     if (stopReason === "end_turn" || toolUses.length === 0) {
+      // Interactive mode: wait for more user input
+      if (options.getNextUserMessage) {
+        yield { type: "waiting_for_input" };
+        const nextMessage = await options.getNextUserMessage();
+        if (!nextMessage || !nextMessage.trim()) {
+          yield { type: "done", reason: "user_exit" };
+          break;
+        }
+        // Grill Me: check deviation
+        const deviationWarning = planManager.onUserMessage(nextMessage.trim());
+        if (deviationWarning) {
+          yield { type: "warning", message: deviationWarning };
+        }
+
+        messages.push({ role: "user", content: nextMessage.trim() });
+        sessionStore.writeMessage({ role: "user", content: nextMessage.trim() });
+        renderer.renderUserMessage(nextMessage.trim());
+        continue;
+      }
+      // Non-interactive mode: exit after first turn
       yield { type: "done", reason: stopReason };
       break;
     }
@@ -293,8 +331,12 @@ export async function* agentLoop(
       }
     }
 
-    // Execute write tools serially
+    // Execute write tools serially (with deviation check)
     for (const tu of writeCalls) {
+      const toolWarning = planManager.onToolCall(tu.name, tu.input);
+      if (toolWarning) {
+        yield { type: "warning", message: toolWarning };
+      }
       const result = await executeToolCall(tu, permissionManager, ctx, renderer);
       yield {
         type: "tool_result",
@@ -325,6 +367,16 @@ export async function* agentLoop(
   }
 
   // ---- Finalize ----
+  // Extract knowledge from this session into the journal (background, don't block)
+  try {
+    const extracted = persistKnowledge(messages, sessionId, workingDir);
+    if (extracted.saved > 0) {
+      yield { type: "warning", message: `📓 从本次对话中提取了 ${extracted.saved} 条知识到 Personal Tech Journal。` };
+    }
+  } catch {
+    // Journal extraction is best-effort
+  }
+
   sessionMeta = finalizeSessionMeta(sessionMeta);
   sessionStore.writeMeta(sessionMeta);
   sessionStore.close();
@@ -418,6 +470,9 @@ async function processStream(
         throw new Error(event.message);
     }
   }
+
+  // Flush any pending output
+  renderer.flush();
 
   return { text, toolUses, usage, stopReason };
 }
