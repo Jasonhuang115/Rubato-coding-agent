@@ -91,8 +91,6 @@ export type PermissionResult =
 
 // ---- Agent config ----
 
-export type Tempo = "presto" | "andante" | "adagio" | "grave";
-
 export interface AgentConfig {
   model: {
     provider: string;       // "deepseek" | "openai" | "anthropic"
@@ -101,7 +99,6 @@ export interface AgentConfig {
     apiKey?: string;        // 覆盖环境变量
     maxRetries?: number;
   };
-  tempo: Tempo;
   permissions: {
     bash: PermissionMode;
     read: PermissionMode;
