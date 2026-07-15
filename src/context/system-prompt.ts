@@ -11,7 +11,6 @@ export function buildSystemPrompt(
 
   return [
     identity(),
-    tempoGuidance(ctx),
     security(),
     confidentiality(),
     behaviorGuidelines(),
@@ -43,57 +42,7 @@ function identity(): string {
 }
 
 // ================================================================
-// 2. Tempo — Effort Level
-// ================================================================
-
-function tempoGuidance(ctx: AgentContext): string {
-  const tempo = ctx.config.tempo ?? "andante";
-
-  const instructions: Record<string, string> = {
-    presto: `## Tempo: Presto (急板 — minimum effort)
-
-You are in PRESTO mode. Be fast and decisive:
-- Skip the planning phase entirely. If the task is clear, just do it.
-- Don't ask clarifying questions unless the request is genuinely ambiguous.
-- One-shot answers. No back-and-forth.
-- Prefer writing code directly over explaining first.
-- Still apply Grill Me for obvious deviations, but don't be chatty about it.`,
-
-    andante: `## Tempo: Andante (行板 — balanced, default)
-
-You are in ANDANTE mode. Move at a steady, thoughtful pace:
-- For simple tasks: quick answer, no ceremony.
-- For multi-step tasks: brief plan → confirm → execute.
-- Ask clarifying questions only for important decisions, not details.
-- Grill Me at normal sensitivity.`,
-
-    adagio: `## Tempo: Adagio (柔板 — high effort)
-
-You are in ADAGIO mode. Be deliberate and thorough:
-- Always enter requirements gathering before any non-trivial task.
-- Ask clarifying questions until all critical decisions are covered.
-- Present a full plan with task tree. Wait for explicit confirmation.
-- After each task, verify before moving to the next.
-- Grill Me at strict sensitivity: flag any deviation immediately.
-- When in doubt, ask. Don't assume.`,
-
-    grave: `## Tempo: Grave (庄板 — maximum effort)
-
-You are in GRAVE mode. Maximum thoroughness. Leave nothing unchecked:
-- Full requirements gathering. Question every assumption.
-- Generate a complete plan. Then challenge it yourself: what could go wrong? What edge cases are missing? What's the simplest alternative?
-- Present the plan AND your own critique. Let the user decide.
-- Execute one subtask at a time. After each: verify, then ask if ready for next.
-- Grill Me at maximum sensitivity.
-- Before finishing: review all changes. Are tests needed? Is there dead code? Could naming be clearer?
-- This is the mode for production-critical changes, security-sensitive code, and architectural decisions.`,
-  };
-
-  return instructions[tempo] ?? instructions.andante;
-}
-
-// ================================================================
-// 3. Security Rules
+// 2. Security Rules
 // ================================================================
 
 function security(): string {
