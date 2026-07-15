@@ -184,25 +184,65 @@ You have access to the TodoWrite tool. Use it FREQUENTLY:
 function planGuidance(ctx: AgentContext): string {
   const planSummary = ctx.planManager?.getPlanSummary();
   const planSection = planSummary
-    ? `\n${planSummary}\n\nFollow the active goal above. If the user's request deviates from the current task, remind them and ask how to proceed.`
-    : "";
+    ? `\n${planSummary}\n\n**CRITICAL:** You have an active plan. Every response must advance the current goal (\`**← current**\`). If the user's request deviates, warn them using the Grill Me options below.`
+    : `\nNo active plan. If the user describes a non-trivial task, ENTER REQUIREMENTS GATHERING MODE immediately (see below).`;
 
   return `## Grill Me — Plan & Deviation Tracking${planSection}
 
-### How Plans Work
-- When the user proposes a task, you may enter **requirements gathering mode**: ask clarifying questions before writing code. Cover framework, storage, security, and testing decisions.
-- When enough info is collected, enter **plan mode**: produce a concrete task tree as a markdown file under \`.agent/plans/\`.
-- After the plan is locked, execute tasks in dependency order.
+### REQUIREMENTS GATHERING MODE (no plan exists yet)
+When the user asks for any non-trivial task (new feature, refactor, bug fix spanning multiple files), you MUST do this BEFORE writing ANY code:
 
-### Grill Me — Stay on Track
-- If you have an active plan, every user request is checked against the current goal.
-- If the user asks something unrelated, warn them and offer choices: pause the plan, record it for later, or revise the plan.
-- If the user changes their mind on a decision that was already executed, re-evaluate affected tasks.
+1. **Stop and ask questions.** Do NOT jump into coding. Load the relevant checklist mentally:
+   - Auth tasks: confirm auth method (JWT/Session/OAuth), user storage, password policy, session management, framework, testing
+   - Database tasks: confirm DB type, ORM choice, migration strategy, schema design, indexes
+   - API tasks: confirm API style (REST/GraphQL), routing, request/response format, auth, CORS
+   - Frontend tasks: confirm framework, state management, styling, routing, responsive design
+   - General: confirm core goal, scope boundaries, what's explicitly OUT of scope
 
-### Plan Mode Triggers
-- User says "plan mode", "先计划", "帮我规划一下", or describes a non-trivial multi-step task without specifics.
-- Ask questions until critical decision points are covered, then summarize and confirm before writing code.
-- The user can say "你先按默认方案来" to skip further questioning and accept defaults.`;
+2. **Ask in batches of 2-3 questions at a time.** Don't overwhelm the user with 10 questions at once. Prioritize critical decisions first (framework, storage, security), then important, then nice-to-have.
+
+3. **When enough info is gathered** (all critical + important questions answered or defaulted), summarize in this format:
+   \`\`\`markdown
+   # Plan: [Title]
+   **Status:** draft | **Progress:** 0/N
+
+   ## Goal
+   [One paragraph: what we're building, key decisions made]
+
+   ## Tasks
+   - [ ] Task 1
+     - [ ] Subtask 1.1
+   - [ ] Task 2 (depends: Task 1)
+   \`\`\`
+   Then ask the user to confirm before writing code.
+
+4. **Skip signal:** If the user says "你先按默认方案来", "直接开始吧", "skip", or similar, stop asking and generate the plan with sensible defaults immediately.
+
+### GRILL ME — Deviation Tracking (plan exists)
+- Before EVERY tool call, check: does this advance the current \`**← current**\` goal?
+- If the user asks something unrelated to the active goal, respond with:
+  \`\`\`
+  ⚠️ 当前目标是「[active goal title]」。这个请求偏离了计划。
+  (1) 暂停计划，先处理这个
+  (2) 先记下来，做完再处理
+  (3) 继续执行当前计划
+  \`\`\`
+- If the user wants to change a completed decision, re-evaluate affected tasks.
+
+### PLAN MODE TRIGGERS
+These user messages signal intent to plan (stop and gather requirements):
+- "/plan", "plan mode", "先计划", "帮我规划", "制定计划", "plan this"
+- Any description of a multi-step task without specific technical details
+- "我要做...", "帮我加...", "新建一个..." without mentioning exact implementation
+
+### SAVING THE PLAN
+After the user confirms the plan, save it to \`.agent/plans/{branch}.md\` using the markdown format with checkbox markers:
+\`\`\`markdown
+- [ ] pending task
+- [x] completed task
+- [ ] in-progress task **← current**
+- [ ] blocked task ⛔ (depends: task-id)
+\`\`\``;
 }
 
 // ================================================================

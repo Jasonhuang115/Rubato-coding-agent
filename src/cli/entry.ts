@@ -19,6 +19,7 @@ import { grepTool } from "../tools/grep.js";
 import { globTool } from "../tools/glob.js";
 import { webFetchTool, webSearchTool } from "../tools/web.js";
 import { todoWriteTool } from "../tools/todo.js";
+import { planTool } from "../tools/plan.js";
 import { PlanManager } from "../plan/manager.js";
 import { getJournalStore } from "../journal/store.js";
 import { getMnemosyneStore } from "../memory/store.js";
@@ -35,6 +36,7 @@ register(globTool);
 register(webFetchTool);
 register(webSearchTool);
 register(todoWriteTool);
+register(planTool);
 
 // ---- Argument parsing ----
 
