@@ -11,6 +11,7 @@ export function buildSystemPrompt(
 
   return [
     identity(),
+    tempoHint(ctx),
     security(),
     confidentiality(),
     behaviorGuidelines(),
@@ -42,7 +43,22 @@ function identity(): string {
 }
 
 // ================================================================
-// 2. Security Rules
+// 2. Tempo — output budget hint
+// ================================================================
+
+function tempoHint(ctx: AgentContext): string {
+  const tempo = ctx.config.tempo ?? "andante";
+  const budgets: Record<string, string> = {
+    presto:  "1024 tokens — be extremely concise, skip explanations",
+    andante: "4096 tokens — balanced, explain when needed",
+    adagio:  "8192 tokens — be thorough, show reasoning",
+    grave:   "16384 tokens — maximum depth, explore edge cases",
+  };
+  return `## Tempo Budget\nCurrent tempo: **${tempo}**. Output budget: ${budgets[tempo] ?? budgets.andante}.`;
+}
+
+// ================================================================
+// 3. Security Rules
 // ================================================================
 
 function security(): string {

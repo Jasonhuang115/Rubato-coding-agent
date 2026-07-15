@@ -152,6 +152,38 @@ Config:
 `);
 }
 
+// ---- Tempo command handler ----
+
+function handleTempoCommand(input: string): void {
+  const args = input.split(/\s+/).slice(1);
+  const valid = ["presto", "andante", "adagio", "grave"] as const;
+
+  if (args.length === 0) {
+    const current = process.env.RUBATO_TEMPO ?? "andante";
+    console.log(`\n  🎵 当前 Tempo：${current}`);
+    console.log("");
+    console.log("  可用级别（控制 LLM token 预算）：");
+    console.log("  presto  ⚡ 1K tokens  — 极简输出，最快最省");
+    console.log("  andante 🚶 4K tokens  — 默认，平衡速度和深度");
+    console.log("  adagio  🐢 8K tokens  — 详尽思考，充分展开");
+    console.log("  grave   🏛️  16K tokens — 极致深度，探索边界");
+    console.log("");
+    console.log("  注：更改后需重启会话生效");
+    return;
+  }
+
+  const level = args[0].toLowerCase();
+  if (!valid.includes(level as typeof valid[number])) {
+    console.log(`\n  无效 Tempo：「${level}」。可选：presto / andante / adagio / grave`);
+    return;
+  }
+
+  process.env.RUBATO_TEMPO = level;
+  const tokens = { presto: "1K", andante: "4K", adagio: "8K", grave: "16K" }[level];
+  console.log(`\n  🎵 Tempo 已设为：${level}（${tokens} tokens）`);
+  console.log("  下次启动生效。或设置环境变量：RUBATO_TEMPO=" + level);
+}
+
 // ---- Git command handler ----
 
 async function handleGitCommand(input: string, workdir: string): Promise<void> {
@@ -317,6 +349,8 @@ function createRepl(
           console.log("  /plan done        — Mark plan as completed");
           console.log("  /grillme on/off   — Toggle Grill Me tracking");
           console.log("  /grillme strict|normal|loose — Set sensitivity");
+          console.log("  /tempo            — Show current effort level");
+          console.log("  /tempo presto|andante|adagio|grave — Set effort");
           console.log("  /git              — Show current git status");
           console.log("  /git health       — Show branch health summary");
           console.log("  /journal search <q> — Search personal knowledge base");
@@ -330,6 +364,9 @@ function createRepl(
           resolve(createRepl(rl, planManager, workdir)());
         } else if (trimmed.startsWith("/grillme")) {
           handleGrillMeCommand(trimmed, planManager);
+          resolve(createRepl(rl, planManager, workdir)());
+        } else if (trimmed.startsWith("/tempo")) {
+          handleTempoCommand(trimmed);
           resolve(createRepl(rl, planManager, workdir)());
         } else if (trimmed.startsWith("/git")) {
           handleGitCommand(trimmed, workdir);

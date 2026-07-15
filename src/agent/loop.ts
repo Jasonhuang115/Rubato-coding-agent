@@ -13,6 +13,7 @@ import type {
   StreamEvent,
   StreamRenderer,
   ToolDefinition,
+  Tempo,
 } from "../core-types.js";
 import { createProvider } from "../model/router.js";
 import { getAllTools, dispatch, getReadTools, getWriteTools } from "../tools/registry.js";
@@ -35,8 +36,17 @@ import { persistKnowledge } from "../journal/extractor.js";
 // ---- Configuration constants ----
 
 const DEFAULT_MAX_TURNS = 50;
-const DEFAULT_MAX_TOKENS = 16_384;
 const COMPACT_THRESHOLD_MESSAGES = 30;
+
+/** Map tempo to LLM max output tokens */
+function getMaxTokens(tempo: Tempo): number {
+  switch (tempo) {
+    case "presto":  return 1_024;   // fast & cheap
+    case "andante": return 4_096;   // default
+    case "adagio":  return 8_192;   // thorough
+    case "grave":   return 16_384;  // max depth
+  }
+}
 const RETRY_MAX_ATTEMPTS = 3;
 const RETRY_BASE_DELAY_MS = 1000;
 const CIRCUIT_BREAKER_THRESHOLD = 5;
@@ -173,7 +183,7 @@ export async function* agentLoop(
             system: systemPrompt,
             messages,
             tools,
-            maxTokens: DEFAULT_MAX_TOKENS,
+            maxTokens: getMaxTokens(config.tempo),
             signal: abortController.signal,
           },
           renderer
