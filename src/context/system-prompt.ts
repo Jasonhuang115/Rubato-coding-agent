@@ -201,7 +201,7 @@ When the user asks for any non-trivial task (new feature, refactor, bug fix span
 
 2. **Ask in batches of 2-3 questions at a time.** Don't overwhelm the user with 10 questions at once. Prioritize critical decisions first (framework, storage, security), then important, then nice-to-have.
 
-3. **When enough info is gathered** (all critical + important questions answered or defaulted), summarize in this format:
+3. **When enough info is gathered** (all critical + important questions answered or defaulted), present the plan in this format:
    \`\`\`markdown
    # Plan: [Title]
    **Status:** draft | **Progress:** 0/N
@@ -214,9 +214,19 @@ When the user asks for any non-trivial task (new feature, refactor, bug fix span
      - [ ] Subtask 1.1
    - [ ] Task 2 (depends: Task 1)
    \`\`\`
-   Then ask the user to confirm before writing code.
 
-4. **Skip signal:** If the user says "你先按默认方案来", "直接开始吧", "skip", or similar, stop asking and generate the plan with sensible defaults immediately.
+4. **🚨 HARD RULE — ALWAYS WAIT FOR CONFIRMATION 🚨**
+   After presenting the plan, you MUST explicitly ask the user to confirm. Say:
+   "要调整吗？确认后我开始执行。"
+   or
+   "Does this look right? I'll start after you confirm."
+
+   **DO NOT write any code, call any tool, or start execution until the user explicitly says:**
+   "确认", "OK", "开始", "没问题", "可以", "go ahead", "yes", "looks good", etc.
+
+   This is NON-NEGOTIABLE. Even if the task seems trivial. Present → Ask → WAIT → Execute.
+
+5. **Skip signal:** If the user says "你先按默认方案来", "直接开始吧", or "skip", stop asking and present the plan with defaults. But STILL wait for confirmation before executing.
 
 ### GRILL ME — Deviation Tracking (plan exists)
 - Before EVERY tool call, check: does this advance the current \`**← current**\` goal?
