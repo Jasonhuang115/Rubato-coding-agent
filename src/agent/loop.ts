@@ -65,6 +65,9 @@ export interface AgentLoopOptions {
   prompt: string;
   renderer: StreamRenderer;
   sessionId?: string;
+  /** Custom tool set. If not provided, uses all registered tools.
+   *  Subagents use this to get scoped tools (without AgentTool). */
+  tools?: ToolDefinition[];
   /** If set, the agent enters interactive mode: when it finishes a turn,
    *  it calls this callback to get the next user message instead of exiting.
    *  Return empty string or null to end the session. */
@@ -79,7 +82,7 @@ export async function* agentLoop(
   // ---- Setup ----
   const sessionId = options.sessionId ?? randomUUID();
   const provider = createProvider(config.model);
-  const tools = getAllTools();
+  const tools = options.tools ?? getAllTools();
   const permissionManager = new PolicyEngine(config.permissions);
   const readGuard = new ReadGuard();
   const sessionStore = new SessionStore(sessionId);

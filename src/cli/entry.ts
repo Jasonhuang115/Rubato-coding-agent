@@ -20,6 +20,7 @@ import { globTool } from "../tools/glob.js";
 import { webFetchTool, webSearchTool } from "../tools/web.js";
 import { todoWriteTool } from "../tools/todo.js";
 import { planTool } from "../tools/plan.js";
+import { agentTool } from "../tools/agent.js";
 import { PlanManager } from "../plan/manager.js";
 import { getJournalStore } from "../journal/store.js";
 import { getMnemosyneStore } from "../memory/store.js";
@@ -37,6 +38,7 @@ register(webFetchTool);
 register(webSearchTool);
 register(todoWriteTool);
 register(planTool);
+register(agentTool);
 
 // ---- Argument parsing ----
 
@@ -190,65 +192,52 @@ async function handleGitCommand(input: string, workdir: string): Promise<void> {
   console.log("\n  用法：/git、/git status、/git health");
 }
 
-// ---- Journal command handler ----
+// ---- Journal command handler (now backed by unified Mnemosyne) ----
 
 async function handleJournalCommand(input: string, workdir: string): Promise<void> {
   const args = input.split(/\s+/).slice(1);
-  const store = getJournalStore();
+  const store = getMnemosyneStore();
 
   if (input.startsWith("/remember")) {
     const title = args.join(" ") || "Untitled";
-    store.addEntry({
-      title,
-      content: `Manual save from session.`,
-      tags: [],
-      sourceSession: "manual",
-      projectPath: workdir,
-      type: "note",
-    });
-    console.log(`\n  📓 已保存：「${title}」`);
+    store.addManualMemory(title, `Manual save from session at ${workdir}.`, [], "manual", "note");
+    console.log(`\n  📓 已保存到统一记忆图谱：「${title}」(protected)`);
     return;
   }
 
   if (args.length === 0 || args[0] === "recent") {
-    const recent = store.getRecent(5);
+    const recent = store.getManualMemories(10);
     if (recent.length === 0) {
       console.log("\n  📓 知识库为空。用 /remember <标题> 保存第一条知识！");
       return;
     }
-    console.log("\n  📓 最近知识：");
+    console.log("\n  📓 个人知识（统一记忆图谱）：");
     for (const entry of recent) {
-      const icon = entry.type === "fix" ? "🔧" : entry.type === "tip" ? "💡" : "📝";
-      console.log(`  ${icon} ${entry.title} (${entry.tags.join(", ") || "无标签"})`);
+      const icon = entry.type === "error" ? "🔧" : entry.type === "concept" ? "💡" : "📝";
+      const tags = entry.tags ? entry.tags.split(",").filter(Boolean) : [];
+      console.log(`  ${icon} ${entry.name} (${tags.join(", ") || "无标签"}) [protected]`);
     }
     return;
   }
 
   if (args[0] === "search") {
     const query = args.slice(1).join(" ");
-    if (!query) {
-      console.log("\n  用法：/journal search <关键词>");
-      return;
-    }
-    const results = store.search(query, 5);
-    if (results.length === 0) {
-      console.log(`\n  未找到与「${query}」相关的知识。`);
-      return;
-    }
+    if (!query) { console.log("\n  用法：/journal search <关键词>"); return; }
+    const results = store.searchWithRelevance(query, 5);
+    if (results.length === 0) { console.log(`\n  未找到与「${query}」相关的记忆。`); return; }
     console.log(`\n  搜索「${query}」结果：`);
-    for (const { entry, score } of results) {
-      console.log(`  - ${entry.title} (相关度: ${score.toFixed(1)})`);
-      console.log(`    ${entry.content.slice(0, 100)}...`);
+    for (const { entity, relevance } of results) {
+      const sourceLabel = entity.source === "manual" ? "[手动]" : entity.source === "memories_md" ? "[MD]" : "[自动]";
+      console.log(`  - ${sourceLabel} [${entity.type}] ${entity.name} (相关度: ${relevance.toFixed(2)})`);
+      if (entity.content) console.log(`    ${entity.content.slice(0, 100)}...`);
     }
     return;
   }
 
   if (args[0] === "stats") {
     const stats = store.getStats();
-    console.log(`\n  📓 知识库统计：`);
-    console.log(`  总条目：${stats.total}`);
-    console.log(`  类型分布：${Object.entries(stats.byType).map(([k, v]) => `${k}: ${v}`).join(", ") || "无"}`);
-    console.log(`  热门标签：${stats.topTags.slice(0, 5).join(", ") || "无"}`);
+    console.log(`\n  📓 统一记忆图谱统计：`);
+    console.log(`  总实体：${stats.entities} | 关系：${stats.relations} | 手动知识：${stats.manualMemories}`);
     return;
   }
 
@@ -259,29 +248,23 @@ async function handleJournalCommand(input: string, workdir: string): Promise<voi
 
 async function handleMemoryCommand(input: string): Promise<void> {
   const args = input.split(/\s+/).slice(1);
-
   try {
     const store = getMnemosyneStore();
     const stats = store.getStats();
 
     if (args[0] === "stats" || args.length === 0) {
-      console.log(`\n  🧠 Mnemosyne 记忆图谱：`);
+      console.log(`\n  🧠 Mnemosyne 统一记忆图谱：`);
       console.log(`  实体：${stats.entities} | 关系：${stats.relations} | 访问记录：${stats.accessLogs}`);
+      console.log(`  手动知识：${stats.manualMemories} (protected)`);
       console.log(`  存储路径：~/.rubato/mnemosyne/memory.db`);
       return;
     }
 
     if (args[0] === "search") {
       const query = args.slice(1).join(" ");
-      if (!query) {
-        console.log("\n  用法：/memory search <关键词>");
-        return;
-      }
+      if (!query) { console.log("\n  用法：/memory search <关键词>"); return; }
       const results = store.searchWithRelevance(query, 5);
-      if (results.length === 0) {
-        console.log(`\n  未找到与「${query}」相关的实体。`);
-        return;
-      }
+      if (results.length === 0) { console.log(`\n  未找到与「${query}」相关的实体。`); return; }
       console.log(`\n  搜索「${query}」结果：`);
       for (const { entity, relevance } of results) {
         console.log(`  - [${entity.type}] ${entity.name} (相关度: ${relevance.toFixed(2)})`);
@@ -292,7 +275,6 @@ async function handleMemoryCommand(input: string): Promise<void> {
     console.log("\n  记忆系统未初始化或不可用。");
     return;
   }
-
   console.log("\n  用法：/memory、/memory stats、/memory search <q>");
 }
 
@@ -444,6 +426,16 @@ async function main(): Promise<void> {
   console.log(`Provider: ${config.model.provider} | Model: ${config.model.model}`);
   console.log(`Working dir: ${workdir}`);
   console.log(`Tools: ${getAllTools().length} registered`);
+
+  // Migrate old Journal entries into unified Mnemosyne (one-time, best-effort)
+  try {
+    const store = getMnemosyneStore();
+    const journalDbPath = path.join(process.env.HOME ?? "/tmp", ".rubato", "journal", "journal.db");
+    const migrated = store.migrateJournalEntries(journalDbPath);
+    if (migrated > 0) {
+      console.log(`📓 已将 ${migrated} 条旧知识迁移到统一记忆图谱。`);
+    }
+  } catch { /* Migration is best-effort */ }
 
   // Load and display active plan
   const planManager = new PlanManager(workdir);

@@ -1,14 +1,15 @@
 // Mnemosyne Memory Store — SQLite-backed knowledge graph
 // Tables: entities (nodes), relations (edges), access_log (decay)
 // Memory decay: weight * exp(-decay_rate * days_since_last_access)
+// Phase 2: FTS5 search, feedback_log, strategy_weights, query_rewrite_rules
 
 import Database from "better-sqlite3";
 import path from "path";
 import fs from "fs";
 import type { MemoryStore, MemoryEntry, MemoryEdge } from "./schema.js";
 
-const DECAY_RATE = 0.01; // per day
-const DECAY_THRESHOLD = 0.3; // below this, memory is "forgotten"
+const DECAY_RATE = 0.01;
+const DECAY_THRESHOLD = 0.3;
 
 export interface EntityRow {
   id: number;
@@ -16,9 +17,13 @@ export interface EntityRow {
   name: string;
   content: string;
   source_session: string;
+  source: string;         // 'auto' | 'manual' | 'seeder' | 'memories_md'
+  protected: number;       // 1 = never auto-delete
+  tags: string;            // comma-separated
   confidence: number;
   created_at: number;
   updated_at: number;
+  embedding: Buffer | null; // 384-dim float32
 }
 
 export interface RelationRow {
@@ -95,6 +100,74 @@ export class MnemosyneStore implements MemoryStore {
       CREATE INDEX IF NOT EXISTS idx_relations_type ON relations(relation_type);
       CREATE INDEX IF NOT EXISTS idx_access_entity ON access_log(entity_id);
     `);
+
+    // Phase 2 migration: add new columns
+    this.migrateAddColumn("entities", "source", "TEXT NOT NULL DEFAULT 'auto'");
+    this.migrateAddColumn("entities", "protected", "INTEGER NOT NULL DEFAULT 0");
+    this.migrateAddColumn("entities", "tags", "TEXT NOT NULL DEFAULT ''");
+    this.migrateAddColumn("entities", "embedding", "BLOB");
+
+    // FTS5 virtual table
+    this.db.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS entities_fts USING fts5(
+        name, content, tags, content='entities', content_rowid='id'
+      );
+    `);
+
+    // Feedback log
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS feedback_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        memory_id INTEGER REFERENCES entities(id) ON DELETE SET NULL,
+        session_id TEXT NOT NULL DEFAULT '',
+        event_type TEXT NOT NULL CHECK(event_type IN ('injected','user_corrected','tool_success','tool_failed')),
+        score_delta REAL NOT NULL DEFAULT 0,
+        context TEXT DEFAULT '{}',
+        timestamp INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_feedback_memory ON feedback_log(memory_id);
+      CREATE INDEX IF NOT EXISTS idx_feedback_event ON feedback_log(event_type);
+    `);
+
+    // Strategy weights
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS strategy_weights (
+        strategy TEXT PRIMARY KEY,
+        weight REAL NOT NULL DEFAULT 0.33,
+        total_calls INTEGER NOT NULL DEFAULT 0,
+        success_calls INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL DEFAULT 0
+      );
+    `);
+
+    const existingWeights = this.db.prepare("SELECT COUNT(*) as c FROM strategy_weights").get() as { c: number };
+    if (existingWeights.c === 0) {
+      const now = Date.now();
+      this.db.prepare("INSERT INTO strategy_weights (strategy, weight, updated_at) VALUES (?, ?, ?)").run("fts5", 0.5, now);
+      this.db.prepare("INSERT INTO strategy_weights (strategy, weight, updated_at) VALUES (?, ?, ?)").run("vector", 0.3, now);
+      this.db.prepare("INSERT INTO strategy_weights (strategy, weight, updated_at) VALUES (?, ?, ?)").run("graph", 0.2, now);
+    }
+
+    // Query rewrite rules
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS query_rewrite_rules (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        original_pattern TEXT NOT NULL,
+        rewritten_query TEXT NOT NULL,
+        success_count INTEGER NOT NULL DEFAULT 1,
+        last_used INTEGER NOT NULL DEFAULT 0
+      );
+    `);
+
+    // Rebuild FTS5 index
+    this.db.exec(`INSERT INTO entities_fts(entities_fts) VALUES('rebuild');`);
+  }
+
+  private migrateAddColumn(table: string, column: string, definition: string): void {
+    const info = this.db.pragma(`table_info(${table})`) as Array<{ name: string }>;
+    if (!info.some((col) => col.name === column)) {
+      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    }
   }
 
   // ---- Entity CRUD ----
@@ -104,13 +177,15 @@ export class MnemosyneStore implements MemoryStore {
     type: EntityRow["type"],
     content: string,
     sourceSession: string,
-    confidence = 1.0
+    confidence = 1.0,
+    source: string = "auto",
+    isProtected = 0
   ): number {
     const now = Date.now();
     const existing = this.findEntityByName(name, type);
 
     if (existing) {
-      // Merge: update content if new info, bump confidence
+      const finalProtected = existing.protected === 1 ? 1 : isProtected;
       const mergedContent = existing.content
         ? `${existing.content}\n${content}`
         : content;
@@ -118,75 +193,56 @@ export class MnemosyneStore implements MemoryStore {
 
       this.db
         .prepare(
-          `UPDATE entities SET content = ?, confidence = ?, updated_at = ?, source_session = ?
+          `UPDATE entities SET content = ?, confidence = ?, updated_at = ?, source_session = ?, protected = ?
            WHERE id = ?`
         )
-        .run(mergedContent, mergedConfidence, now, sourceSession, existing.id);
+        .run(mergedContent, mergedConfidence, now, sourceSession, finalProtected, existing.id);
 
       return existing.id;
     }
 
     const result = this.db
       .prepare(
-        `INSERT INTO entities (type, name, content, source_session, confidence, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO entities (type, name, content, source_session, source, protected, confidence, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
-      .run(type, name, content, sourceSession, confidence, now, now);
+      .run(type, name, content, sourceSession, source, isProtected, confidence, now, now);
 
     return Number(result.lastInsertRowid);
   }
 
   findEntityByName(name: string, type?: string): EntityRow | null {
     const row = type
-      ? this.db
-          .prepare(`SELECT * FROM entities WHERE name = ? AND type = ? LIMIT 1`)
-          .get(name, type)
-      : this.db
-          .prepare(`SELECT * FROM entities WHERE name = ? LIMIT 1`)
-          .get(name);
-
+      ? this.db.prepare(`SELECT * FROM entities WHERE name = ? AND type = ? LIMIT 1`).get(name, type)
+      : this.db.prepare(`SELECT * FROM entities WHERE name = ? LIMIT 1`).get(name);
     return (row as EntityRow) ?? null;
   }
 
   getEntity(id: number): EntityRow | null {
-    const row = this.db
-      .prepare(`SELECT * FROM entities WHERE id = ?`)
-      .get(id);
+    const row = this.db.prepare(`SELECT * FROM entities WHERE id = ?`).get(id);
     return (row as EntityRow) ?? null;
   }
 
   // ---- Relations ----
 
   addRelation(
-    sourceId: number,
-    targetId: number,
+    sourceId: number, targetId: number,
     relationType: RelationRow["relation_type"],
-    weight = 1.0,
-    evidence = ""
+    weight = 1.0, evidence = ""
   ): number {
-    // Avoid exact duplicates — update weight instead
     const existing = this.db
-      .prepare(
-        `SELECT id, weight FROM relations
-         WHERE source_id = ? AND target_id = ? AND relation_type = ?`
-      )
+      .prepare(`SELECT id, weight FROM relations WHERE source_id = ? AND target_id = ? AND relation_type = ?`)
       .get(sourceId, targetId, relationType) as { id: number; weight: number } | undefined;
 
     if (existing) {
       const newWeight = Math.min(2.0, existing.weight + weight * 0.3);
-      this.db
-        .prepare(`UPDATE relations SET weight = ?, evidence = ? WHERE id = ?`)
-        .run(newWeight, evidence, existing.id);
+      this.db.prepare(`UPDATE relations SET weight = ?, evidence = ? WHERE id = ?`).run(newWeight, evidence, existing.id);
       return existing.id;
     }
 
     const result = this.db
-      .prepare(
-        `INSERT INTO relations (source_id, target_id, relation_type, weight, evidence, created_at)
-         VALUES (?, ?, ?, ?, ?, ?)`
-      )
+      .prepare(`INSERT INTO relations (source_id, target_id, relation_type, weight, evidence, created_at) VALUES (?, ?, ?, ?, ?, ?)`)
       .run(sourceId, targetId, relationType, weight, evidence, Date.now());
-
     return Number(result.lastInsertRowid);
   }
 
@@ -194,15 +250,12 @@ export class MnemosyneStore implements MemoryStore {
     const sql = relationType
       ? `SELECT * FROM relations WHERE (source_id = ? OR target_id = ?) AND relation_type = ? ORDER BY weight DESC`
       : `SELECT * FROM relations WHERE source_id = ? OR target_id = ? ORDER BY weight DESC`;
-
     const rows = relationType
       ? this.db.prepare(sql).all(entityId, entityId, relationType)
       : this.db.prepare(sql).all(entityId, entityId);
-
     return rows as RelationRow[];
   }
 
-  /** Get 1-hop neighbors with decay-adjusted relevance */
   getNeighbors(entityId: number, minWeight = 0.3): Array<{ entity: EntityRow; relation: RelationRow; relevance: number }> {
     const now = Date.now();
     const rows = this.db
@@ -215,13 +268,7 @@ export class MnemosyneStore implements MemoryStore {
          ORDER BY r.weight DESC`
       )
       .all(entityId, entityId, entityId) as Array<
-      EntityRow & {
-        rel_id: number;
-        relation_type: string;
-        rel_weight: number;
-        rel_source: number;
-        rel_target: number;
-      }
+      EntityRow & { rel_id: number; relation_type: string; rel_weight: number; rel_source: number; rel_target: number }
     >;
 
     return rows
@@ -232,23 +279,16 @@ export class MnemosyneStore implements MemoryStore {
 
         return {
           entity: {
-            id: row.id,
-            type: row.type,
-            name: row.name,
-            content: row.content,
+            id: row.id, type: row.type, name: row.name, content: row.content,
             source_session: row.source_session,
-            confidence: row.confidence,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
+            source: row.source ?? "auto", protected: row.protected ?? 0,
+            tags: row.tags ?? "", embedding: row.embedding as Buffer | null,
+            confidence: row.confidence, created_at: row.created_at, updated_at: row.updated_at,
           },
           relation: {
-            id: row.rel_id,
-            source_id: row.rel_source,
-            target_id: row.rel_target,
+            id: row.rel_id, source_id: row.rel_source, target_id: row.rel_target,
             relation_type: row.relation_type as RelationRow["relation_type"],
-            weight: row.rel_weight,
-            evidence: "",
-            created_at: row.created_at,
+            weight: row.rel_weight, evidence: "", created_at: row.created_at,
           },
           relevance,
         };
@@ -260,17 +300,10 @@ export class MnemosyneStore implements MemoryStore {
   // ---- Access Log & Decay ----
 
   recordAccess(entityId: number, sessionId: string): void {
-    this.db
-      .prepare(`INSERT INTO access_log (entity_id, accessed_at, source_session) VALUES (?, ?, ?)`)
-      .run(entityId, Date.now(), sessionId);
-
-    // Update entity timestamp (resets decay)
-    this.db
-      .prepare(`UPDATE entities SET updated_at = ? WHERE id = ?`)
-      .run(Date.now(), entityId);
+    this.db.prepare(`INSERT INTO access_log (entity_id, accessed_at, source_session) VALUES (?, ?, ?)`).run(entityId, Date.now(), sessionId);
+    this.db.prepare(`UPDATE entities SET updated_at = ? WHERE id = ?`).run(Date.now(), entityId);
   }
 
-  /** Get entities that have decayed below threshold — ready for pruning */
   getForgottenCandidates(olderThanDays = 30): EntityRow[] {
     const cutoff = Date.now() - olderThanDays * 24 * 60 * 60 * 1000;
     const rows = this.db
@@ -279,13 +312,10 @@ export class MnemosyneStore implements MemoryStore {
          LEFT JOIN access_log a ON a.entity_id = e.id
          WHERE e.updated_at < ?
          GROUP BY e.id
-         HAVING COUNT(a.id) = 0
-            OR MAX(a.accessed_at) < ?
-         ORDER BY e.updated_at ASC
-         LIMIT 100`
+         HAVING COUNT(a.id) = 0 OR MAX(a.accessed_at) < ?
+         ORDER BY e.updated_at ASC LIMIT 100`
       )
       .all(cutoff, cutoff);
-
     return rows as EntityRow[];
   }
 
@@ -293,34 +323,34 @@ export class MnemosyneStore implements MemoryStore {
     const candidates = this.getForgottenCandidates(olderThanDays);
     if (candidates.length === 0) return 0;
 
-    const ids = candidates.map((c) => c.id);
-    const placeholders = ids.map(() => "?").join(",");
+    // NEVER delete protected entities
+    const ids = candidates.filter((c) => c.protected === 0).map((c) => c.id);
+    if (ids.length === 0) return 0;
 
+    const placeholders = ids.map(() => "?").join(",");
     this.db.prepare(`DELETE FROM access_log WHERE entity_id IN (${placeholders})`).run(...ids);
     this.db.prepare(`DELETE FROM relations WHERE source_id IN (${placeholders}) OR target_id IN (${placeholders})`).run(...ids, ...ids);
     const result = this.db.prepare(`DELETE FROM entities WHERE id IN (${placeholders})`).run(...ids);
-
     return result.changes;
   }
 
   // ---- Search ----
 
-  /** Full-text search across entity names and content */
   searchEntities(query: string, limit = 10): EntityRow[] {
-    const like = `%${query}%`;
-    const rows = this.db
-      .prepare(
-        `SELECT * FROM entities
-         WHERE name LIKE ? OR content LIKE ?
-         ORDER BY confidence DESC, updated_at DESC
-         LIMIT ?`
-      )
-      .all(like, like, limit);
-
-    return rows as EntityRow[];
+    try {
+      const rows = this.db
+        .prepare(`SELECT e.* FROM entities e INNER JOIN entities_fts fts ON e.id = fts.rowid WHERE entities_fts MATCH ? ORDER BY rank LIMIT ?`)
+        .all(query, limit);
+      return rows as EntityRow[];
+    } catch {
+      const like = `%${query}%`;
+      const rows = this.db
+        .prepare(`SELECT * FROM entities WHERE name LIKE ? OR content LIKE ? ORDER BY confidence DESC, updated_at DESC LIMIT ?`)
+        .all(like, like, limit);
+      return rows as EntityRow[];
+    }
   }
 
-  /** Search with decay-adjusted relevance scoring */
   searchWithRelevance(query: string, limit = 10): Array<{ entity: EntityRow; relevance: number }> {
     const raw = this.searchEntities(query, limit * 2);
     const now = Date.now();
@@ -331,7 +361,6 @@ export class MnemosyneStore implements MemoryStore {
         const decay = Math.exp(-DECAY_RATE * daysSinceAccess);
         const nameMatch = entity.name.toLowerCase().includes(query.toLowerCase()) ? 1.0 : 0.5;
         const relevance = entity.confidence * decay * nameMatch;
-
         return { entity, relevance };
       })
       .filter((r) => r.relevance >= DECAY_THRESHOLD)
@@ -339,88 +368,200 @@ export class MnemosyneStore implements MemoryStore {
       .slice(0, limit);
   }
 
-  /** Get entities of a specific type */
   getByType(type: string, limit = 50): EntityRow[] {
-    const rows = this.db
-      .prepare(`SELECT * FROM entities WHERE type = ? ORDER BY updated_at DESC LIMIT ?`)
-      .all(type, limit);
+    const rows = this.db.prepare(`SELECT * FROM entities WHERE type = ? ORDER BY updated_at DESC LIMIT ?`).all(type, limit);
     return rows as EntityRow[];
+  }
+
+  getAllEntityIds(limit = 200): Array<{ id: number }> {
+    return this.db.prepare(`SELECT id FROM entities ORDER BY updated_at DESC LIMIT ?`).all(limit) as Array<{ id: number }>;
+  }
+
+  getAccessCount(entityId: number): number {
+    const row = this.db.prepare(`SELECT COUNT(*) as c FROM access_log WHERE entity_id = ?`).get(entityId) as { c: number };
+    return row.c;
+  }
+
+  setEmbedding(entityId: number, embedding: Buffer): void {
+    this.db.prepare(`UPDATE entities SET embedding = ? WHERE id = ?`).run(embedding, entityId);
+  }
+
+  // ---- Manual Memory ----
+
+  addManualMemory(title: string, content: string, tags: string[], sourceSession: string, type: EntityRow["type"] = "note"): number {
+    const now = Date.now();
+    const tagStr = tags.join(",");
+
+    const existing = this.findEntityByName(title, type);
+    if (existing) {
+      this.db.prepare(`UPDATE entities SET content = ?, tags = ?, updated_at = ?, protected = 1, source = 'manual' WHERE id = ?`)
+        .run(content, tagStr, now, existing.id);
+      return existing.id;
+    }
+
+    const result = this.db
+      .prepare(`INSERT INTO entities (type, name, content, source_session, source, protected, tags, confidence, created_at, updated_at) VALUES (?, ?, ?, ?, 'manual', 1, ?, 1.0, ?, ?)`)
+      .run(type, title, content, sourceSession, tagStr, now, now);
+    return Number(result.lastInsertRowid);
+  }
+
+  getManualMemories(limit = 50): EntityRow[] {
+    return this.db.prepare(`SELECT * FROM entities WHERE source IN ('manual', 'memories_md') ORDER BY updated_at DESC LIMIT ?`).all(limit) as EntityRow[];
+  }
+
+  // ---- Feedback Log ----
+
+  recordFeedback(memoryId: number, sessionId: string, eventType: "injected" | "user_corrected" | "tool_success" | "tool_failed", scoreDelta = 0, context: Record<string, unknown> = {}): void {
+    this.db.prepare(`INSERT INTO feedback_log (memory_id, session_id, event_type, score_delta, context, timestamp) VALUES (?, ?, ?, ?, ?, ?)`)
+      .run(memoryId, sessionId, eventType, scoreDelta, JSON.stringify(context), Date.now());
+  }
+
+  getFeedbackStats(memoryId: number): { injections: number; successes: number; failures: number } {
+    const injections = (this.db.prepare(`SELECT COUNT(*) as c FROM feedback_log WHERE memory_id = ? AND event_type = 'injected'`).get(memoryId) as { c: number }).c;
+    const successes = (this.db.prepare(`SELECT COUNT(*) as c FROM feedback_log WHERE memory_id = ? AND event_type = 'tool_success'`).get(memoryId) as { c: number }).c;
+    const failures = (this.db.prepare(`SELECT COUNT(*) as c FROM feedback_log WHERE memory_id = ? AND event_type = 'tool_failed'`).get(memoryId) as { c: number }).c;
+    return { injections, successes, failures };
+  }
+
+  // ---- Strategy Weights ----
+
+  updateStrategyWeight(strategy: string, wasHelpful: boolean): void {
+    this.db.prepare(
+      `UPDATE strategy_weights SET total_calls = total_calls + 1, success_calls = success_calls + ?,
+       weight = CASE WHEN total_calls > 0 THEN CAST(success_calls + ? AS REAL) / (total_calls + 1) ELSE weight END,
+       updated_at = ? WHERE strategy = ?`
+    ).run(wasHelpful ? 1 : 0, wasHelpful ? 1 : 0, Date.now(), strategy);
+  }
+
+  getStrategyWeights(): Array<{ strategy: string; weight: number; totalCalls: number; successRate: number }> {
+    const rows = this.db.prepare(`SELECT * FROM strategy_weights ORDER BY weight DESC`).all() as Array<{ strategy: string; weight: number; total_calls: number; success_calls: number }>;
+    return rows.map((r) => ({ strategy: r.strategy, weight: r.weight, totalCalls: r.total_calls, successRate: r.total_calls > 0 ? r.success_calls / r.total_calls : 0 }));
+  }
+
+  // ---- Query Rewrite Rules ----
+
+  addQueryRewriteRule(originalPattern: string, rewrittenQuery: string): void {
+    const existing = this.db.prepare(`SELECT id, success_count FROM query_rewrite_rules WHERE original_pattern = ? AND rewritten_query = ?`).get(originalPattern, rewrittenQuery) as { id: number; success_count: number } | undefined;
+    if (existing) {
+      this.db.prepare(`UPDATE query_rewrite_rules SET success_count = ?, last_used = ? WHERE id = ?`).run(existing.success_count + 1, Date.now(), existing.id);
+    } else {
+      this.db.prepare(`INSERT INTO query_rewrite_rules (original_pattern, rewritten_query, last_used) VALUES (?, ?, ?)`).run(originalPattern, rewrittenQuery, Date.now());
+    }
+  }
+
+  getQueryRewrites(originalPattern: string, limit = 5): string[] {
+    const rows = this.db.prepare(`SELECT rewritten_query FROM query_rewrite_rules WHERE original_pattern = ? ORDER BY success_count DESC LIMIT ?`).all(originalPattern, limit) as Array<{ rewritten_query: string }>;
+    return rows.map((r) => r.rewritten_query);
+  }
+
+  // ---- Graph Traversal ----
+
+  traverseGraph(startIds: number[], maxHops = 2, maxResults = 30): Array<{ entity: EntityRow; hops: number; path: string[] }> {
+    const visited = new Set<number>();
+    const results: Array<{ entity: EntityRow; hops: number; path: string[] }> = [];
+    const queue: Array<{ id: number; hops: number; path: string[] }> = startIds.map((id) => ({ id, hops: 0, path: [String(id)] }));
+
+    while (queue.length > 0 && results.length < maxResults) {
+      const current = queue.shift()!;
+      if (visited.has(current.id) || current.hops > maxHops) continue;
+      visited.add(current.id);
+
+      const entity = this.getEntity(current.id);
+      if (!entity) continue;
+
+      if (current.hops > 0) {
+        results.push({ entity, hops: current.hops, path: current.path });
+      }
+
+      const relations = this.getRelations(current.id);
+      for (const rel of relations) {
+        const neighborId = rel.source_id === current.id ? rel.target_id : rel.source_id;
+        if (!visited.has(neighborId)) {
+          queue.push({ id: neighborId, hops: current.hops + 1, path: [...current.path, `${rel.relation_type}→${neighborId}`] });
+        }
+      }
+    }
+
+    return results.sort((a, b) => a.hops - b.hops);
+  }
+
+  // ---- Journal Migration ----
+
+  migrateJournalEntries(journalDbPath: string): number {
+    if (!fs.existsSync(journalDbPath)) return 0;
+    let migrated = 0;
+    try {
+      const journalDb = new Database(journalDbPath);
+      journalDb.pragma("journal_mode = WAL");
+
+      const rows = journalDb.prepare(`SELECT * FROM journal_entries ORDER BY created_at`).all() as Array<{
+        title: string; content: string; tags: string; source_session: string; type: string;
+      }>;
+
+      for (const row of rows) {
+        const tagList = row.tags ? row.tags.split(",").filter(Boolean) : [];
+        const entityType = mapJournalType(row.type);
+        this.addManualMemory(row.title, row.content, tagList, row.source_session || "journal_migration", entityType);
+        migrated++;
+      }
+
+      journalDb.close();
+    } catch { /* best-effort */ }
+    return migrated;
   }
 
   // ---- Stats ----
 
-  getStats(): { entities: number; relations: number; accessLogs: number } {
+  getStats(): { entities: number; relations: number; accessLogs: number; manualMemories: number } {
     const entities = (this.db.prepare(`SELECT COUNT(*) as c FROM entities`).get() as { c: number }).c;
     const relations = (this.db.prepare(`SELECT COUNT(*) as c FROM relations`).get() as { c: number }).c;
     const accessLogs = (this.db.prepare(`SELECT COUNT(*) as c FROM access_log`).get() as { c: number }).c;
-    return { entities, relations, accessLogs };
+    const manualMemories = (this.db.prepare(`SELECT COUNT(*) as c FROM entities WHERE source IN ('manual', 'memories_md')`).get() as { c: number }).c;
+    return { entities, relations, accessLogs, manualMemories };
   }
 
   // ---- Lifecycle ----
 
-  close(): void {
-    this.db.close();
-  }
+  close(): void { this.db.close(); }
 
-  // ---- MemoryStore interface (compat with schema.ts) ----
+  // ---- MemoryStore interface ----
 
   async addEntry(entry: MemoryEntry): Promise<number> {
-    return this.upsertEntity(
-      entry.content.slice(0, 100), // name from content
-      entry.type as EntityRow["type"],
-      entry.content,
-      entry.source ?? "",
-      1.0
-    );
+    return this.upsertEntity(entry.content.slice(0, 100), entry.type as EntityRow["type"], entry.content, entry.source ?? "", 1.0);
   }
 
   async addEdge(edge: MemoryEdge): Promise<number> {
-    return this.addRelation(
-      edge.source_id,
-      edge.target_id,
-      edge.relation as RelationRow["relation_type"],
-      edge.weight
-    );
+    return this.addRelation(edge.source_id, edge.target_id, edge.relation as RelationRow["relation_type"], edge.weight);
   }
 
   async search(query: string, limit = 10): Promise<MemoryEntry[]> {
     const entities = this.searchWithRelevance(query, limit);
-    return entities.map(({ entity }) => ({
-      id: entity.id,
-      type: entity.type as MemoryEntry["type"],
-      content: `${entity.name}: ${entity.content}`,
-      source: entity.source_session,
-      timestamp: entity.updated_at,
-    }));
+    return entities.map(({ entity }) => ({ id: entity.id, type: entity.type as MemoryEntry["type"], content: `${entity.name}: ${entity.content}`, source: entity.source_session, timestamp: entity.updated_at }));
   }
 
-  async searchByVector(_vector: Float32Array, _limit = 10): Promise<MemoryEntry[]> {
-    // Phase 2: implement vector search via sqlite-vec
-    // For now, fall back to text search
-    return [];
-  }
+  async searchByVector(_vector: Float32Array, _limit = 10): Promise<MemoryEntry[]> { return []; }
 
   async getEdges(entryId: number): Promise<MemoryEdge[]> {
     const rels = this.getRelations(entryId);
-    return rels.map((r) => ({
-      id: r.id,
-      source_id: r.source_id,
-      target_id: r.target_id,
-      relation: r.relation_type as MemoryEdge["relation"],
-      weight: r.weight,
-      timestamp: r.created_at,
-    }));
+    return rels.map((r) => ({ id: r.id, source_id: r.source_id, target_id: r.target_id, relation: r.relation_type as MemoryEdge["relation"], weight: r.weight, timestamp: r.created_at }));
   }
 
   async getRelated(entryId: number, depth = 1): Promise<MemoryEntry[]> {
     const neighbors = this.getNeighbors(entryId);
-    return neighbors.map(({ entity }) => ({
-      id: entity.id,
-      type: entity.type as MemoryEntry["type"],
-      content: `${entity.name}: ${entity.content}`,
-      source: entity.source_session,
-      timestamp: entity.updated_at,
-    }));
+    return neighbors.map(({ entity }) => ({ id: entity.id, type: entity.type as MemoryEntry["type"], content: `${entity.name}: ${entity.content}`, source: entity.source_session, timestamp: entity.updated_at }));
+  }
+}
+
+// ---- Helpers ----
+
+function mapJournalType(journalType: string): EntityRow["type"] {
+  switch (journalType) {
+    case "tip": return "note";
+    case "fix": return "error";
+    case "concept": return "concept";
+    case "snippet": return "note";
+    case "resource": return "note";
+    default: return "note";
   }
 }
 
@@ -429,17 +570,12 @@ export class MnemosyneStore implements MemoryStore {
 let defaultStore: MnemosyneStore | null = null;
 
 export function getMnemosyneStore(dbPath?: string): MnemosyneStore {
-  if (!defaultStore) {
-    defaultStore = new MnemosyneStore(dbPath);
-  }
+  if (!defaultStore) defaultStore = new MnemosyneStore(dbPath);
   return defaultStore;
 }
 
 export function closeMnemosyneStore(): void {
-  if (defaultStore) {
-    defaultStore.close();
-    defaultStore = null;
-  }
+  if (defaultStore) { defaultStore.close(); defaultStore = null; }
 }
 
 function getDefaultDBPath(): string {

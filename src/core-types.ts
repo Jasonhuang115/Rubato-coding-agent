@@ -208,3 +208,22 @@ export interface SessionRecord {
   timestamp: number;
   data: unknown;
 }
+
+// ---- Subagent ----
+
+export interface SubagentDefinition {
+  name: string;               // "explore" | "general" | "verify" | custom
+  description: string;        // used for intent-matching
+  systemPrompt: string;
+  model?: string;             // "inherit" | specific model ID
+  tools: string[];            // allowlist, ["*"] = all except AgentTool
+  readonly: boolean;          // default true
+  maxTurns: number;           // default 15
+}
+
+export interface SubagentResult {
+  status: "completed" | "failed" | "timeout";
+  agentId: string;
+  output: string;
+  usage: { inputTokens: number; outputTokens: number; toolCalls: number };
+}
