@@ -1,364 +1,255 @@
-# rubato
+# Rubato
 
 从零构建的 Coding Agent，核心理念：**新手友好，伴随成长，有记忆**。
 
-灵感来自 Claude Code，但不是它的替代品——而是专注于四个差异化创新点：需求澄清与意图树追踪、结构化知识记忆、Git 顾问、个人技术知识库。
+灵感来自 Claude Code，但不是替代品——差异化创新点：Subagent 并行系统 + 自进化 RAG 记忆 + 意图树追踪 + Git 顾问。
 
-**Phase 1 + Phase 2 已完成** — 完整的 Agent 骨架 + 四大创新模块，50 个测试全部通过。
+> 以下全文由 Rubato 编码，也由 Rubato 跑 SWE-bench 测试。没有调用外部 Agent 框架。
 
 ## 进度
 
 | 阶段 | 状态 | 内容 |
 |------|------|------|
-| Phase 1 | ✅ 完成 | Agent 骨架：核心循环、9 工具、多提供商、权限、上下文注入 |
-| Phase 2 | ✅ 完成 | 四大创新：意图树 & Grill Me、Mnemosyne 记忆图、Git 顾问、技术 Journal |
+| Phase 1 | ✅ | Agent 骨架：核心循环、9 工具、多提供商、权限、上下文注入 |
+| Phase 2 | ✅ | Subagent 系统 + 自进化 RAG + 工作树隔离 + SWE-bench 评测 |
 
 ---
 
-## 四大创新点
+## 创新点
 
-### 1. Plan 模式 + 意图树 + Grill Me
+### 1. Subagent 系统
+
+父 agent 可以 spawn 子 agent 并行处理任务——共享同一套 `agentLoop()` 引擎，只换 tool pool 和 system prompt。
+
+```
+Parent (11 tools, 50 turns)
+  ├─ AgentTool → spawnSubagent()
+  │   ├─ Explore   (Read/Grep/Glob/Bash, 15 turns)
+  │   ├─ General   (all tools minus Agent, 15 turns)
+  │   ├─ Verify    (read-only adversarial, 10 turns)
+  │   └─ Custom    (.rubato/agents/*.md)
+  │       ├─ isolation: "worktree" → git worktree
+  │       └─ run_in_background: true → async handle
+  └─ 结果自动回到父 agent 上下文
+```
+
+- **3 种内置类型** — explore（只读搜索）、general（全工具）、verify（对抗性审查）
+- **自定义 agent** — `.rubato/agents/*.md` 用 YAML frontmatter 定义，自动加载
+- **工作树隔离** — 子 agent 在独立 git worktree 中运行，互不干扰
+- **后台执行** — 异步 spawn，结果写入文件，父 agent 随时 Read 查看
+- **转录记录** — 每个子 agent 的 turn 历史存入 SessionStore JSONL
+
+### 2. 自进化 RAG 记忆（Mnemosyne）
+
+不是静态 MEMORY.md，而是一个**会自己进化**的知识图谱。
+
+```
+Seeder（项目扫描播种）
+  ↓
+活跃记忆（FTS5 + 向量 + 图检索）
+  ↓
+Evaluator（五维评分：准确度 × 新鲜度 × 频率 × 冲突 × 相关度）
+  ↓
+┌─ 高分 → 升级为"原则"（固定注入）
+├─ 中分 → 保持活跃
+└─ 低分 + 非保护 → 遗忘
+       低分 + 保护 → 保留但不再注入
+  ↓
+Consolidator（聚类 → 抽象 → 遗忘，每 5 次对话触发）
+```
+
+- **统一入口** — 自动提取 + 手动 `/remember` + MEMORY.md 导入 → 同一张 entities 表
+- **FTS5 全文搜索** + **向量相似度**（384-dim trigram-hash）+ **图遍历**（1-hop 扩展）
+- **RRF 融合** — Reciprocal Rank Fusion 合并三路检索结果，动态权重随反馈调整
+- **查询重写** — 失败查询 → 成功检索的映射自动学习
+- **Protected 记忆** — 手动上传的知识永不被自动删除
+- **播种器** — 首次打开项目自动扫描 package.json、目录结构、Git 历史、配置文件
+
+### 3. Plan 模式 + Grill Me 意图追踪
 
 防止 Agent "跑偏"的核心机制：
 
 ```
-用户提出需求
-  ↓
-[Grill Me — 需求澄清]  AI 反问确认，直到信息充分
-  ↓
-[Plan 模式 — 生成意图树]  结构化计划 → .agent/plans/{branch}.md
-  ↓
-[按意图树执行]  依赖排序，逐步实现
-  ↓
-[Grill Me — 偏离追踪]  每次输入/工具调用检查是否偏离计划
-  ↓
-用户改变主意 → 更新意图树 → 重新计算依赖 → 继续
-  ↓
-跨会话 → 自动恢复未完成的计划
+用户需求 → [Grill Me 需求澄清] → [Plan 意图树] → [按树执行]
+                                                    ↓
+                                        [Grill Me 偏离追踪] ← 每次输入/工具调用
 ```
 
-**Grill Me 两种模式：**
-- **需求澄清模式** — 用户提出模糊需求时，AI 不急于写代码，而是加载对应 Checklist（auth/database/API/frontend/testing），持续追问直到关键决策点都被覆盖。用户可随时说"先按默认方案来"跳过剩余问题。
-- **偏离追踪模式** — 计划锁定后，每次用户输入和写工具调用都会检查是否偏离。3 档灵敏度：`strict`（任何计划外操作都提醒）、`normal`（持续偏离才提醒）、`loose`（只拦明显跑偏）。
+- **需求澄清模式** — 5 类 Checklist（auth/database/API/frontend/testing），反问直达关键决策
+- **偏离追踪** — 3 档灵敏度 strict/normal/loose
+- **意图树** — Markdown 序列化到 `.agent/plans/{branch}.md`，跨会话恢复
 
-**意图树 Markdown 格式：**
-```markdown
-# Plan: 用户认证系统
-**Status:** in_progress | **Progress:** 3/7 | **Updated:** 2026-07-15
+### 4. Git 顾问系统
 
-## Tasks
-- [ ] 数据库层 — users 表
-  - [x] 创建 users 表（含索引和约束）
-- [ ] 业务逻辑 **← current**
-  - [ ] POST /register 注册接口
-  - [ ] POST /login 登录接口
-- [ ] 认证中间件 (depends: root/1/2)
-- [ ] 安全加固 ⛔
-```
+Agent 是 Git 顾问，不是 Git 执行者。所有写操作需确认。
 
-### 2. Mnemosyne 记忆图谱
-
-超越静态 MEMORY.md 的结构化知识网络。
-
-- **三元组存储** — `(entity) → [relation] → (entity)` 模型：文件、函数、类、概念、错误、配置等作为节点，关系包括 `DEPENDS_ON`、`FIXED_BY`、`IMPLEMENTS`、`CONFIGURES`、`TESTED_BY` 等
-- **记忆衰退** — `weight × exp(-decay_rate × days_since_access)`，长期不使用自动降权
-- **自动提取** — 会话结束时从对话历史中提取三元组，规则匹配 + 关键词抽取
-- **上下文注入** — 每次对话开始时，搜索与当前 query 相关的实体及 1-hop 邻居，注入 system prompt
-- **跨项目全局记忆** — `~/.rubato/global/` 记录用户偏好（技术栈、命名风格、工具选择）
-
-### 3. Git 顾问系统（信息型，不自动执行）
-
-Agent 是 Git 顾问，不是 Git 执行者。所有写操作必须用户明确确认。
-
-**面向新手：**
-- **操作拦截与解释** — 当用户说"帮我提交"时，先展示当前状态（分支、变更文件、远程对比），用通俗语言解释接下来会发生什么，再询问确认
-- **Git 概念解释** — 用当前项目的实际状态解释 rebase/merge/stash/reset 的区别，而非教科书定义
-
-**面向中级：**
-- **Push 前检查** — 自动检查目标分支是否有新提交（需 rebase）、其他分支是否有冲突风险、本地测试是否跑过
-- **分支健康检查** — 会话开始时注入分支摘要，标记过期分支和需要同步的分支
-
-**面向所有用户：**
-- **代码考古** — 自然语言查询代码历史："这个判断条件为什么加？"→ 追踪 git log → 展示 commit message + diff + 关联 issue
-- **语义 Blame** — 传统 `git blame` 只告诉你谁写的，我们结合 Mnemosyne 告诉你为什么这么写、当时修了什么 bug、后来又有谁改过
-- **提交意图验证** — 对比意图树和实际变更文件，提醒"你说了要改 A，怎么还改了 B？"
-- **团队协作雷达** — 纯本地分析，检测远程分支是否有其他人修改了相同的文件，评估冲突风险
-- **工作流自学习** — 观察团队 Git 行为，自动学习分支命名规则、PR 大小习惯、合并偏好
-- **Merge 冲突叙事** — "你的分支做了什么" vs "对方分支做了什么" vs "为什么冲突"，给出 3 种解决建议
-
-### 4. 个人技术知识库（Personal Tech Journal）
-
-在日常对话中积累技术知识，变成专属"第二大脑"。
-
-- **自动提取** — 检测对话中的信号短语（"原来如此"、"这个 bug 是因为"、"解决方案是"、"最佳实践"等），自动提取为结构化知识条目
-- **触发式回忆** — 每次会话开始时用当前 context 搜索知识库，找到高度相关的历史知识自动注入
-- **手动保存** — `/remember <标题>` 随时保存
-- **全功能搜索** — 按关键词、标签、类型、项目搜索；支持全文检索
-- **知识导出** — 导出为 Markdown 文件
+- **操作解释** — commit/push/merge 前用实际状态解释后果
+- **代码考古** — "这个判断条件为什么加？"→ git log → commit message + diff
+- **分支健康** — 标记过期分支、需要同步的分支
+- **语义 Blame** — 结合 Mnemosyne 告诉你为什么这么写
+- **冲突叙事** — "你的 vs 对方的 vs 为什么冲突" + 3 种解决方案
 
 ---
 
 ## 快速开始
 
 ```bash
-# 安装
 git clone https://github.com/dengpan19/rubato.git
 cd rubato
 npm install
 npm run build
 
-# 设置 API Key（也可放在 .env 文件中）
-export DEEPSEEK_API_KEY=sk-xxx
-export ANTHROPIC_API_KEY=sk-ant-xxx
-export OPENAI_API_KEY=sk-xxx
-export TAVILY_API_KEY=tvly-xxx  # Web Search 需要
+# 设置 API Key
+mkdir -p ~/.rubato
+cat > ~/.rubato/.env << 'EOF'
+DEEPSEEK_API_KEY=sk-your-key
+TAVILY_API_KEY=tvly-your-key   # Web Search
+EOF
 
-# 交互模式（默认）
-npm run dev
+# 全局命令
+npm link
 
-# 单次执行
-npm run dev -- -n "帮我写一个 hello world"
-
-# 指定提供商和模型
-npm run dev -- -p anthropic -m claude-sonnet-4-20250514 "重构这个文件"
-
-# 管道输入
-echo "解释这个函数" | rubato -n
+# 启动
+rubato
 ```
 
 ## REPL 命令
 
-交互模式下可用的斜杠命令：
-
-### 意图树 & Grill Me
-
 | 命令 | 说明 |
 |------|------|
 | `/plan` | 查看当前意图树和进度 |
-| `/plan new <描述>` | 开启需求澄清模式，AI 会多轮反问确认细节 |
-| `/plan list` | 列出所有已保存的计划 |
-| `/plan done` | 标记当前计划完成并归档 |
-| `/grillme` | 查看 Grill Me 状态（开关 + 灵敏度） |
-| `/grillme on` / `off` | 开启 / 关闭偏离追踪 |
-| `/grillme strict` | 严格模式 — 任何计划外操作都提醒 |
-| `/grillme normal` | 默认模式 — 持续偏离才提醒 |
-| `/grillme loose` | 宽松模式 — 只拦明显跑偏 |
-
-### Git
-
-| 命令 | 说明 |
-|------|------|
-| `/git` | 显示当前 Git 状态（分支、变更文件、领先/落后远程、最近提交） |
-| `/git health` | 分支健康检查 — 哪些过期了、需要同步、状态异常 |
-
-### 知识库 & 记忆
-
-| 命令 | 说明 |
-|------|------|
-| `/journal` | 查看最近 5 条知识 |
-| `/journal search <关键词>` | 搜索个人技术知识库 |
-| `/journal stats` | 知识库统计（总数、类型分布、热门标签） |
-| `/remember <标题>` | 手动将当前上下文保存到知识库 |
-| `/memory` | Mnemosyne 记忆图谱统计（实体数、关系数） |
-| `/memory search <关键词>` | 搜索记忆图谱中的实体和关系 |
-
-### 通用
-
-| 命令 | 说明 |
-|------|------|
-| `/help` | 显示所有命令 |
-| `/exit` / `/quit` | 退出 |
-| `Ctrl+C` | 退出 |
+| `/plan new <描述>` | 开启需求澄清模式 |
+| `/grillme on/off/strict/normal/loose` | 偏离追踪控制 |
+| `/git` / `/git health` | Git 状态 / 分支健康 |
+| `/remember <标题>` | 手动保存到记忆图谱 |
+| `/memory stats` | 记忆图谱统计 |
+| `/memory search <关键词>` | 搜索记忆图谱 |
+| `/journal search <关键词>` | 搜索个人知识（同 /memory） |
+| `/exit` | 退出 |
 
 ## 配置
 
-### API Key
-
-支持两种方式设置 API Key（优先级：Shell 环境变量 > `.env.local` > `.env`）：
-
-```bash
-# 项目级 .env 文件（推荐，不要提交到 Git）
-echo 'DEEPSEEK_API_KEY=sk-xxx' > .env
-echo 'TAVILY_API_KEY=tvly-xxx' >> .env
-
-# 全局 .env（对所有项目生效）
-echo 'DEEPSEEK_API_KEY=sk-xxx' > ~/.rubato/.env
-```
-
-### config.yml
-
-在项目根目录或 `~/.rubato/config.yml` 创建：
-
 ```yaml
+# ~/.rubato/config.yml 或项目根 .rubato.yml
 model:
-  provider: deepseek              # deepseek | openai | anthropic | groq | openrouter | ollama
+  provider: deepseek
   model: deepseek-chat
-  baseURL: https://custom.com/v1  # 可选：自建代理
   maxRetries: 3
 
 permissions:
-  bash: confirm                   # auto | confirm | manual
-  read: auto
+  bash: confirm
   write: confirm
-  edit: confirm
   web: confirm
-  rules:                          # 可选：细粒度规则
-    - tool: bash
-      pattern: "npm test"
-      action: allow
-    - tool: bash
-      pattern: "rm -rf"
-      action: deny
-
-embedding:
-  source: local_onnx              # local_onnx | api (Phase 2: 向量检索)
 
 mnemosyne:
-  bootstrap_on_first_open: true
-  bootstrap_max_files: 50
-
-session:
-  cleanupPeriodDays: 30
+  bootstrap_on_first_open: true   # 首次打开自动扫描项目
+  bootstrap_max_files: 500
 ```
 
-### 命令行参数
+## 自定义 Agent
 
-```
-rubato [options] [prompt]
+创建 `.rubato/agents/*.md`：
 
-Options:
-  -d, --dir <path>    工作目录（默认：当前目录）
-  -m, --model <name>  模型名称
-  -p, --provider <n>   提供商
-  -n, --one-shot      单次执行后退出（非交互模式）
-  -h, --help          帮助
-```
-
+```markdown
 ---
+name: code-reviewer
+description: Expert code reviewer
+tools: [Read, Grep, Glob, Bash]
+model: inherit
+readonly: true
+maxTurns: 10
+---
+
+You are an expert code reviewer. When reviewing:
+1. Check for correctness first
+2. Then performance
+3. Then style
+Report issues with file paths and line numbers.
+```
+
+AgentTool 会自动发现并列出所有自定义 agent。
 
 ## 架构
 
 ```
 src/
-├── agent/              # Async generator 核心循环
-│   ├── loop.ts         #   主循环：流式调用 → 工具执行 → 偏离检查 → 等待输入
-│   └── read-guard.ts   #   读写守卫
-├── model/              # ModelProvider 接口 + 7 个实现
-│   └── router.ts       #   自动路由
-├── tools/              # 9 个工具
-│   ├── read.ts, write.ts, edit.ts   # 文件操作
-│   ├── bash.ts                      # Shell 执行
-│   ├── grep.ts, glob.ts             # 代码搜索
-│   ├── web.ts                       # WebFetch + WebSearch (Tavily)
-│   └── todo.ts                      # 任务管理
-├── permissions/        # 权限策略引擎（auto/confirm/manual + 规则匹配）
-├── context/            # 上下文链注入（优先级排序）
-│   ├── system-prompt.ts   #   11 模块分层 System Prompt
-│   ├── claude-md.ts       #   CLAUDE.md 注入
-│   ├── memory-md.ts       #   MEMORY.md 注入
-│   ├── git-status.ts      #   Git 状态注入
-│   ├── mnemosyne-source.ts#   Mnemosyne 记忆注入
-│   └── compression.ts     #   MicroCompact 压缩
-├── plan/               # Phase 2a: 意图树 & Grill Me
-│   ├── tree.ts            #   意图树数据结构 + Markdown 序列化
-│   ├── gatherer.ts        #   Grill Me 需求澄清（5 类 Checklist）
-│   ├── planner.ts         #   结构化计划生成
-│   ├── grillme.ts         #   偏离追踪（3 档灵敏度）
-│   └── manager.ts         #   统一门面
-├── memory/             # Phase 2b: Mnemosyne 记忆图谱
-│   ├── store.ts           #   SQLite 图存储（实体 + 关系 + 访问日志 + 衰退）
-│   ├── extractor.ts       #   三元组自动抽取
-│   └── global.ts          #   跨项目全局记忆
-├── git/                # Phase 2c: Git 顾问系统
-│   ├── advisor.ts         #   Git 操作拦截与解释
-│   ├── newbie-guide.ts    #   Git 概念用项目上下文解释
-│   ├── preflight.ts       #   Push 前检查
-│   ├── branch-health.ts   #   分支健康检查
-│   ├── archaeology.ts     #   代码考古（自然语言查历史）
-│   ├── semantic-blame.ts  #   语义 Blame（为什么这么写）
-│   ├── intent-verify.ts   #   提交意图验证
-│   ├── team-radar.ts      #   团队协作雷达
-│   ├── workflow-learner.ts#   工作流自学习
-│   └── conflict-narrator.ts#  Merge 冲突叙事
-├── journal/            # Phase 2d: 个人技术知识库
-│   ├── store.ts           #   SQLite 知识库存储
-│   ├── extractor.ts       #   信号检测 + 自动提取
-│   └── recall.ts          #   触发式回忆
-├── cli/                # 命令行入口
-│   ├── entry.ts           #   参数解析 + REPL + 命令处理
-│   ├── stream-renderer.ts #   行缓冲 Markdown→ANSI 渲染器
-│   └── config-loader.ts   #   配置 + .env 加载
-├── session/            # JSONL 会话持久化
-├── embedding/          # ONNX + sqlite-vec 基础设施
-└── core-types.ts       # 核心类型定义
+├── agent/
+│   ├── loop.ts              # Async generator 核心循环
+│   ├── subagent.ts          # 子 agent spawn + worktree + background
+│   ├── agent-defs.ts        # 自定义 agent .rubato/agents/*.md 加载器
+│   └── read-guard.ts        # 读写守卫
+├── tools/
+│   ├── agent.ts             # AgentTool（spawn 子 agent）
+│   ├── read/write/edit.ts   # 文件操作
+│   ├── bash.ts              # Shell
+│   ├── grep/glob.ts         # 搜索
+│   ├── web.ts               # WebFetch + WebSearch (Tavily)
+│   └── todo.ts              # 任务管理
+├── memory/                  # 自进化 RAG
+│   ├── store.ts             # SQLite + FTS5 + 反馈日志 + 策略权重
+│   ├── seeder.ts            # 项目扫描播种（deps/structure/git/config）
+│   ├── evaluator.ts         # 五维评分引擎
+│   ├── consolidator.ts      # 聚类 → 抽象 → 遗忘
+│   ├── rewriter.ts          # 查询重写学习
+│   ├── fusion.ts            # 三路检索 RRF 融合
+│   ├── vector-search.ts     # 向量相似度搜索
+│   └── extractor.ts         # 三元组自动抽取
+├── context/                 # 上下文注入链
+│   ├── system-prompt.ts     # 11 模块分层 System Prompt
+│   ├── mnemosyne-source.ts  # Mnemosyne 评分过滤注入
+│   ├── claude-md/memory-md/soul/git-status.ts
+│   └── compression.ts       # MicroCompact
+├── embedding/               # 向量嵌入
+│   ├── setup.ts             # ONNX 懒下载 + trigram-hash embedding
+│   └── generate.ts          # Embedding 生成入口
+├── plan/                    # 意图树 & Grill Me
+├── git/                     # Git 顾问系统
+├── journal/                 # 个人知识提取 & 回忆
+├── permissions/             # 权限策略引擎
+├── model/                   # 7 个 LLM 提供商
+├── session/                 # JSONL 会话持久化
+├── cli/                     # 命令行入口 + REPL
+└── core-types.ts            # 核心类型
 ```
-
-### 数据存储
-
-```
-.agent/                       # 项目级数据
-├── plans/{branch}.md         #   意图树 Markdown
-└── workflow-profile.json     #   Git 工作流学习档案
-
-~/.rubato/              # 用户级数据
-├── .env / .env.local         #   全局 API Key
-├── mnemosyne/memory.db       #   项目记忆图谱 (SQLite)
-├── global/memory.db          #   跨项目全局记忆 (SQLite)
-├── journal/journal.db        #   个人技术知识库 (SQLite)
-└── models/                   #   ONNX 嵌入模型
-```
-
-### System Prompt 架构
-
-分层设计，11 个独立模块组合：
-
-| 序号 | 模块 | 内容 |
-|------|------|------|
-| 1 | Identity | 身份 + 能力范围 |
-| 2 | Security | 安全红线 + 双用途工具规则 |
-| 3 | Confidentiality | 不透露工具/模型供应商 |
-| 4 | Behavior | 语气风格 + 专业客观 + 主动 |
-| 5 | Code Conventions | 一致风格 + 错误处理 + 测试 |
-| 6 | Tool Usage | 优先专用工具 + 并行读串行写 |
-| 7 | Task Management | TodoWrite + 编码前规划 |
-| 8 | Plan Guidance | Grill Me 行为指令 + 当前计划注入 |
-| 9 | Git Policy | 不自动提交/push + 写操作需确认 |
-| 10 | Environment | 工作目录 + 平台 + Shell |
-| 11 | Communication | 引用格式 + Markdown 规范 |
-
----
-
-## 工具清单
-
-| 工具 | 类型 | 并行 | 说明 |
-|------|------|------|------|
-| Read | read | ✅ | 读取文件，最多 2000 行 |
-| Grep | read | ✅ | 正则搜索文件内容 |
-| Glob | read | ✅ | 文件名模式匹配 |
-| WebFetch | read | ✅ | HTTP GET + HTML→Markdown 转换 |
-| WebSearch | read | ✅ | Tavily 搜索引擎 |
-| Write | write | ❌ | 创建/覆盖文件 |
-| Edit | write | ❌ | 精确字符串替换 |
-| Bash | write | ❌ | Shell 命令执行 |
-| TodoWrite | write | ❌ | 任务列表管理 |
-
-## 技术栈
-
-- **TypeScript** + Node.js (ES2022, ESM)
-- **openai** v4 — DeepSeek 等 OpenAI 兼容 API
-- **@anthropic-ai/sdk** — Anthropic 流式 + prompt caching
-- **better-sqlite3** — 本地 SQLite（记忆图谱 + 知识库 + 全局记忆）
-- **vitest** — 测试框架（50 个测试）
-- **chalk** — 终端 ANSI 颜色
-
----
 
 ## 测试
 
 ```bash
-npm test              # 运行所有测试（50 tests, 5 suites）
-npm run test:watch    # watch 模式
+npm test              # 85 tests, 6 suites
 ```
+
+| Suite | 测试 | 内容 |
+|-------|------|------|
+| memory | 35 | CRUD、FTS5、手动记忆、关系、反馈、评分、嵌入、整理 |
+| tools | 13 | Read/Write/Edit/Bash/Grep/Glob/Web/Todo |
+| context | 10 | CLAUDE.md、Memory.md、Soul、Git Status、Mnemosyne |
+| model | 10 | DeepSeek、OpenAI、Anthropic、Router |
+| agent | 8 | AgentLoop、Retry、CircuitBreaker、Compaction |
+| permissions | 9 | Auto/Confirm/Manual、Rules、Deny |
+
+## SWE-bench 评测
+
+```bash
+# 安装
+pip3 install swebench datasets
+
+# 下载数据集 + 跑 N 个实例
+bash scripts/swebench-quickstart.sh 10
+
+# 评分（需要 Docker）
+python3 -m swebench.harness.run_evaluation \
+  --dataset_name princeton-nlp/SWE-bench_Lite \
+  --predictions_path predictions.json \
+  --run_id rubato-v0.2
+```
+
+## 技术栈
+
+- **TypeScript** + Node.js (ES2022, ESM)
+- **better-sqlite3** — SQLite + FTS5 + WAL 模式
+- **openai** v4 + **@anthropic-ai/sdk** — LLM 提供商
+- **vitest** — 测试（85 tests）
+- **SWE-bench** — 评测框架
 
 ## License
 
