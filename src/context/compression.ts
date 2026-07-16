@@ -12,8 +12,7 @@ export interface CompactSummary {
 
 /**
  * MicroCompact replaces old message blocks with short summaries.
- * In Phase 1, this is a simple rule-based summarizer.
- * In Phase 2, this will use a cheap model for smarter summarization.
+ * Ensures tool_use/tool_result pairs stay together to avoid API 400 errors.
  */
 export function microCompact(
   messages: Message[],
@@ -21,8 +20,21 @@ export function microCompact(
 ): Message[] {
   if (messages.length <= targetCount) return messages;
 
-  // Keep the most recent messages intact
-  const keepFrom = messages.length - targetCount + 1;
+  // Find a safe cut point: never split a tool_use/tool_result pair
+  let keepFrom = messages.length - targetCount + 1;
+  if (keepFrom <= 0) keepFrom = 1;
+
+  while (keepFrom < messages.length) {
+    const firstKept = messages[keepFrom];
+    // If first kept is a tool_result, its tool_use is in the old batch — move forward
+    if (!isToolResult(firstKept)) break;
+    keepFrom++;
+  }
+
+  if (keepFrom >= messages.length - 1) {
+    keepFrom = Math.max(1, messages.length - 5);
+  }
+
   const toSummarize = messages.slice(0, keepFrom);
   const toKeep = messages.slice(keepFrom);
 
@@ -30,54 +42,97 @@ export function microCompact(
   return [summary, ...toKeep];
 }
 
+function isToolResult(msg: Message): boolean {
+  if (typeof msg.content === "string") return false;
+  return msg.content.some((b) => b.type === "tool_result");
+}
+
 function summarizeMessages(messages: Message[]): Message {
-  const userMsgs = messages.filter((m) => m.role === "user").length;
-  const assistantMsgs = messages.filter((m) => m.role === "assistant").length;
-  const toolCalls = messages.filter((m) => {
-    if (typeof m.content === "string") return false;
-    return m.content.some((b) => b.type === "tool_use");
-  }).length;
+  const parts: string[] = [];
+  parts.push(`[Earlier conversation — ${messages.length} messages compressed]`);
 
-  // Extract key information from messages
-  let summaryText = `[Context summary: ${messages.length} earlier messages `;
-  summaryText += `(${userMsgs} user, ${assistantMsgs} assistant, ${toolCalls} tool calls).`;
-
-  // Extract file paths and tool names for context
+  // Extract user questions
+  const userQuestions: string[] = [];
   const fileRefs = new Set<string>();
   const toolNames = new Set<string>();
+  const errors: string[] = [];
+  const keyFacts: string[] = [];
 
   for (const msg of messages) {
     if (typeof msg.content === "string") {
-      // Try to find file paths
+      if (msg.role === "user" && msg.content.length > 10 && msg.content.length < 300) {
+        userQuestions.push(msg.content.slice(0, 200));
+      }
       const matches = msg.content.match(/\/[\w./-]+/g);
       if (matches) matches.forEach((m) => fileRefs.add(m));
     } else {
       for (const block of msg.content) {
         if (block.type === "tool_use") {
           toolNames.add(block.name);
-          const filePath = block.input.file_path as string;
-          if (filePath) fileRefs.add(filePath);
+          const fp = block.input.file_path as string;
+          if (fp) fileRefs.add(fp);
+          const pattern = block.input.pattern as string;
+          if (pattern) fileRefs.add(pattern);
         }
         if (block.type === "tool_result" && block.is_error) {
-          summaryText += ` Had errors.`;
+          const errPreview = (block.content || "").slice(0, 80);
+          if (errPreview) errors.push(errPreview);
+        }
+        if (block.type === "text" && block.text.length > 20) {
+          const text = block.text;
+          // Extract first substantive sentence (language-agnostic)
+          const firstSentence = text.match(/^(.{30,200})[.。!\n]/);
+          if (firstSentence) {
+            keyFacts.push(firstSentence[1].trim().slice(0, 150));
+          }
+          // Also catch explicit keyword-prefixed findings (Chinese)
+          const cnFindings = text.match(/(?:关键|发现|问题|结论|总结|注意|核心)[：:]\s*(.+?)(?:\n|$)/g);
+          if (cnFindings) {
+            cnFindings.forEach((f) => {
+              const trimmed = f.trim().slice(0, 150);
+              if (!keyFacts.includes(trimmed)) keyFacts.push(trimmed);
+            });
+          }
+          // Catch English observation patterns
+          const enFindings = text.match(/(?:Key (?:finding|insight|observation)|Found|Noted|Important|Critical|Note)[：:]\s*(.+?)(?:\n|$)/gi);
+          if (enFindings) {
+            enFindings.forEach((f) => {
+              const trimmed = f.trim().slice(0, 150);
+              if (!keyFacts.includes(trimmed)) keyFacts.push(trimmed);
+            });
+          }
         }
       }
     }
   }
 
+  if (userQuestions.length > 0) {
+    parts.push(`\nUser requests: ${userQuestions.slice(-5).join(" | ")}`);
+  }
   if (fileRefs.size > 0) {
-    summaryText += ` Files: ${Array.from(fileRefs).slice(0, 10).join(", ")}.`;
+    const files = Array.from(fileRefs).filter((f) => !f.includes("*") && f.length < 120);
+    if (files.length > 0) {
+      parts.push(`Files examined: ${files.slice(0, 15).join(", ")}${files.length > 15 ? ` ...+${files.length - 15}` : ""}`);
+    }
   }
   if (toolNames.size > 0) {
-    summaryText += ` Tools used: ${Array.from(toolNames).join(", ")}.`;
+    parts.push(`Tools used: ${Array.from(toolNames).join(", ")}`);
+  }
+  if (keyFacts.length > 0) {
+    parts.push(`Key findings:\n${keyFacts.slice(0, 8).map((f) => `  - ${f}`).join("\n")}`);
+  }
+  if (errors.length > 0) {
+    parts.push(`Errors encountered: ${errors.slice(0, 4).join("; ")}`);
   }
 
-  summaryText += `]`;
+  // If we got almost nothing, keep a minimal breadcrumb
+  if (parts.length <= 1) {
+    parts.push(`(Messages were mostly tool calls with no extractable text)`);
+  }
 
-  return {
-    role: "user",
-    content: summaryText,
-  };
+  parts.push(`\n[End of compressed context — continue from here]`);
+
+  return { role: "user", content: parts.join("\n") };
 }
 
 // ---- Snip: truncate large content blocks ----

@@ -129,7 +129,7 @@ describe("MicroCompact", () => {
 
     expect(compressed.length).toBeLessThan(messages.length);
     // First message should be the summary
-    expect(compressed[0].content).toContain("[Context summary");
+    expect(compressed[0].content).toContain("[Earlier conversation");
   });
 
   it("keeps messages when under target count", () => {

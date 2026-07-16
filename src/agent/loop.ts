@@ -1,6 +1,8 @@
 // Agent core loop — async generator driving the conversation
 
 import { randomUUID } from "crypto";
+import fs from "fs";
+import path from "path";
 import type {
   ModelProvider,
   AgentConfig,
@@ -34,9 +36,11 @@ import { persistKnowledge } from "../journal/extractor.js";
 
 // ---- Configuration constants ----
 
-const DEFAULT_MAX_TURNS = 50;
+const DEFAULT_MAX_TURNS = 100;
 const DEFAULT_MAX_TOKENS = 16_384;
-const COMPACT_THRESHOLD_MESSAGES = 30;
+const COMPACT_THRESHOLD_MESSAGES = 25;
+const OFFLOAD_THRESHOLD = 30_000; // >30KB → disk offload (matching Claude Code); below stays inline
+const APPROX_TOKEN_LIMIT = 800_000;   // trigger compaction well before provider's 1M limit
 const RETRY_MAX_ATTEMPTS = 3;
 const RETRY_BASE_DELAY_MS = 1000;
 const CIRCUIT_BREAKER_THRESHOLD = 5;
@@ -72,6 +76,8 @@ export interface AgentLoopOptions {
    *  it calls this callback to get the next user message instead of exiting.
    *  Return empty string or null to end the session. */
   getNextUserMessage?: () => Promise<string | null>;
+  /** Set to true to force compaction on next turn (for /compact command) */
+  forceCompaction?: boolean;
 }
 
 export async function* agentLoop(
@@ -81,7 +87,7 @@ export async function* agentLoop(
 
   // ---- Setup ----
   const sessionId = options.sessionId ?? randomUUID();
-  const provider = createProvider(config.model);
+  let provider = createProvider(config.model);
   const tools = options.tools ?? getAllTools();
   const permissionManager = new PolicyEngine(config.permissions);
   const readGuard = new ReadGuard();
@@ -138,12 +144,24 @@ export async function* agentLoop(
 
   // ---- Main turn loop ----
   for (let turn = 0; turn < DEFAULT_MAX_TURNS; turn++) {
+    // Support dynamic model/provider switching via /model command
+    if (provider.name !== config.model.provider) {
+      provider = createProvider(config.model);
+      yield { type: "warning", message: `Switched to ${config.model.provider}/${config.model.model}` };
+    }
+
     yield { type: "turn_start", turn: turn + 1 };
 
-    // Compress if too many messages
-    if (messages.length > COMPACT_THRESHOLD_MESSAGES) {
-      yield { type: "compacting", reason: `Message count ${messages.length} > ${COMPACT_THRESHOLD_MESSAGES}` };
-      const compacted = microCompact(messages, Math.floor(COMPACT_THRESHOLD_MESSAGES * 0.7));
+    // Compress if too many messages OR approaching token limit OR user requested /compact
+    const approxTokens = estimateTokens(messages);
+    const forceCompact = options.forceCompaction;
+    if (forceCompact || messages.length > COMPACT_THRESHOLD_MESSAGES || approxTokens > APPROX_TOKEN_LIMIT) {
+      if (forceCompact) options.forceCompaction = false; // reset
+      const reason = forceCompact
+        ? "User requested compaction"
+        : `Messages: ${messages.length}, ~${Math.round(approxTokens / 1000)}K tokens`;
+      yield { type: "compacting", reason };
+      const compacted = microCompact(messages, Math.floor(COMPACT_THRESHOLD_MESSAGES * 0.6));
       messages.length = 0;
       messages.push(...compacted);
       sessionStore.writeCompaction({ turn, messageCount: messages.length });
@@ -328,7 +346,7 @@ export async function* agentLoop(
             {
               type: "tool_result",
               tool_use_id: toolUse.id,
-              content: result.content,
+              content: offloadIfLarge(result.content, toolUse.name),
               is_error: result.isError,
             },
           ],
@@ -363,7 +381,7 @@ export async function* agentLoop(
           {
             type: "tool_result",
             tool_use_id: tu.id,
-            content: result.content,
+            content: offloadIfLarge(result.content, tu.name),
             is_error: result.isError,
           },
         ],
@@ -538,4 +556,40 @@ function isCircuitBreakerOpen(errorTimestamps: number[]): boolean {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Offload large tool results to disk (Claude Code pattern: >30KB → file).
+ *  Model gets the file path + a preview — it can Read to see the full output.
+ *  Below threshold, content passes through unchanged. */
+function offloadIfLarge(content: string, toolName: string): string {
+  if (content.length <= OFFLOAD_THRESHOLD) return content;
+
+  const dir = "/tmp/rubato-tool-results";
+  fs.mkdirSync(dir, { recursive: true });
+  const filePath = path.join(dir, `${toolName}-${randomUUID().slice(0, 8)}.txt`);
+  fs.writeFileSync(filePath, content, "utf-8");
+
+  const previewLen = 800;
+  const preview = content.slice(0, previewLen);
+  return [
+    `[Full output (${(content.length / 1024).toFixed(1)}KB) offloaded to ${filePath}]`,
+    ``,
+    `Preview:`,
+    preview,
+    content.length > previewLen ? `\n... [use Read ${filePath} to see the full ${(content.length / 1024).toFixed(0)}KB output]` : ``,
+  ].join("\n");
+}
+
+/** Rough token estimate: ~1 token per 3 chars for English/Chinese mixed text */
+function estimateTokens(messages: Message[]): number {
+  let chars = 0;
+  for (const msg of messages) {
+    if (typeof msg.content === "string") chars += msg.content.length;
+    else for (const block of msg.content) {
+      if (block.type === "text") chars += block.text.length;
+      else if (block.type === "tool_result") chars += (block.content?.length ?? 0);
+      else if (block.type === "tool_use") chars += JSON.stringify(block.input).length;
+    }
+  }
+  return Math.ceil(chars / 3);
 }
