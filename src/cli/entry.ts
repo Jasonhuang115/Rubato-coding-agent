@@ -280,12 +280,86 @@ async function handleMemoryCommand(input: string): Promise<void> {
   console.log("\n  用法：/memory、/memory stats、/memory search <q>");
 }
 
+// ---- Model command handler ----
+
+const KNOWN_MODELS: Record<string, string[]> = {
+  deepseek: ["deepseek-chat", "deepseek-reasoner"],
+  anthropic: ["claude-sonnet-4-20250514", "claude-opus-4-20250514", "claude-haiku-4-5-20251001"],
+  openai: ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo"],
+  groq: ["llama-3.3-70b-versatile", "mixtral-8x7b-32768"],
+  openrouter: ["openai/gpt-4o", "anthropic/claude-sonnet-4"],
+  ollama: ["llama3", "codellama"],
+};
+// Note: if a model is not listed, /model <name> still works —
+// it switches provider to match the known provider pattern, or keeps current provider.
+
+function handleModelCommand(input: string, config: { model: { provider: string; model: string } }): void {
+  const args = input.split(/\s+/).slice(1);
+
+  // `/model` — list available models
+  if (args.length === 0) {
+    console.log(`\n  Current: ${config.model.provider}/${config.model.model}\n`);
+    for (const [provider, models] of Object.entries(KNOWN_MODELS)) {
+      const marker = provider === config.model.provider ? " ← current" : "";
+      console.log(`  ${provider}:`);
+      for (const m of models) {
+        const mMarker = provider === config.model.provider && m === config.model.model ? " ←" : "";
+        console.log(`    ${m}${mMarker}`);
+      }
+    }
+    console.log(`\n  Usage: /model <model-name>  (e.g. /model deepseek-reasoner)`);
+    return;
+  }
+
+  const target = args[0].toLowerCase();
+
+  // Find which provider has this model
+  for (const [provider, models] of Object.entries(KNOWN_MODELS)) {
+    const match = models.find((m) => m.toLowerCase() === target);
+    if (match) {
+      const oldModel = config.model.model;
+      const oldProvider = config.model.provider;
+      config.model.provider = provider;
+      config.model.model = match;
+      console.log(`\n  Switched: ${oldProvider}/${oldModel} → ${provider}/${match}`);
+      console.log(`  (takes effect on next message)`);
+      return;
+    }
+  }
+
+  // Check if it's a provider name
+  if (KNOWN_MODELS[target]) {
+    config.model.provider = target;
+    config.model.model = KNOWN_MODELS[target][0];
+    console.log(`\n  Switched to ${target}/${config.model.model}`);
+    return;
+  }
+
+  // Not in known list — try to guess provider from model name prefix
+  const providerHints: Record<string, string> = {
+    deepseek: "deepseek", anthropic: "anthropic",
+    claude: "anthropic", gpt: "openai", openai: "openai",
+    llama: "groq", mixtral: "groq",
+  };
+  let guessedProvider = config.model.provider;
+  for (const [hint, prov] of Object.entries(providerHints)) {
+    if (target.includes(hint)) { guessedProvider = prov; break; }
+  }
+
+  config.model.provider = guessedProvider;
+  config.model.model = args[0];
+  console.log(`\n  Switched to ${guessedProvider}/${args[0]}`);
+  console.log(`  (takes effect on next message)`);
+}
+
 // ---- Main ----
 
 function createRepl(
   rl: readline.Interface,
   planManager: PlanManager,
-  workdir: string
+  workdir: string,
+  config: { model: { provider: string; model: string } },
+  loopOptions?: { forceCompaction?: boolean }
 ): () => Promise<string | null> {
   return () => {
     return new Promise((resolve) => {
@@ -293,9 +367,14 @@ function createRepl(
         const trimmed = answer.trim();
         if (trimmed === "/exit" || trimmed === "/quit") {
           resolve(null);
+        } else if (trimmed === "/compact") {
+          if (loopOptions) { loopOptions.forceCompaction = true; }
+          console.log("\n  Compacting on next turn...");
+          resolve(createRepl(rl, planManager, workdir, config, loopOptions)());
         } else if (trimmed === "/help") {
           console.log("\n  REPL Commands:");
           console.log("  /exit, /quit      — Exit the chat");
+          console.log("  /compact           — Summarize earlier context to free space");
           console.log("  /plan             — Show current plan");
           console.log("  /plan new <desc>  — Start a new plan (gathering mode)");
           console.log("  /plan done        — Mark plan as completed");
@@ -306,24 +385,28 @@ function createRepl(
           console.log("  /journal search <q> — Search personal knowledge base");
           console.log("  /remember <title> — Save current context to journal");
           console.log("  /memory stats     — Show Mnemosyne memory stats");
+          console.log("  /model            — List / switch models");
           console.log("  /help             — Show this help");
           console.log("  Ctrl+C            — Exit");
-          resolve(createRepl(rl, planManager, workdir)());
+          resolve(createRepl(rl, planManager, workdir, config, loopOptions)());
         } else if (trimmed.startsWith("/plan")) {
           handlePlanCommand(trimmed, planManager);
-          resolve(createRepl(rl, planManager, workdir)());
+          resolve(createRepl(rl, planManager, workdir, config, loopOptions)());
         } else if (trimmed.startsWith("/grillme")) {
           handleGrillMeCommand(trimmed, planManager);
-          resolve(createRepl(rl, planManager, workdir)());
+          resolve(createRepl(rl, planManager, workdir, config, loopOptions)());
         } else if (trimmed.startsWith("/git")) {
           handleGitCommand(trimmed, workdir);
-          resolve(createRepl(rl, planManager, workdir)());
+          resolve(createRepl(rl, planManager, workdir, config, loopOptions)());
         } else if (trimmed.startsWith("/journal") || trimmed.startsWith("/remember")) {
           handleJournalCommand(trimmed, workdir);
-          resolve(createRepl(rl, planManager, workdir)());
+          resolve(createRepl(rl, planManager, workdir, config, loopOptions)());
         } else if (trimmed.startsWith("/memory")) {
           handleMemoryCommand(trimmed);
-          resolve(createRepl(rl, planManager, workdir)());
+          resolve(createRepl(rl, planManager, workdir, config, loopOptions)());
+        } else if (trimmed.startsWith("/model")) {
+          handleModelCommand(trimmed, config);
+          resolve(createRepl(rl, planManager, workdir, config, loopOptions)());
         } else {
           resolve(trimmed || null);
         }
@@ -478,13 +561,16 @@ async function main(): Promise<void> {
   const initialPrompt = prompt || "Hello! What would you like to work on?";
   renderer.renderUserMessage(initialPrompt);
 
+  const loopOptions: { forceCompaction?: boolean } = {};
+
   try {
     for await (const event of agentLoop({
       config,
       workingDir: workdir,
       prompt: initialPrompt,
       renderer,
-      getNextUserMessage: rl ? createRepl(rl, planManager, workdir) : undefined,
+      getNextUserMessage: rl ? createRepl(rl, planManager, workdir, config, loopOptions) : undefined,
+      forceCompaction: loopOptions.forceCompaction,
     })) {
       switch (event.type) {
         case "turn_start":
