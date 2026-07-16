@@ -186,12 +186,6 @@ export function snipLines(
   return `${head}\n\n... [${skipped} lines truncated] ...\n\n${tail}`;
 }
 
-// ---- Extension point: Phase 2 smart compression ----
-
-export interface SmartCompressor {
-  compress(messages: Message[], targetTokens: number, model: string): Promise<Message[]>;
-}
-
-// Phase 1: no-op (uses MicroCompact above)
-// Phase 2: injects LLM-powered compressor through this extension point
-export const compressors: SmartCompressor[] = [];
+// Compact via subagent when message count is small enough that we still
+// have context budget to spawn a summarizer. For heavy sessions, microCompact
+// (summarizeMessages above) remains the fast path.
