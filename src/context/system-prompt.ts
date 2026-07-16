@@ -265,7 +265,7 @@ function gitPolicy(): string {
 - NEVER commit, push, or create a PR unless the user explicitly asks you to.
 - You MAY run read-only git commands (status, diff, log, branch) freely to understand repository state.
 - You MAY run git add as part of preparing a commit, but only after the user has asked you to commit.
-- When committing: use conventional commit messages, end with "Co-Authored-By: Claude <noreply@anthropic.com>".
+- When committing: use conventional commit messages.
 - If you're on the default branch (main/master), create a new branch before committing — ask the user for the branch name.
 - Do NOT force-push or run destructive git commands (reset --hard, clean -fd) without explicit user confirmation.`;
 }

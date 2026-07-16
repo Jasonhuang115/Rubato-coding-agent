@@ -159,7 +159,21 @@ export class MnemosyneStore implements MemoryStore {
       );
     `);
 
-    // Rebuild FTS5 index
+    // FTS5 triggers — keep index in sync with entities table
+    this.db.exec(`
+      CREATE TRIGGER IF NOT EXISTS entities_fts_insert AFTER INSERT ON entities BEGIN
+        INSERT INTO entities_fts(rowid, name, content, tags) VALUES (new.id, new.name, new.content, new.tags);
+      END;
+      CREATE TRIGGER IF NOT EXISTS entities_fts_delete AFTER DELETE ON entities BEGIN
+        INSERT INTO entities_fts(entities_fts, rowid, name, content, tags) VALUES('delete', old.id, old.name, old.content, old.tags);
+      END;
+      CREATE TRIGGER IF NOT EXISTS entities_fts_update AFTER UPDATE ON entities BEGIN
+        INSERT INTO entities_fts(entities_fts, rowid, name, content, tags) VALUES('delete', old.id, old.name, old.content, old.tags);
+        INSERT INTO entities_fts(rowid, name, content, tags) VALUES (new.id, new.name, new.content, new.tags);
+      END;
+    `);
+
+    // Rebuild FTS5 index from existing data
     this.db.exec(`INSERT INTO entities_fts(entities_fts) VALUES('rebuild');`);
   }
 

@@ -444,6 +444,17 @@ async function main(): Promise<void> {
   // Initialize embedding infrastructure (lazy download)
   initEmbeddings().catch(() => {});
 
+  // Bootstrap memory seeder on first project open
+  if (config.mnemosyne.bootstrap_on_first_open) {
+    try {
+      const { bootstrapMemories } = await import("../memory/seeder.js");
+      const seedResult = await bootstrapMemories(workdir, config.mnemosyne.bootstrap_max_files);
+      if (seedResult.totalSeeded > 0) {
+        console.log(`🌱 Seeded ${seedResult.totalSeeded} initial memories from project scan.`);
+      }
+    } catch { /* best-effort */ }
+  }
+
   // Load and display active plan
   const planManager = new PlanManager(workdir);
   const planSummary = planManager.getPlanSummary();

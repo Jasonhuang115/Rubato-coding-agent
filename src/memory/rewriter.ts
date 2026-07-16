@@ -1,5 +1,6 @@
 // Query Rewriter — learns from failed queries to improve future retrieval
 import { getMnemosyneStore } from "./store.js";
+import type { MnemosyneStore } from "./store.js";
 
 export interface RewriteResult {
   originalQuery: string; variants: string[]; usedRewrite: boolean;
@@ -18,16 +19,16 @@ export function rewriteQuery(raw: string): RewriteResult {
   return { originalQuery: raw, variants: variants.slice(0, 5), usedRewrite: variants.length > 1 };
 }
 
-export function learnQueryRewrite(originalQuery: string, foundMemoryIds: number[]): void {
+export function learnQueryRewrite(originalQuery: string, foundMemoryIds: number[], store?: MnemosyneStore): void {
   if (foundMemoryIds.length === 0) return;
-  const store = getMnemosyneStore();
+  const s = store ?? getMnemosyneStore();
   const names: string[] = [];
   for (const id of foundMemoryIds) {
-    const entity = store.getEntity(id);
+    const entity = s.getEntity(id);
     if (entity) { names.push(entity.name); names.push(...tokenize(entity.content.slice(0, 200)).slice(0, 5)); }
   }
   const rewrittenQuery = buildRewrittenQuery(originalQuery, names);
-  if (rewrittenQuery && rewrittenQuery !== originalQuery) store.addQueryRewriteRule(originalQuery, rewrittenQuery);
+  if (rewrittenQuery && rewrittenQuery !== originalQuery) s.addQueryRewriteRule(originalQuery, rewrittenQuery);
 }
 
 export function learnFromRetrieval(originalQuery: string, retrievedIds: number[], wasHelpful: boolean): void {

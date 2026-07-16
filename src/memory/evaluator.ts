@@ -2,7 +2,7 @@
 // 5 dimensions: accuracy, freshness, relevance, conflict, frequency
 
 import { getMnemosyneStore } from "./store.js";
-import type { EntityRow } from "./store.js";
+import type { MnemosyneStore, EntityRow } from "./store.js";
 
 export interface MemoryScore {
   total: number;
@@ -22,18 +22,18 @@ export const THRESHOLDS = {
   upgradeMinAccesses: 10,
 };
 
-export function evaluateMemory(entityId: number): ScoreReport | null {
-  const store = getMnemosyneStore();
-  const entity = store.getEntity(entityId);
+export function evaluateMemory(entityId: number, store?: MnemosyneStore): ScoreReport | null {
+  const s = store ?? getMnemosyneStore();
+  const entity = s.getEntity(entityId);
   if (!entity) return null;
 
-  const feedback = store.getFeedbackStats(entityId);
+  const feedback = s.getFeedbackStats(entityId);
   const now = Date.now();
 
   const accuracy = computeAccuracy(feedback);
   const freshness = computeFreshness(entity, now);
-  const relevance = computeRelevance(entityId);
-  const conflict = computeConflict(entity);
+  const relevance = computeRelevance(entityId, s);
+  const conflict = computeConflict(entity, s);
   const frequency = computeFrequency(feedback);
 
   const weights = { accuracy: 0.30, freshness: 0.20, relevance: 0.20, conflict: 0.15, frequency: 0.15 };
@@ -52,16 +52,16 @@ export function evaluateMemory(entityId: number): ScoreReport | null {
   return { entityId: entity.id, entityName: entity.name, score, recommendation };
 }
 
-export function evaluateAll(limit = 200): ScoreReport[] {
-  const store = getMnemosyneStore();
-  return store.getAllEntityIds(limit)
-    .map((row) => evaluateMemory(row.id))
+export function evaluateAll(limit = 200, store?: MnemosyneStore): ScoreReport[] {
+  const s = store ?? getMnemosyneStore();
+  return s.getAllEntityIds(limit)
+    .map((row) => evaluateMemory(row.id, s))
     .filter((r): r is ScoreReport => r !== null)
     .sort((a, b) => b.score.total - a.score.total);
 }
 
-export function getInjectCandidates(query?: string, limit = 10): ScoreReport[] {
-  const all = evaluateAll(100);
+export function getInjectCandidates(query?: string, limit = 10, store?: MnemosyneStore): ScoreReport[] {
+  const all = evaluateAll(100, store);
   const candidates = all.filter((r) => r.recommendation === "inject" || r.recommendation === "upgrade");
   if (query) {
     const lower = query.toLowerCase();
@@ -74,8 +74,8 @@ export function getInjectCandidates(query?: string, limit = 10): ScoreReport[] {
   return candidates.slice(0, limit);
 }
 
-export function getForgetCandidates(limit = 20): ScoreReport[] {
-  return evaluateAll(100).filter((r) => r.recommendation === "forget").slice(0, limit);
+export function getForgetCandidates(limit = 20, store?: MnemosyneStore): ScoreReport[] {
+  return evaluateAll(100, store).filter((r) => r.recommendation === "forget").slice(0, limit);
 }
 
 // ---- Dimension computations ----
@@ -83,23 +83,21 @@ export function getForgetCandidates(limit = 20): ScoreReport[] {
 function computeAccuracy(feedback: { injections: number; successes: number; failures: number }): number {
   const total = feedback.successes + feedback.failures;
   if (total === 0) return 0.5;
-  return (feedback.successes + 1) / (total + 2); // Laplace smoothing
+  return (feedback.successes + 1) / (total + 2);
 }
 
 function computeFreshness(entity: EntityRow, now: number): number {
   const ageDays = (now - entity.updated_at) / (1000 * 60 * 60 * 24);
-  return clamp(Math.exp(-0.0231 * ageDays)); // half-life 30 days
+  return clamp(Math.exp(-0.0231 * ageDays));
 }
 
-function computeRelevance(entityId: number): number {
-  const store = getMnemosyneStore();
-  const totalAccesses = store.getAccessCount(entityId);
+function computeRelevance(entityId: number, s: MnemosyneStore): number {
+  const totalAccesses = s.getAccessCount(entityId);
   return clamp(1 / (1 + Math.exp(-0.15 * (totalAccesses - 5))));
 }
 
-function computeConflict(entity: EntityRow): number {
-  const store = getMnemosyneStore();
-  const relations = store.getRelations(entity.id);
+function computeConflict(entity: EntityRow, s: MnemosyneStore): number {
+  const relations = s.getRelations(entity.id);
   const conflictCount = relations.filter((r) => r.relation_type === "REPLACES" || r.relation_type === "ALTERNATIVE_TO").length;
   return clamp(1.0 - conflictCount * 0.2);
 }

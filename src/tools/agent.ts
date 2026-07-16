@@ -1,6 +1,7 @@
 // Agent tool — spawn a subagent to handle independent subtasks
 // Supports: built-in types, custom definitions, worktree isolation, background execution
 
+import fs from "fs";
 import type { ToolDefinition, AgentContext } from "../core-types.js";
 import { getBuiltinDefinition, spawnSubagent, spawnSubagentInWorktree, spawnSubagentInBackground } from "../agent/subagent.js";
 import { findDefinition, getAllDefinitions } from "../agent/agent-defs.js";
@@ -56,10 +57,39 @@ export const agentTool: ToolDefinition = {
 
     if (model) definition.model = model;
 
-    // Background execution
+    // Background execution — write results to a file the agent can Read later
     if (runInBackground) {
       const handle = spawnSubagentInBackground(definition, prompt, ctx, ctx.config);
-      return { content: `## Background Subagent Spawned\n**Agent ID:** ${handle.agentId}\n**Type:** ${definition.name}\n**Status:** running in background\n\nThe subagent is working independently.` };
+      const resultsPath = `/tmp/rubato-subagent-${handle.agentId}.md`;
+
+      // Fire-and-forget: wait for result, ALWAYS write to file
+      handle.wait().then((r) => {
+        try {
+          const content = `# Subagent Result: ${definition.name}\n**Agent ID:** ${handle.agentId}\n**Status:** ${r.status}\n**Tokens:** ${r.usage.inputTokens} in / ${r.usage.outputTokens} out | **Tool calls:** ${r.usage.toolCalls}\n\n---\n\n${r.output || "(no output)"}`;
+          fs.writeFileSync(resultsPath, content, "utf-8");
+        } catch {
+          // Last-resort: write even if everything above failed
+          try { fs.writeFileSync(resultsPath, `# Subagent Result: ${definition.name}\n**Status:** failed to produce output`, "utf-8"); } catch {}
+        }
+      }).catch((err) => {
+        // Subagent itself crashed — still write a file so agent knows it's done
+        try {
+          fs.writeFileSync(resultsPath, `# Subagent Result: ${definition.name}\n**Agent ID:** ${handle.agentId}\n**Status:** failed\n**Error:** ${err instanceof Error ? err.message : String(err)}`, "utf-8");
+        } catch {}
+      });
+
+      return {
+        content:
+          `## Background Subagent Spawned\n` +
+          `**Agent ID:** ${handle.agentId}\n` +
+          `**Type:** ${definition.name}\n` +
+          `**Status:** running in background\n\n` +
+          `The subagent is working independently. ` +
+          `When it finishes, results will be written to \`${resultsPath}\`. ` +
+          `To check: Read the file ONCE. If it doesn't exist, the subagent is still running — ` +
+          `wait and try one more time. If still missing after 2 attempts, the subagent failed ` +
+          `and you should proceed without it. Do NOT poll the same file more than 3 times.`,
+      };
     }
 
     // Worktree isolation
