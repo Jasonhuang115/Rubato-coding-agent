@@ -59,6 +59,12 @@ export class AnsiStreamRenderer implements StreamRenderer {
     const trimmed = raw.trimEnd(); // keep \n for writing
     const content = trimmed; // line without \n
 
+    // During thinking: all output is dimmed (no code-fence detection needed)
+    if (this.thinkingMode) {
+      process.stdout.write(chalk.dim(`  ${content}`) + "\n");
+      return;
+    }
+
     // Detect fenced code block start/end
     const fenceMatch = content.match(/^\s*```(\w*)\s*$/);
     if (fenceMatch) {
@@ -99,11 +105,19 @@ export class AnsiStreamRenderer implements StreamRenderer {
     process.stdout.write(formatInline(content) + "\n");
   }
 
-  renderThinking(_text: string): void {
+  renderThinking(text: string): void {
     if (!this.thinkingMode) {
+      // Flush any pending line before starting thinking block
+      if (this.lineBuf) {
+        process.stdout.write(formatInline(this.lineBuf));
+        this.lineBuf = "";
+      }
       console.log(chalk.dim("\n  ⟐ Thinking..."));
       this.thinkingMode = true;
     }
+    // Stream the actual thinking content (dimmed)
+    this.lineBuf += text;
+    this.drain();
   }
 
   renderSystemMessage(text: string): void {

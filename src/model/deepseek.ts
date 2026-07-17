@@ -86,6 +86,14 @@ export class DeepSeekProvider implements ModelProvider {
         const delta = choice.delta;
         if (!delta) continue;
 
+        // --- Reasoning/Thinking content (DeepSeek-R1, V4 Pro, etc.) ---
+        if ((delta as Record<string, unknown>).reasoning_content) {
+          yield {
+            type: "thinking_delta",
+            text: (delta as Record<string, unknown>).reasoning_content as string,
+          };
+        }
+
         // --- Text content ---
         if (delta.content) {
           yield { type: "text_delta", text: delta.content };

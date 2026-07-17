@@ -1,0 +1,52 @@
+[
+  {
+    "instance_id": "astropy__astropy-12907",
+    "model_name_or_path": "rubato-v0.2",
+    "model_patch": "diff --git a/astropy/modeling/separable.py b/astropy/modeling/separable.py\nindex a308e27..45bea36 100644\n--- a/astropy/modeling/separable.py\n+++ b/astropy/modeling/separable.py\n@@ -242,7 +242,7 @@ def _cstack(left, right):\n         cright = _coord_matrix(right, 'right', noutp)\n     else:\n         cright = np.zeros((noutp, right.shape[1]))\n-        cright[-right.shape[0]:, -right.shape[1]:] = 1\n+        cright[-right.shape[0]:, -right.shape[1]:] = right\n \n     return np.hstack([cleft, cright])\n \n"
+  },
+  {
+    "instance_id": "astropy__astropy-14182",
+    "model_name_or_path": "rubato-v0.2",
+    "model_patch": ""
+  },
+  {
+    "instance_id": "astropy__astropy-14365",
+    "model_name_or_path": "rubato-v0.2",
+    "model_patch": "diff --git a/astropy/io/ascii/qdp.py b/astropy/io/ascii/qdp.py\nindex 83a4f00..e01148a 100644\n--- a/astropy/io/ascii/qdp.py\n+++ b/astropy/io/ascii/qdp.py\n@@ -60,7 +60,7 @@ def _line_type(line, delimiter=None):\n     ValueError: Unrecognized QDP line...\n     \"\"\"\n     _decimal_re = r\"[+-]?(\\d+(\\.\\d*)?|\\.\\d+)([eE][+-]?\\d+)?\"\n-    _command_re = r\"READ [TS]ERR(\\s+[0-9]+)+\"\n+    _command_re = r\"(?i:READ [TS]ERR(\\s+[0-9]+)+)\"\n \n     sep = delimiter\n     if delimiter is None:\n"
+  },
+  {
+    "instance_id": "astropy__astropy-14995",
+    "model_name_or_path": "rubato-v0.2",
+    "model_patch": "diff --git a/astropy/nddata/mixins/ndarithmetic.py b/astropy/nddata/mixins/ndarithmetic.py\nindex 4153dfc..69d7714 100644\n--- a/astropy/nddata/mixins/ndarithmetic.py\n+++ b/astropy/nddata/mixins/ndarithmetic.py\n@@ -522,6 +522,8 @@ class NDArithmeticMixin:\n             return deepcopy(operand.mask)\n         elif operand is None:\n             return deepcopy(self.mask)\n+        elif operand.mask is None:\n+            return deepcopy(self.mask)\n         else:\n             # Now lets calculate the resulting mask (operation enforces copy)\n             return handle_mask(self.mask, operand.mask, **kwds)\n"
+  },
+  {
+    "instance_id": "astropy__astropy-6938",
+    "model_name_or_path": "rubato-v0.2",
+    "model_patch": "diff --git a/astropy/io/fits/fitsrec.py b/astropy/io/fits/fitsrec.py\nindex 574b407..8890e15 100644\n--- a/astropy/io/fits/fitsrec.py\n+++ b/astropy/io/fits/fitsrec.py\n@@ -1261,7 +1261,7 @@ class FITS_rec(np.recarray):\n \n         # Replace exponent separator in floating point numbers\n         if 'D' in format:\n-            output_field.replace(encode_ascii('E'), encode_ascii('D'))\n+            output_field[:] = output_field.replace(encode_ascii('E'), encode_ascii('D'))\n \n \n def _get_recarray_field(array, key):\n"
+  },
+  {
+    "instance_id": "astropy__astropy-7746",
+    "model_name_or_path": "rubato-v0.2",
+    "model_patch": "diff --git a/astropy/wcs/wcs.py b/astropy/wcs/wcs.py\nindex d3a06f2..9e31233 100644\n--- a/astropy/wcs/wcs.py\n+++ b/astropy/wcs/wcs.py\n@@ -1218,6 +1218,8 @@ reduce these to 2 dimensions using the naxis kwarg.\n                 raise ValueError(\n                     \"Coordinate arrays are not broadcastable to each other\")\n \n+            if axes[0].size == 0:\n+                return [np.array([]) for _ in axes]\n             xy = np.hstack([x.reshape((x.size, 1)) for x in axes])\n \n             if ra_dec_order and sky == 'input':\n"
+  },
+  {
+    "instance_id": "django__django-10914",
+    "model_name_or_path": "rubato-v0.2",
+    "model_patch": "diff --git a/django/conf/global_settings.py b/django/conf/global_settings.py\nindex acee988..bdeec80 100644\n--- a/django/conf/global_settings.py\n+++ b/django/conf/global_settings.py\n@@ -304,7 +304,7 @@ FILE_UPLOAD_TEMP_DIR = None\n \n # The numeric mode to set newly-uploaded files to. The value should be a mode\n # you'd pass directly to os.chmod; see https://docs.python.org/library/os.html#files-and-directories.\n-FILE_UPLOAD_PERMISSIONS = None\n+FILE_UPLOAD_PERMISSIONS = 0o644\n \n # The numeric mode to assign to newly-created directories, when uploading files.\n # The value should be a mode as you'd pass to os.chmod;\ndiff --git a/tests/test_utils/tests.py b/tests/test_utils/tests.py\nindex a1a113a..e953eb6 100644\n--- a/tests/test_utils/tests.py\n+++ b/tests/test_utils/tests.py\n@@ -1099,7 +1099,7 @@ class OverrideSettingsTests(SimpleTestCase):\n         the file_permissions_mode attribute of\n         django.core.files.storage.default_storage.\n         \"\"\"\n-        self.assertIsNone(default_storage.file_permissions_mode)\n+        self.assertEqual(default_storage.file_permissions_mode, 0o644)\n         with self.settings(FILE_UPLOAD_PERMISSIONS=0o777):\n             self.assertEqual(default_storage.file_permissions_mode, 0o777)\n \n"
+  },
+  {
+    "instance_id": "django__django-10924",
+    "model_name_or_path": "rubato-v0.2",
+    "model_patch": ""
+  },
+  {
+    "instance_id": "django__django-11001",
+    "model_name_or_path": "rubato-v0.2",
+    "model_patch": ""
+  },
+  {
+    "instance_id": "django__django-11019",
+    "model_name_or_path": "rubato-v0.2",
+    "model_patch": "diff --git a/django/forms/widgets.py b/django/forms/widgets.py\nindex 02aa32b..ab2f348 100644\n--- a/django/forms/widgets.py\n+++ b/django/forms/widgets.py\n@@ -144,6 +144,12 @@ class Media:\n                         '%s\\n%s' % (combined_list[last_insert_index], combined_list[index]),\n                         MediaOrderConflictWarning,\n                     )\n+                    # Move the existing element before the last_insert_index\n+                    # position to resolve the conflict in favor of list_2's\n+                    # ordering.\n+                    element = combined_list.pop(index)\n+                    combined_list.insert(last_insert_index, element)\n+                    index = last_insert_index\n                 # path already exists in the list. Update last_insert_index so\n                 # that the following elements are inserted in front of this one.\n                 last_insert_index = index\n"
+  }
+]
