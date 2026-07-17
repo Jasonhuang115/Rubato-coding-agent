@@ -5,7 +5,11 @@ import type { SessionMeta } from "../core-types.js";
 export function createSessionMeta(
   id: string,
   model: string,
-  branch?: string
+  branch?: string,
+  opts?: {
+    firstMessage?: string;
+    status?: "active" | "ended";
+  }
 ): SessionMeta {
   return {
     id,
@@ -15,6 +19,9 @@ export function createSessionMeta(
     duration: 0,
     branch: branch ?? "unknown",
     fileHistory: [],
+    firstMessage: opts?.firstMessage,
+    status: opts?.status ?? "active",
+    messageCount: 0,
   };
 }
 

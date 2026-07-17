@@ -43,7 +43,7 @@ function parseAgentFile(filePath: string): SubagentDefinition | null {
   };
 }
 
-function parseSimpleYaml(yaml: string): Record<string, unknown> {
+export function parseSimpleYaml(yaml: string): Record<string, unknown> {
   const result: Record<string, unknown> = {};
   for (const line of yaml.split("\n")) {
     const trimmed = line.trim();
@@ -55,9 +55,13 @@ function parseSimpleYaml(yaml: string): Record<string, unknown> {
     if (typeof value === "string") {
       if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) value = value.slice(1, -1);
       if (value === "true") value = true;
-      if (value === "false") value = false;
-      if (/^\d+$/.test(value as string)) value = parseInt(value as string, 10);
-      if ((value as string).startsWith("[") && (value as string).endsWith("]")) value = (value as string).slice(1, -1).split(",").map((s) => s.trim().replace(/['"]/g, ""));
+      else if (value === "false") value = false;
+      // Guards: after boolean coercion, value may no longer be a string
+      if (typeof value === "string") {
+        // Array check before number check — parseInt would change the type
+        if (value.startsWith("[") && value.endsWith("]")) value = value.slice(1, -1).split(",").map((s) => s.trim().replace(/['"]/g, ""));
+        else if (/^\d+$/.test(value)) value = parseInt(value, 10);
+      }
     }
     result[key] = value;
   }

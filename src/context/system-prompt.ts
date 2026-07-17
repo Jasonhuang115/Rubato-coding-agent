@@ -2,6 +2,7 @@
 // Inspired by Claude Code's layered prompt architecture
 
 import type { AgentContext, ToolDefinition } from "../core-types.js";
+import { getSkillRegistry } from "../skills/registry.js";
 
 export function buildSystemPrompt(
   ctx: AgentContext,
@@ -20,6 +21,7 @@ export function buildSystemPrompt(
     planGuidance(ctx),
     gitPolicy(),
     environment(ctx),
+    skillCatalog(),
     communication(),
     toolSection(toolDescriptions),
   ]
@@ -329,7 +331,42 @@ function environment(ctx: AgentContext): string {
 }
 
 // ================================================================
-// 9. Communication
+// 10. Skill Catalog
+// ================================================================
+
+function skillCatalog(): string {
+  try {
+    const registry = getSkillRegistry();
+    const skills = registry.listSkills();
+    if (skills.length === 0) return "";
+
+    const lines: string[] = [];
+    lines.push("## Available Skills");
+    lines.push(
+      "Skills are invoked by typing `/skill-name` in the REPL (fork mode spawns a subagent, inline mode injects instructions)."
+    );
+    lines.push("");
+    lines.push("| Command | Description | Mode |");
+    lines.push("|---------|-------------|------|");
+    for (const s of skills) {
+      const desc = (s.description ?? "(no description)").slice(0, 60);
+      const mode = s.context === "inline" ? "inline" : "fork";
+      lines.push(`| \`/${s.name}\` | ${desc} | ${mode} |`);
+    }
+    lines.push("");
+    lines.push(
+      "When the user asks to use a skill, tell them to type `/<skill-name>`. " +
+      "You can also suggest relevant skills when they match the user's task."
+    );
+
+    return lines.join("\n");
+  } catch {
+    return ""; // skill system not initialized yet
+  }
+}
+
+// ================================================================
+// 11. Communication
 // ================================================================
 
 function communication(): string {

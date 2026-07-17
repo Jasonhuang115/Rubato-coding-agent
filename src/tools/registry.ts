@@ -47,6 +47,10 @@ export async function dispatch(
   }
 }
 
+export function unregister(name: string): boolean {
+  return tools.delete(name);
+}
+
 export function clear(): void {
   tools.clear();
 }

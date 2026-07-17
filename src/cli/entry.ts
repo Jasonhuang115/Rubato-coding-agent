@@ -1,14 +1,15 @@
 #!/usr/bin/env node
 // CLI entry point — parses arguments, loads config, runs the agent
 
+import { randomUUID } from "crypto";
 import path from "path";
 import fs from "fs";
 import * as readline from "readline";
 import YAML from "yaml";
-import type { ConfirmDecision } from "../core-types.js";
+import type { ConfirmDecision, SessionMeta } from "../core-types.js";
 import { loadConfig, loadEnvFiles } from "./config-loader.js";
 import { AnsiStreamRenderer } from "./stream-renderer.js";
-import { agentLoop } from "../agent/loop.js";
+import { agentLoop, abortCurrentRequest } from "../agent/loop.js";
 import {
   register,
   getTool,
@@ -24,6 +25,7 @@ import { webFetchTool, webSearchTool } from "../tools/web.js";
 import { todoWriteTool } from "../tools/todo.js";
 import { planTool } from "../tools/plan.js";
 import { agentTool } from "../tools/agent.js";
+import { skillTool } from "../tools/skill.js";
 import { PlanManager } from "../plan/manager.js";
 import { getJournalStore } from "../journal/store.js";
 import { getMnemosyneStore } from "../memory/store.js";
@@ -31,6 +33,13 @@ import { initCustomDefinitions } from "../agent/agent-defs.js";
 import { initEmbeddings } from "../embedding/generate.js";
 import { getGitState, getCurrentBranch } from "../git/advisor.js";
 import { getBranchHealth } from "../git/branch-health.js";
+import { loadAllSkills } from "../skills/loader.js";
+import { getSkillRegistry } from "../skills/registry.js";
+import type { SkillDefinition } from "../skills/types.js";
+import { spawnSubagent } from "../agent/subagent.js";
+import type { AgentConfig, AgentContext } from "../core-types.js";
+import { PolicyEngine } from "../permissions/policy.js";
+import { SessionManager } from "../session/manager.js";
 
 // Register all tools
 register(readTool);
@@ -44,6 +53,7 @@ register(webSearchTool);
 register(todoWriteTool);
 register(planTool);
 register(agentTool);
+register(skillTool);
 
 // ---- Argument parsing ----
 
@@ -53,6 +63,8 @@ function parseArgs(): {
   model?: string;
   provider?: string;
   interactive: boolean;
+  continueSession: boolean;
+  resumeSession?: string;
 } {
   const args = process.argv.slice(2);
   let workdir = process.cwd();
@@ -60,6 +72,8 @@ function parseArgs(): {
   let provider: string | undefined;
   let interactive = true;   // default: interactive
   let oneShot = false;
+  let continueSession = false;
+  let resumeSession: string | undefined;
   const positional: string[] = [];
 
   for (let i = 0; i < args.length; i++) {
@@ -80,6 +94,14 @@ function parseArgs(): {
       case "--one-shot":
         oneShot = true;
         interactive = false;
+        break;
+      case "-c":
+      case "--continue":
+        continueSession = true;
+        break;
+      case "-r":
+      case "--resume":
+        resumeSession = args[++i] ?? "";
         break;
       case "-h":
       case "--help":
@@ -104,7 +126,7 @@ function parseArgs(): {
     interactive = false;
   }
 
-  return { prompt, workdir, model, provider, interactive };
+  return { prompt, workdir, model, provider, interactive, continueSession, resumeSession };
 }
 
 function getStdinPrompt(): string {
@@ -141,6 +163,8 @@ Options:
   -d, --dir <path>    Working directory (default: current directory)
   -m, --model <name>  Model override (e.g. "deepseek-chat", "claude-sonnet-4-20250514")
   -p, --provider <n>  Provider override (e.g. "deepseek", "openai", "anthropic")
+  -c, --continue      Resume the most recent session in this project
+  -r, --resume [id]   Resume a specific session by ID (or show picker)
   -n, --one-shot      Run once and exit (no REPL)
   -h, --help          Show this help
 
@@ -151,8 +175,11 @@ API Keys:
 
 REPL Commands:
   /exit, /quit         Exit the chat
+  /clear               Start a fresh session (saves current)
+  /sessions            List project sessions
+  /sessions resume <n> Resume a past session
   /help                Show REPL help
-  Ctrl+C               Exit
+  Ctrl+C               Interrupt output / Exit when idle
 
 Config:
   Place .rubato.yml in your project root or ~/.rubato/config.yml
@@ -285,17 +312,6 @@ async function handleMemoryCommand(input: string): Promise<void> {
 
 // ---- Model command handler ----
 
-const KNOWN_MODELS: Record<string, string[]> = {
-  deepseek: ["deepseek-chat", "deepseek-reasoner"],
-  anthropic: ["claude-sonnet-4-20250514", "claude-opus-4-20250514", "claude-haiku-4-5-20251001"],
-  openai: ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo"],
-  groq: ["llama-3.3-70b-versatile", "mixtral-8x7b-32768"],
-  openrouter: ["openai/gpt-4o", "anthropic/claude-sonnet-4"],
-  ollama: ["llama3", "codellama"],
-};
-// Note: if a model is not listed, /model <name> still works —
-// it switches provider to match the known provider pattern, or keeps current provider.
-
 function saveModelPreference(provider: string, model: string): void {
   const dir = path.join(process.env.HOME ?? "/tmp", ".rubato");
   fs.mkdirSync(dir, { recursive: true });
@@ -310,66 +326,279 @@ function saveModelPreference(provider: string, model: string): void {
   fs.writeFileSync(configPath, YAML.stringify(existing), "utf-8");
 }
 
-function handleModelCommand(input: string, config: { model: { provider: string; model: string } }): void {
+function handleModelCommand(
+  input: string,
+  config: { model: { provider: string; model: string } }
+): void {
   const args = input.split(/\s+/).slice(1);
 
-  // `/model` — list available models
   if (args.length === 0) {
-    console.log(`\n  Current: ${config.model.provider}/${config.model.model}\n`);
-    for (const [provider, models] of Object.entries(KNOWN_MODELS)) {
-      const marker = provider === config.model.provider ? " ← current" : "";
-      console.log(`  ${provider}:`);
-      for (const m of models) {
-        const mMarker = provider === config.model.provider && m === config.model.model ? " ←" : "";
-        console.log(`    ${m}${mMarker}`);
-      }
-    }
-    console.log(`\n  Usage: /model <model-name>  (e.g. /model deepseek-reasoner)`);
+    console.log(`\n  Current: ${config.model.provider}/${config.model.model}`);
+    console.log(`  Type /model <name> to switch  (e.g. /model deepseek-chat)`);
     return;
   }
 
-  const target = args[0].toLowerCase();
+  const target = args[0];
+  const targetLower = target.toLowerCase();
 
-  // Find which provider has this model
-  for (const [provider, models] of Object.entries(KNOWN_MODELS)) {
-    const match = models.find((m) => m.toLowerCase() === target);
-    if (match) {
-      const oldModel = config.model.model;
-      const oldProvider = config.model.provider;
-      config.model.provider = provider;
-      config.model.model = match;
-      saveModelPreference(provider, match);
-      console.log(`\n  Switched: ${oldProvider}/${oldModel} → ${provider}/${match}`);
-      console.log(`  (takes effect on next message)`);
-      return;
+  // Try to guess provider from model name
+  let provider = config.model.provider; // keep current by default
+  if (targetLower.includes("claude") || targetLower.includes("anthropic")) provider = "anthropic";
+  else if (targetLower.includes("gpt") || targetLower.includes("openai")) provider = "openai";
+  else if (targetLower.includes("deepseek")) provider = "deepseek";
+  else if (targetLower.includes("llama") || targetLower.includes("mixtral")) provider = "groq";
+
+  config.model.provider = provider;
+  config.model.model = target;
+  saveModelPreference(provider, target);
+  console.log(`\n  Switched to ${provider}/${target}  (takes effect on next message)`);
+}
+
+// ---- Sessions command handler ----
+
+interface SessionsCommandResult {
+  restartLoop: boolean;
+  resumeId?: string;
+}
+
+function handleSessionsCommand(
+  input: string,
+  sessionManager: SessionManager,
+): SessionsCommandResult {
+  const args = input.split(/\s+/).slice(1);
+
+  if (args.length === 0 || args[0] === "list") {
+    const sessions = sessionManager.listSessions();
+    if (sessions.length === 0) {
+      console.log("\n  No sessions found for this project.");
+      return { restartLoop: false };
     }
+    console.log("\n  ── Sessions ──");
+    console.log("  #   | When                | Status  | Model         | First message");
+    console.log("  ----|---------------------|---------|---------------|--------------");
+    sessions.forEach((s, i) => {
+      const when = new Date(s.createdAt).toLocaleString().slice(0, 19);
+      const status = s.status === "active" ? "\x1b[32mactive\x1b[0m" : "\x1b[90mended\x1b[0m";
+      const model = s.model.slice(0, 13).padEnd(13);
+      const msg = (s.firstMessage ?? "").slice(0, 50);
+      const idx = String(i).padEnd(3);
+      const tokenStr = s.tokenCount > 0 ? `\x1b[90m${Math.round(s.tokenCount / 1000)}k\x1b[0m` : "";
+      console.log(`  ${idx} | ${when} | ${status}   | ${model} | ${msg} ${tokenStr}`);
+    });
+    console.log(`\n  /sessions resume <#> or <id-prefix> to resume`);
+    return { restartLoop: false };
   }
 
-  // Check if it's a provider name
-  if (KNOWN_MODELS[target]) {
-    config.model.provider = target;
-    config.model.model = KNOWN_MODELS[target][0];
-    saveModelPreference(target, KNOWN_MODELS[target][0]);
-    console.log(`\n  Switched to ${target}/${config.model.model}`);
-    return;
+  if (args[0] === "resume") {
+    const target = args[1];
+    if (!target) {
+      console.log("\n  Usage: /sessions resume <#> or /sessions resume <id-prefix>");
+      return { restartLoop: false };
+    }
+
+    const sessions = sessionManager.listSessions();
+
+    // Try numeric index first
+    const numIndex = parseInt(target, 10);
+    if (!isNaN(numIndex) && numIndex >= 0 && numIndex < sessions.length) {
+      return { restartLoop: true, resumeId: sessions[numIndex].id };
+    }
+
+    // Try ID prefix match
+    const matches = sessions.filter((s) => s.id.startsWith(target));
+    if (matches.length === 1) {
+      return { restartLoop: true, resumeId: matches[0].id };
+    } else if (matches.length > 1) {
+      console.log("\n  Multiple sessions match. Be more specific:");
+      matches.forEach((s) => console.log(`    ${s.id} — ${s.firstMessage?.slice(0, 60)}`));
+      return { restartLoop: false };
+    }
+
+    console.log(`\n  No session found matching "${target}".`);
+    return { restartLoop: false };
   }
 
-  // Not in known list — try to guess provider from model name prefix
-  const providerHints: Record<string, string> = {
-    deepseek: "deepseek", anthropic: "anthropic",
-    claude: "anthropic", gpt: "openai", openai: "openai",
-    llama: "groq", mixtral: "groq",
+  console.log("\n  Usage: /sessions, /sessions resume <#|id-prefix>");
+  return { restartLoop: false };
+}
+
+// ---- Skill command handler ----
+
+/**
+ * Handle a /skill-name command from the REPL.
+ * Returns:
+ *   - string: pass this as user input to the model (inline mode, or passthrough)
+ *   - null/undefined: already handled, recurse REPL (fork mode)
+ */
+async function handleSkillCommand(
+  input: string,
+  workdir: string,
+  config: AgentConfig
+): Promise<string | null> {
+  const parts = input.split(/\s+/);
+  const cmdName = parts[0].slice(1); // strip leading "/"
+  const args = parts.slice(1).join(" ");
+
+  const registry = getSkillRegistry();
+  const skill = registry.getSkill(cmdName);
+
+  if (!skill) {
+    console.log(`\n  Unknown skill: /${cmdName}`);
+    return null; // recurse REPL
+  }
+
+  const context = skill.context ?? "inline";
+
+  if (context === "inline") {
+    // Inline skills: pass through to the model.
+    // The skill's instructions are already in the system prompt catalog.
+    // We just forward the user's message so the model can apply the skill.
+    if (args) {
+      console.log(`\n  📋 Skill "${skill.name}" — passing to model...`);
+    }
+    // Return the input without the leading slash prefix, so the model sees
+    // the intent naturally: "/code-review src/auth.ts" → "code-review src/auth.ts"
+    return args || skill.name;
+  }
+
+  // Fork mode: spawn a subagent directly from the REPL
+  console.log(`\n  🔧 Running skill "${skill.name}"...`);
+
+  // Build a minimal subagent definition from the skill
+  const subagentDef = {
+    name: skill.name,
+    description: skill.description ?? `Run the "${skill.name}" skill`,
+    systemPrompt:
+      skill.systemPrompt ??
+      `You are the "${skill.name}" skill. ${skill.description ?? ""}`,
+    tools: skill.tools ?? ["Read", "Grep", "Glob", "Bash"],
+    model: skill.model ?? "inherit",
+    readonly: true,
+    maxTurns: skill.maxTurns ?? 15,
   };
-  let guessedProvider = config.model.provider;
-  for (const [hint, prov] of Object.entries(providerHints)) {
-    if (target.includes(hint)) { guessedProvider = prov; break; }
+
+  // Build permissions with allowed-tools pre-authorized
+  const permissions = { ...config.permissions };
+  if (skill.allowedTools && skill.allowedTools.length > 0) {
+    const allowRules = skill.allowedTools.map((pattern) => ({
+      tool: "*" as const,
+      pattern,
+      action: "allow" as const,
+      reason: `Skill "${skill.name}" pre-authorization`,
+    }));
+    permissions.rules = [...(permissions.rules ?? []), ...allowRules];
   }
 
-  config.model.provider = guessedProvider;
-  config.model.model = args[0];
-  saveModelPreference(guessedProvider, args[0]);
-  console.log(`\n  Switched to ${guessedProvider}/${args[0]}`);
-  console.log(`  (takes effect on next message)`);
+  // Build a minimal agent context with allowed-tools permissions
+  const minimalCtx: AgentContext = {
+    workingDir: workdir,
+    sessionId: `skill-${cmdName}-${Date.now()}`,
+    readGuard: {
+      hasRead: () => false,
+      markAsRead: () => {},
+      serialize: () => ({ files: {} }),
+    },
+    permissionManager: new PolicyEngine(permissions),
+    config: { ...config, permissions },
+  };
+
+  try {
+    const result = await spawnSubagent(
+      subagentDef,
+      args || `Run the "${skill.name}" skill`,
+      minimalCtx,
+      { ...config, permissions }
+    );
+
+    console.log(`\n  ── ${skill.name} output ──`);
+    console.log(result.output || "(no output)");
+    if (result.usage.toolCalls > 0) {
+      console.log(
+        `  [${result.status}] ${result.usage.inputTokens} in / ${result.usage.outputTokens} out / ${result.usage.toolCalls} tools`
+      );
+    }
+  } catch (err) {
+    console.log(
+      `\n  ✖ Skill "${skill.name}" failed: ${err instanceof Error ? err.message : err}`
+    );
+  }
+
+  return null; // recurse REPL after fork-mode skill completes
+}
+
+// ---- Tab completion & / menu ----
+
+function getSlashCompletions(): string[] {
+  const builtin = [
+    "/exit", "/quit", "/compact", "/clear", "/help",
+    "/plan", "/plan new", "/plan list", "/plan done", "/plan show",
+    "/grillme", "/grillme on", "/grillme off", "/grillme strict", "/grillme normal", "/grillme loose",
+    "/git", "/git health",
+    "/journal", "/journal recent", "/journal search", "/journal stats",
+    "/remember",
+    "/memory", "/memory stats", "/memory search",
+    "/model",
+    "/sessions", "/sessions list", "/sessions resume",
+  ];
+
+  // Add skill commands
+  const skillCmds = getSkillRegistry()
+    .listSkills()
+    .map((s) => `/${s.name}`);
+
+  return [...builtin, ...skillCmds];
+}
+
+function createSlashCompleter(): readline.Completer {
+  const commands = getSlashCompletions();
+  return (line: string) => {
+    if (!line.startsWith("/")) {
+      return [[], line];
+    }
+
+    const hits = commands.filter((cmd) => cmd.startsWith(line));
+    // If only one hit, complete it with trailing space
+    if (hits.length === 1 && hits[0] === line) {
+      return [[], line];
+    }
+    return [hits.length > 0 ? hits : [], line];
+  };
+}
+
+function showSlashMenu(): void {
+  const skills = getSkillRegistry().listSkills();
+
+  console.log("\n  ── Commands ──");
+  console.log("  /exit, /quit       Exit");
+  console.log("  /clear              Start a fresh session");
+  console.log("  /compact            Compact context");
+  console.log("  /plan               Show plan | /plan new <desc> | /plan done");
+  console.log("  /grillme            Toggle plan tracking | /grillme on/off/strict/normal/loose");
+  console.log("  /git                Git status | /git health");
+  console.log("  /journal            Search journal | /journal search <q>");
+  console.log("  /remember <title>   Save to journal");
+  console.log("  /memory             Memory stats | /memory search <q>");
+  console.log("  /model              Switch model | /model <name>");
+  console.log("  /sessions           List sessions | /sessions resume <#>");
+  console.log("  /help               Full help");
+
+  if (skills.length > 0) {
+    console.log("\n  ── Skills ──");
+    for (const s of skills) {
+      const mode = s.context === "fork" ? "⚡fork" : "📋inline";
+      console.log(`  /${s.name.padEnd(18)} ${mode}  ${s.description ?? ""}`);
+    }
+  }
+
+  console.log(`\n  Tab → autocomplete. Type /name for details.`);
+}
+
+// ---- Loop state (for session restart signaling) ----
+
+interface LoopState {
+  shouldRestart: boolean;
+  newSessionId?: string;
+  resumeSummary?: string;
 }
 
 // ---- Main ----
@@ -378,22 +607,56 @@ function createRepl(
   rl: readline.Interface,
   planManager: PlanManager,
   workdir: string,
-  config: { model: { provider: string; model: string } },
-  loopOptions?: { forceCompaction?: boolean }
+  config: AgentConfig,
+  loopOptions: { forceCompaction?: boolean },
+  sessionManager: SessionManager,
+  loopState: LoopState,
+  currentSessionId: () => string,
+  onSessionFinalize: () => void,
 ): () => Promise<string | null> {
   return () => {
     return new Promise((resolve) => {
       rl.question("\n▸ You: ", (answer) => {
         const trimmed = answer.trim();
-        if (trimmed === "/exit" || trimmed === "/quit") {
+        if (trimmed === "/") {
+          showSlashMenu();
+          resolve(createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)());
+        } else if (trimmed === "/exit" || trimmed === "/quit") {
+          onSessionFinalize();
+          resolve(null);
+        } else if (trimmed === "/clear") {
+          // Finalize current session and restart
+          onSessionFinalize();
+          loopState.shouldRestart = true;
+          loopState.newSessionId = randomUUID();
+          console.log("\n  ✨ Session saved. Starting fresh...");
           resolve(null);
         } else if (trimmed === "/compact") {
           if (loopOptions) { loopOptions.forceCompaction = true; }
           console.log("\n  Compacting on next turn...");
-          resolve(createRepl(rl, planManager, workdir, config, loopOptions)());
+          resolve(createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)());
+        } else if (trimmed.startsWith("/sessions")) {
+          const result = handleSessionsCommand(trimmed, sessionManager);
+          if (result.restartLoop && result.resumeId) {
+            onSessionFinalize();
+            try {
+              const { summary } = sessionManager.resumeSession(result.resumeId);
+              loopState.shouldRestart = true;
+              loopState.newSessionId = randomUUID();
+              loopState.resumeSummary = summary;
+              console.log(`\n  📋 Resuming session ${result.resumeId.slice(0, 8)}...`);
+            } catch (err) {
+              console.log(`\n  ✖ Failed to resume: ${err instanceof Error ? err.message : err}`);
+              loopState.shouldRestart = false;
+            }
+            resolve(null);
+          } else {
+            resolve(createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)());
+          }
         } else if (trimmed === "/help") {
           console.log("\n  REPL Commands:");
           console.log("  /exit, /quit      — Exit the chat");
+          console.log("  /clear             — Start a fresh session (saves current)");
           console.log("  /compact           — Summarize earlier context to free space");
           console.log("  /plan             — Show current plan");
           console.log("  /plan new <desc>  — Start a new plan (gathering mode)");
@@ -406,27 +669,47 @@ function createRepl(
           console.log("  /remember <title> — Save current context to journal");
           console.log("  /memory stats     — Show Mnemosyne memory stats");
           console.log("  /model            — List / switch models");
+          console.log("  /sessions         — List project sessions | /sessions resume <#>");
           console.log("  /help             — Show this help");
-          console.log("  Ctrl+C            — Exit");
-          resolve(createRepl(rl, planManager, workdir, config, loopOptions)());
+          console.log("  Ctrl+C            — Interrupt / Exit when idle");
+          // List loaded skills
+          const skills = getSkillRegistry().listSkills();
+          if (skills.length > 0) {
+            console.log("\n  Skills (/<name>):");
+            for (const s of skills) {
+              const mode = s.context === "inline" ? "inline" : "fork";
+              console.log(`  /${s.name.padEnd(18)} — ${s.description ?? "(no description)"} [${mode}]`);
+            }
+          }
+          resolve(createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)());
         } else if (trimmed.startsWith("/plan")) {
           handlePlanCommand(trimmed, planManager);
-          resolve(createRepl(rl, planManager, workdir, config, loopOptions)());
+          resolve(createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)());
         } else if (trimmed.startsWith("/grillme")) {
           handleGrillMeCommand(trimmed, planManager);
-          resolve(createRepl(rl, planManager, workdir, config, loopOptions)());
+          resolve(createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)());
         } else if (trimmed.startsWith("/git")) {
           handleGitCommand(trimmed, workdir);
-          resolve(createRepl(rl, planManager, workdir, config, loopOptions)());
+          resolve(createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)());
         } else if (trimmed.startsWith("/journal") || trimmed.startsWith("/remember")) {
           handleJournalCommand(trimmed, workdir);
-          resolve(createRepl(rl, planManager, workdir, config, loopOptions)());
+          resolve(createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)());
         } else if (trimmed.startsWith("/memory")) {
           handleMemoryCommand(trimmed);
-          resolve(createRepl(rl, planManager, workdir, config, loopOptions)());
+          resolve(createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)());
         } else if (trimmed.startsWith("/model")) {
           handleModelCommand(trimmed, config);
-          resolve(createRepl(rl, planManager, workdir, config, loopOptions)());
+          resolve(createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)());
+        } else if (trimmed.startsWith("/") && getSkillRegistry().getSkill(trimmed.split(/\s+/)[0].slice(1))) {
+          handleSkillCommand(trimmed, workdir, config).then((passthrough) => {
+            if (typeof passthrough === "string") {
+              // Inline skill: pass through to the model
+              resolve(passthrough);
+            } else {
+              // Fork skill or unknown: already handled, next REPL prompt
+              resolve(createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)());
+            }
+          });
         } else {
           resolve(trimmed || null);
         }
@@ -570,7 +853,7 @@ function createConfirmPrompt(
 }
 
 async function main(): Promise<void> {
-  const { prompt, workdir, model, provider, interactive } = parseArgs();
+  const { prompt, workdir, model, provider, interactive, continueSession, resumeSession } = parseArgs();
 
   // Load API keys from .env files (shell env takes priority)
   loadEnvFiles(workdir);
@@ -588,6 +871,9 @@ async function main(): Promise<void> {
   console.log(`Working dir: ${workdir}`);
   console.log(`Tools: ${getAllTools().length} registered`);
 
+  // ---- Session manager ----
+  const sessionManager = new SessionManager(workdir);
+
   // Migrate old Journal entries into unified Mnemosyne (one-time, best-effort)
   try {
     const store = getMnemosyneStore();
@@ -600,6 +886,8 @@ async function main(): Promise<void> {
 
   // Initialize custom agent definitions
   try { initCustomDefinitions(workdir); } catch { /* optional */ }
+  // Load skills from .rubato/skills/
+  try { loadAllSkills(workdir); } catch { /* optional */ }
   // Initialize embedding infrastructure (lazy download)
   initEmbeddings().catch(() => {});
 
@@ -625,80 +913,232 @@ async function main(): Promise<void> {
     console.log(`Mode: interactive (type /exit to quit, /help for help)`);
   }
 
+  // ---- Handle --continue / --resume ----
+  let effectivePrompt = prompt || "Hello! What would you like to work on?";
+  let initialResumeSummary: string | undefined;
+
+  if (continueSession) {
+    const recent = SessionManager.findMostRecent(workdir);
+    if (recent) {
+      try {
+        const { summary } = sessionManager.resumeSession(recent.id);
+        initialResumeSummary = summary;
+        console.log(`\n  📋 Resuming session: ${recent.id.slice(0, 8)}...`);
+        if (recent.firstMessage) {
+          console.log(`  "${recent.firstMessage.slice(0, 80)}"`);
+        }
+      } catch { /* best-effort */ }
+    } else {
+      console.log("\n  No previous sessions found for this project.");
+    }
+  }
+
+  if (resumeSession !== undefined) {
+    if (resumeSession === "") {
+      // Show interactive picker
+      const sessions = sessionManager.listSessions();
+      if (sessions.length === 0) {
+        console.log("\n  No sessions found for this project.");
+        process.exit(1);
+      }
+      console.log("\n  Select a session to resume:");
+      sessions.forEach((s, i) => {
+        const when = new Date(s.createdAt).toLocaleString();
+        console.log(`  ${i}: ${s.id.slice(0, 8)}... — ${s.firstMessage?.slice(0, 60)} (${s.status})`);
+      });
+      // Use readline to get selection
+      const selection = await new Promise<string>((resolve) => {
+        const selRl = readline.createInterface({ input: process.stdin, output: process.stdout });
+        selRl.question("\n  Enter #: ", (answer) => {
+          selRl.close();
+          resolve(answer.trim());
+        });
+      });
+      const idx = parseInt(selection, 10);
+      if (isNaN(idx) || idx < 0 || idx >= sessions.length) {
+        console.log("\n  Invalid selection.");
+        process.exit(1);
+      }
+      const { summary } = sessionManager.resumeSession(sessions[idx].id);
+      initialResumeSummary = summary;
+    } else {
+      // Resume specific session by ID/prefix
+      const sessions = sessionManager.listSessions();
+      const matches = sessions.filter((s) => s.id.startsWith(resumeSession));
+      if (matches.length === 0) {
+        console.log(`\n  No session found matching "${resumeSession}".`);
+        process.exit(1);
+      }
+      if (matches.length > 1) {
+        console.log("\n  Multiple matches. Be more specific:");
+        matches.forEach((s) => console.log(`    ${s.id}`));
+        process.exit(1);
+      }
+      try {
+        const { summary } = sessionManager.resumeSession(matches[0].id);
+        initialResumeSummary = summary;
+        console.log(`\n  📋 Resuming session: ${matches[0].id.slice(0, 8)}...`);
+      } catch { /* best-effort */ }
+    }
+  }
+
   // Setup REPL if interactive
   const rl = interactive
     ? readline.createInterface({
         input: process.stdin,
         output: process.stdout,
+        completer: createSlashCompleter(),
       })
     : null;
 
-  // Show initial prompt in interactive mode
-  const initialPrompt = prompt || "Hello! What would you like to work on?";
-  renderer.renderUserMessage(initialPrompt);
+  // In interactive mode with no initial prompt, wait for the user's first real message
+  if (interactive && !prompt && !continueSession && !resumeSession) {
+    // Don't render a fake user message — get real input from user first
+    effectivePrompt = await new Promise<string>((resolve) => {
+      rl!.question("\n▸ You: ", (answer) => {
+        const trimmed = answer.trim();
+        if (!trimmed) {
+          resolve("/exit"); // empty input → exit
+        } else {
+          resolve(trimmed);
+        }
+      });
+    });
+    if (effectivePrompt === "/exit") {
+      console.log("Exiting...");
+      if (rl) rl.close();
+      process.exit(0);
+    }
+    // Don't renderUserMessage here — readline already echoes what the user typed
+  } else if (effectivePrompt) {
+    renderer.renderUserMessage(effectivePrompt);
+  }
 
   const loopOptions: { forceCompaction?: boolean } = {};
 
-  try {
-    for await (const event of agentLoop({
-      config,
-      workingDir: workdir,
-      prompt: initialPrompt,
-      renderer,
-      getNextUserMessage: rl ? createRepl(rl, planManager, workdir, config, loopOptions) : undefined,
-      forceCompaction: loopOptions.forceCompaction,
-      onConfirmTool: rl ? createConfirmPrompt(rl) : undefined,
-    })) {
-      switch (event.type) {
-        case "turn_start":
-          // Silent progress
-          break;
+  // Track whether we're processing a turn (so Ctrl+C knows to abort vs exit)
+  let processing = true;
 
-        case "text":
-          // Already rendered by stream
-          break;
-
-        case "thinking":
-          break;
-
-        case "tool_result":
-          renderer.renderToolResult(
-            `${event.name}: ${event.isError ? "✖" : "✓"} ${event.result.substring(0, 200)}`
-          );
-          break;
-
-        case "error":
-          renderer.renderError(event.message);
-          break;
-
-        case "warning":
-          renderer.renderWarning(event.message);
-          break;
-
-        case "compacting":
-          renderer.renderSystemMessage(`Compacting context: ${event.reason}`);
-          break;
-
-        case "waiting_for_input":
-          // REPL prompt is handled by getNextUserMessage callback
-          break;
-
-        case "done":
-          console.log(`\n[Session ended: ${event.reason}]`);
-          break;
-
-        case "turn_end":
-          // Could show token usage here
-          break;
-      }
+  // Ctrl+C handling: abort current request when processing, exit when idle
+  const onSigInt = () => {
+    if (processing) {
+      abortCurrentRequest();
+      console.log("\n  ⏹ Interrupted — returning to prompt...");
+    } else {
+      console.log("\n  Exiting...");
+      if (rl) rl.close();
+      process.exit(0);
     }
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : String(err);
-    renderer.renderError(`Fatal: ${message}`);
-    process.exit(1);
-  } finally {
-    if (rl) rl.close();
-  }
+  };
+  process.on("SIGINT", onSigInt);
+
+  // ---- Outer restart loop ----
+  let loopState: LoopState = { shouldRestart: false };
+  let sessionTokens = 0;
+  let activeSessionId = "";
+
+  // Mutable getter for current session ID (for REPL handlers)
+  const getSessionId = () => activeSessionId;
+
+  // Called by REPL before restarting/exiting to save session state
+  const onSessionFinalize = () => {
+    if (activeSessionId && sessionManager) {
+      sessionManager.updateSession(activeSessionId, {
+        tokenCount: sessionTokens,
+        status: "ended",
+      });
+    }
+  };
+
+  do {
+    loopState = { shouldRestart: false };
+    activeSessionId = loopState.newSessionId ?? randomUUID();
+    sessionTokens = 0;
+
+    const resumeSummary = loopState.resumeSummary ?? initialResumeSummary;
+    initialResumeSummary = undefined; // only inject on first iteration
+
+    try {
+      for await (const event of agentLoop({
+        config,
+        workingDir: workdir,
+        prompt: effectivePrompt,
+        renderer,
+        sessionId: activeSessionId,
+        sessionManager,
+        resumeSummary,
+        getNextUserMessage: rl
+          ? createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, getSessionId, onSessionFinalize)
+          : undefined,
+        forceCompaction: loopOptions.forceCompaction,
+        onConfirmTool: rl ? createConfirmPrompt(rl) : undefined,
+      })) {
+        switch (event.type) {
+          case "turn_start":
+            processing = true;
+            break;
+
+          case "text":
+            // Already rendered by stream
+            break;
+
+          case "thinking":
+            break;
+
+          case "tool_result":
+            renderer.renderToolResult(
+              `${event.name}: ${event.isError ? "✖" : "✓"} ${event.result.substring(0, 200)}`
+            );
+            break;
+
+          case "error":
+            renderer.renderError(event.message);
+            break;
+
+          case "warning":
+            renderer.renderWarning(event.message);
+            break;
+
+          case "compacting":
+            renderer.renderSystemMessage(`Compacting context: ${event.reason}`);
+            break;
+
+          case "waiting_for_input":
+            processing = false; // idle — Ctrl+C will exit
+            break;
+
+          case "done":
+            console.log(`\n[Session ended: ${event.reason}]`);
+            processing = false;
+            break;
+
+          case "turn_end":
+            if (event.usage) {
+              sessionTokens += event.usage.input + event.usage.output;
+            }
+            break;
+        }
+      }
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      renderer.renderError(`Fatal: ${message}`);
+      process.exit(1);
+    }
+
+    // Finalize session if it was active
+    if (activeSessionId) {
+      onSessionFinalize();
+    }
+
+    // If restarting, reset prompt for the new session
+    if (loopState.shouldRestart) {
+      effectivePrompt = "Hello! What would you like to work on?";
+      loopOptions.forceCompaction = false;
+    }
+  } while (loopState.shouldRestart);
+
+  process.off("SIGINT", onSigInt);
+  if (rl) rl.close();
 }
 
 main().catch((err) => {

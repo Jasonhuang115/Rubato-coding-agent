@@ -136,6 +136,8 @@ export class PolicyEngine implements PermissionManager {
       case "bash":
         return this.config.bash;
       case "read":
+      case "glob":
+      case "grep":
         return this.config.read;
       case "write":
         return this.config.write;

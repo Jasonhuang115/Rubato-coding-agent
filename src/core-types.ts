@@ -209,12 +209,31 @@ export interface SessionMeta {
   branch: string;
   fileHistory: string[];
   summary?: string;
+  firstMessage?: string;
+  messageCount?: number;
+  status?: "active" | "ended";
 }
 
 export interface SessionRecord {
   type: "session_meta" | "message" | "tool_event" | "compaction";
   timestamp: number;
   data: unknown;
+}
+
+// ---- Session Index ----
+
+export type SessionStatus = "active" | "ended";
+
+export interface SessionIndexEntry {
+  id: string;
+  createdAt: number;
+  lastActiveAt: number;
+  firstMessage: string;
+  model: string;
+  tokenCount: number;
+  messageCount: number;
+  status: SessionStatus;
+  summary?: string;
 }
 
 // ---- Subagent ----

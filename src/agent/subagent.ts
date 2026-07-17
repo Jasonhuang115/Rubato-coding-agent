@@ -103,11 +103,11 @@ export function getBuiltinDefinition(name: string): SubagentDefinition {
 
 function resolveTools(allowlist: string[]): ToolDefinition[] {
   if (allowlist.includes("*")) {
-    return getAllTools().filter((t) => t.name !== "Agent");
+    return getAllTools().filter((t) => t.name !== "Agent" && t.name !== "Skill");
   }
   return allowlist
     .map((name) => getTool(name))
-    .filter((t): t is ToolDefinition => t !== undefined && t.name !== "Agent");
+    .filter((t): t is ToolDefinition => t !== undefined && t.name !== "Agent" && t.name !== "Skill");
 }
 
 // ---- Spawn primitive ----

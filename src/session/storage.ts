@@ -1,8 +1,17 @@
 // Session storage — JSONL persistence for session records
+// Supports project-scoped storage (when projectHash is provided) with
+// fallback to legacy flat ~/.rubato/sessions/ for sub-agents.
 
 import fs from "fs";
 import path from "path";
 import type { SessionMeta, SessionRecord } from "../core-types.js";
+
+function getSessionDir(projectHash?: string): string {
+  if (projectHash) {
+    return path.join(process.env.HOME ?? "/tmp", ".rubato", "projects", projectHash, "sessions");
+  }
+  return path.join(process.env.HOME ?? "/tmp", ".rubato", "sessions");
+}
 
 export class SessionStore {
   private dir: string;
@@ -10,8 +19,8 @@ export class SessionStore {
   private writeStream: fs.WriteStream | null = null;
   private records: SessionRecord[] = [];
 
-  constructor(sessionId: string, baseDir?: string) {
-    this.dir = baseDir ?? path.join(process.env.HOME ?? "/tmp", ".rubato", "sessions");
+  constructor(sessionId: string, projectHash?: string) {
+    this.dir = getSessionDir(projectHash);
     this.filePath = path.join(this.dir, `${sessionId}.jsonl`);
   }
 
@@ -100,8 +109,8 @@ export function loadSession(sessionId: string, baseDir?: string): SessionRecord[
   return records;
 }
 
-export function listSessions(baseDir?: string): string[] {
-  const dir = baseDir ?? path.join(process.env.HOME ?? "/tmp", ".rubato", "sessions");
+export function listSessions(projectHash?: string): string[] {
+  const dir = getSessionDir(projectHash);
   if (!fs.existsSync(dir)) return [];
 
   return fs

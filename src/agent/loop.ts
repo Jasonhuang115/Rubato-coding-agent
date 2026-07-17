@@ -32,6 +32,7 @@ import { PolicyEngine } from "../permissions/policy.js";
 import { ReadGuard } from "./read-guard.js";
 import { SessionStore } from "../session/storage.js";
 import { createSessionMeta, finalizeSessionMeta } from "../session/meta.js";
+import type { SessionManager } from "../session/manager.js";
 import { PlanManager } from "../plan/manager.js";
 import { sessionStartRecall } from "../journal/recall.js";
 import { persistKnowledge } from "../journal/extractor.js";
@@ -90,6 +91,22 @@ export interface AgentLoopOptions {
     toolName: string,
     input: Record<string, unknown>,
   ) => Promise<ConfirmDecision>;
+  /** Session manager for project-scoped session lifecycle (main sessions only) */
+  sessionManager?: SessionManager;
+  /** If provided, inject this summary as previous session context */
+  resumeSummary?: string;
+}
+
+// ---- Abort mechanism (exposed for Ctrl+C interrupt) ----
+
+let currentAbortController: AbortController | null = null;
+
+/** Abort the currently in-flight model request. Safe to call from signal handlers. */
+export function abortCurrentRequest(): void {
+  if (currentAbortController) {
+    currentAbortController.abort();
+    currentAbortController = null; // signal that this was a user interrupt
+  }
 }
 
 export async function* agentLoop(
@@ -103,14 +120,18 @@ export async function* agentLoop(
   const tools = options.tools ?? getAllTools();
   const permissionManager = new PolicyEngine(config.permissions);
   const readGuard = new ReadGuard();
-  const sessionStore = new SessionStore(sessionId);
+
+  // Use project-scoped storage when sessionManager is available
+  const projectHash = options.sessionManager?.getProjectHash();
+  const sessionStore = new SessionStore(sessionId, projectHash);
 
   sessionStore.init();
 
   let sessionMeta = createSessionMeta(
     sessionId,
     `${config.model.provider}/${config.model.model}`,
-    undefined
+    undefined,
+    { firstMessage: prompt.slice(0, 200) },
   );
 
   // ---- Plan Manager ----
@@ -144,7 +165,8 @@ export async function* agentLoop(
 
   const systemPrompt = buildSystemPrompt(ctx, tools) +
     (contextText ? `\n\n## Project Context\n${contextText}` : "") +
-    (journalRecall ? `\n\n${journalRecall}` : "");
+    (journalRecall ? `\n\n${journalRecall}` : "") +
+    (options.resumeSummary ? `\n\n## Previous Session Context\nThe following is a summary of a previous session in this project. Use this context to understand what was previously discussed:\n\n${options.resumeSummary}` : "");
 
   // System prompt tokens — counted once since it's sent on every API call
   const systemTokens = roughTokenEstimate(systemPrompt);
@@ -255,6 +277,7 @@ export async function* agentLoop(
       }
 
       const abortController = new AbortController();
+      currentAbortController = abortController;
       const timeout = setTimeout(() => abortController.abort(), 120_000); // 2 min timeout
 
       try {
@@ -272,12 +295,23 @@ export async function* agentLoop(
         );
 
         clearTimeout(timeout);
+        currentAbortController = null;
 
         // Reset error counters on success
         consecutiveErrors = 0;
         break;
       } catch (err: unknown) {
         clearTimeout(timeout);
+        const wasUserAbort = currentAbortController === null; // cleared by external abortCurrentRequest()
+        currentAbortController = null;
+
+        // User pressed Ctrl+C — don't retry, return to REPL
+        if (wasUserAbort || (err instanceof Error && err.name === "AbortError" && retryCount === 0)) {
+          yield { type: "warning", message: "Interrupted (Ctrl+C)" };
+          yield { type: "done", reason: "user_interrupt" };
+          return;
+        }
+
         retryCount++;
 
         const message = err instanceof Error ? err.message : String(err);
@@ -335,6 +369,7 @@ export async function* agentLoop(
     messages.push({ role: "assistant", content: assistantBlocks });
 
     sessionStore.writeMessage({ role: "assistant", blocks: assistantBlocks });
+    sessionMeta.messageCount = (sessionMeta.messageCount ?? 0) + 1;
     if (usage) {
       sessionMeta.totalTokens += usage.input + usage.output;
     }
@@ -363,6 +398,7 @@ export async function* agentLoop(
 
         messages.push({ role: "user", content: nextMessage.trim() });
         sessionStore.writeMessage({ role: "user", content: nextMessage.trim() });
+        sessionMeta.messageCount = (sessionMeta.messageCount ?? 0) + 1;
         renderer.renderUserMessage(nextMessage.trim());
         continue;
       }
@@ -374,11 +410,19 @@ export async function* agentLoop(
     // ---- Execute tool calls ----
     const readCalls: ToolUseBlock[] = [];
     const writeCalls: ToolUseBlock[] = [];
+    let toolDenied = false;
 
     for (const tu of toolUses) {
       const tool = tools.find((t) => t.name === tu.name);
       if (tool?.type === "read" && tool.isConcurrencySafe) {
-        readCalls.push(tu);
+        // Check if this tool needs confirmation — confirm-mode tools
+        // must NOT run in parallel (readline can only handle one question at a time)
+        const perm = permissionManager.check(tu.name, tu.input);
+        if (!perm.allowed && perm.mode === "confirm" && options.onConfirmTool) {
+          writeCalls.push(tu); // serialize confirm-mode tools
+        } else {
+          readCalls.push(tu);
+        }
       } else {
         writeCalls.push(tu);
       }
@@ -401,6 +445,7 @@ export async function* agentLoop(
 
       // Yield events after all reads complete (can't yield inside async callbacks)
       for (const { toolUse, result } of readResults) {
+        if (result.denied) toolDenied = true;
         yield {
           type: "tool_result",
           id: toolUse.id,
@@ -432,6 +477,7 @@ export async function* agentLoop(
         yield { type: "warning", message: toolWarning };
       }
       const result = await executeToolCall(tu, permissionManager, ctx, renderer, options.onConfirmTool);
+      if (result.denied) toolDenied = true;
       yield {
         type: "tool_result",
         id: tu.id,
@@ -457,6 +503,31 @@ export async function* agentLoop(
           },
         ],
       });
+    }
+
+    // ---- Stop turn if user explicitly denied any tool ----
+    if (toolDenied) {
+      yield { type: "warning", message: "Tool denied — stopping for your input." };
+      if (options.getNextUserMessage) {
+        yield { type: "waiting_for_input" };
+        const nextMessage = await options.getNextUserMessage();
+        if (!nextMessage || !nextMessage.trim()) {
+          yield { type: "done", reason: "user_exit" };
+          break;
+        }
+        const deviationWarning = planManager.onUserMessage(nextMessage.trim());
+        if (deviationWarning) {
+          yield { type: "warning", message: deviationWarning };
+        }
+        messages.push({ role: "user", content: nextMessage.trim() });
+        sessionStore.writeMessage({ role: "user", content: nextMessage.trim() });
+        sessionMeta.messageCount = (sessionMeta.messageCount ?? 0) + 1;
+        renderer.renderUserMessage(nextMessage.trim());
+        continue;
+      }
+      // Non-interactive mode: stop immediately
+      yield { type: "done", reason: "tool_denied" };
+      break;
     }
   }
 
@@ -485,8 +556,21 @@ export async function* agentLoop(
   }
 
   sessionMeta = finalizeSessionMeta(sessionMeta);
-  sessionStore.writeMeta(sessionMeta);
-  sessionStore.close();
+
+  if (options.sessionManager) {
+    // Use SessionManager for project-scoped finalization
+    sessionStore.writeMeta(sessionMeta);
+    sessionStore.close();
+    options.sessionManager.updateSession(sessionId, {
+      messageCount: sessionMeta.messageCount ?? 0,
+      tokenCount: sessionMeta.totalTokens,
+      status: "ended",
+      summary: sessionMeta.summary,
+    });
+  } else {
+    sessionStore.writeMeta(sessionMeta);
+    sessionStore.close();
+  }
 
   yield { type: "done", reason: "max_turns" };
 }
@@ -595,13 +679,13 @@ async function executeToolCall(
     toolName: string,
     input: Record<string, unknown>,
   ) => Promise<ConfirmDecision>,
-): Promise<{ content: string; isError: boolean }> {
+): Promise<{ content: string; isError: boolean; denied: boolean }> {
   // Check permission
   const perm = permissionManager.check(toolUse.name, toolUse.input);
 
   if (!perm.allowed) {
     if (perm.mode === "manual") {
-      return { content: `Permission denied: ${perm.reason}`, isError: true };
+      return { content: `Permission denied: ${perm.reason}`, isError: true, denied: false };
     }
 
     // "confirm" mode — ask user interactively if callback is provided
@@ -614,10 +698,10 @@ async function executeToolCall(
           permissionManager.allowTool(toolUse.name);
           break; // proceed + remember
         case "deny_once":
-          return { content: `User denied: ${toolUse.name}`, isError: true };
+          return { content: `User denied: ${toolUse.name}`, isError: true, denied: true };
         case "deny_always":
           permissionManager.denyTool(toolUse.name);
-          return { content: `User denied (all future ${toolUse.name} blocked this session)`, isError: true };
+          return { content: `User denied (all future ${toolUse.name} blocked this session)`, isError: true, denied: true };
       }
     } else {
       // No callback: auto-approve with warning (subagents, one-shot, etc.)
@@ -627,7 +711,7 @@ async function executeToolCall(
 
   // Dispatch to tool handler
   const result = await dispatch(toolUse.name, toolUse.input, ctx);
-  return { content: result.content, isError: result.isError ?? false };
+  return { content: result.content, isError: result.isError ?? false, denied: false };
 }
 
 // ---- Circuit breaker ----
