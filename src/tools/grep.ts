@@ -104,10 +104,9 @@ export const grepTool: ToolDefinition = {
 
       child.on("close", (code: number | null) => {
         // rg exits with 1 for "no matches", which is fine
-        if (code !== 0 && code !== 1 && !stdout) {
-          // rg not found, try grep
-          if (useRg && code === 127) {
-            // rg not found — try with grep
+        if (code !== 0 && code !== 1) {
+          // rg failed — try grep as fallback (not just code 127: -2, 2, etc.)
+          if (useRg) {
             const grepChild = spawn(
               "grep",
               ["-rnI", "--color=never", `-m${maxMatches}`, pattern, searchPath],
