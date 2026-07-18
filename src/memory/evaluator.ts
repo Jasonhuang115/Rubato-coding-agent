@@ -6,7 +6,7 @@ import type { MnemosyneStore, EntityRow } from "./store.js";
 
 export interface MemoryScore {
   total: number;
-  dimensions: { accuracy: number; freshness: number; relevance: number; conflict: number; frequency: number };
+  dimensions: { accuracy: number; freshness: number; relevance: number; conflict: number; frequency: number; feedback: number };
 }
 
 export interface ScoreReport {
@@ -32,17 +32,19 @@ export function evaluateMemory(entityId: number, store?: MnemosyneStore): ScoreR
 
   const accuracy = computeAccuracy(feedback);
   const freshness = computeFreshness(entity, now);
-  const relevance = computeRelevance(entityId, s);
+  const relevance = computeRelevance(entityId, entity.access_count ?? 0, s);
   const conflict = computeConflict(entity, s);
   const frequency = computeFrequency(feedback);
+  const feedbackScore = computeFeedbackScore(entity.feedback_score ?? 0);
 
-  const weights = { accuracy: 0.30, freshness: 0.20, relevance: 0.20, conflict: 0.15, frequency: 0.15 };
+  const weights = { accuracy: 0.25, freshness: 0.15, relevance: 0.15, conflict: 0.10, frequency: 0.15, feedback: 0.20 };
   const total = clamp(
     accuracy * weights.accuracy + freshness * weights.freshness +
-    relevance * weights.relevance + conflict * weights.conflict + frequency * weights.frequency
+    relevance * weights.relevance + conflict * weights.conflict +
+    frequency * weights.frequency + feedbackScore * weights.feedback
   );
 
-  const score: MemoryScore = { total, dimensions: { accuracy, freshness, relevance, conflict, frequency } };
+  const score: MemoryScore = { total, dimensions: { accuracy, freshness, relevance, conflict, frequency, feedback: feedbackScore } };
 
   let recommendation: ScoreReport["recommendation"] = "hold";
   if (total >= THRESHOLDS.upgrade && feedback.injections >= THRESHOLDS.upgradeMinAccesses) recommendation = "upgrade";
@@ -91,9 +93,13 @@ function computeFreshness(entity: EntityRow, now: number): number {
   return clamp(Math.exp(-0.0231 * ageDays));
 }
 
-function computeRelevance(entityId: number, s: MnemosyneStore): number {
-  const totalAccesses = s.getAccessCount(entityId);
-  return clamp(1 / (1 + Math.exp(-0.15 * (totalAccesses - 5))));
+function computeRelevance(entityId: number, accessCount: number, s: MnemosyneStore): number {
+  const relationCount = s.getRelations(entityId).length;
+  return clamp(0.3 + 0.7 * (1 / (1 + Math.exp(-0.3 * (accessCount - 3)))) + 0.05 * Math.min(relationCount, 10));
+}
+
+function computeFeedbackScore(feedbackScore: number): number {
+  return clamp(0.5 + feedbackScore * 0.5);
 }
 
 function computeConflict(entity: EntityRow, s: MnemosyneStore): number {

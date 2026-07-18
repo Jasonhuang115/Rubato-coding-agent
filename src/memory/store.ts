@@ -25,6 +25,11 @@ export interface EntityRow {
   created_at: number;
   updated_at: number;
   embedding: Buffer | null; // 384-dim float32
+  status: string;           // 'active' | 'superseded' | 'deprecated'
+  superseded_by: number | null;
+  abstracted_from: string;  // comma-separated IDs of source entities
+  feedback_score: number;   // cumulative feedback signal
+  access_count: number;     // total times accessed
 }
 
 export interface RelationRow {
@@ -107,6 +112,11 @@ export class MnemosyneStore implements MemoryStore {
     this.migrateAddColumn("entities", "protected", "INTEGER NOT NULL DEFAULT 0");
     this.migrateAddColumn("entities", "tags", "TEXT NOT NULL DEFAULT ''");
     this.migrateAddColumn("entities", "embedding", "BLOB");
+    this.migrateAddColumn("entities", "status", "TEXT NOT NULL DEFAULT 'active'");
+    this.migrateAddColumn("entities", "superseded_by", "INTEGER DEFAULT NULL");
+    this.migrateAddColumn("entities", "abstracted_from", "TEXT NOT NULL DEFAULT ''");
+    this.migrateAddColumn("entities", "feedback_score", "REAL NOT NULL DEFAULT 0.0");
+    this.migrateAddColumn("entities", "access_count", "INTEGER NOT NULL DEFAULT 0");
 
     // FTS5 virtual table
     this.db.exec(`
@@ -115,19 +125,38 @@ export class MnemosyneStore implements MemoryStore {
       );
     `);
 
-    // Feedback log
+    // Feedback log — tracks injection, reference, and usage signals
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS feedback_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         memory_id INTEGER REFERENCES entities(id) ON DELETE SET NULL,
         session_id TEXT NOT NULL DEFAULT '',
-        event_type TEXT NOT NULL CHECK(event_type IN ('injected','user_corrected','tool_success','tool_failed')),
+        event_type TEXT NOT NULL CHECK(event_type IN ('injected','referenced','ignored','user_corrected','tool_success','tool_failed')),
         score_delta REAL NOT NULL DEFAULT 0,
+        signal_type TEXT NOT NULL DEFAULT 'injected',
         context TEXT DEFAULT '{}',
+        retrieval_source TEXT NOT NULL DEFAULT '',
         timestamp INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_feedback_memory ON feedback_log(memory_id);
       CREATE INDEX IF NOT EXISTS idx_feedback_event ON feedback_log(event_type);
+    `);
+
+    // Extra columns for feedback_log (migration-safe)
+    this.migrateAddColumn("feedback_log", "signal_type", "TEXT NOT NULL DEFAULT 'injected'");
+    this.migrateAddColumn("feedback_log", "retrieval_source", "TEXT NOT NULL DEFAULT ''");
+
+    // Pending consolidation — lazy merging (RecMem pattern)
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS pending_consolidation (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        group_hash TEXT NOT NULL,
+        entity_ids TEXT NOT NULL,
+        similarity REAL NOT NULL DEFAULT 0,
+        trigger_count INTEGER NOT NULL DEFAULT 1,
+        first_seen_at INTEGER NOT NULL,
+        last_seen_at INTEGER NOT NULL
+      );
     `);
 
     // Strategy weights
@@ -201,37 +230,61 @@ export class MnemosyneStore implements MemoryStore {
 
     if (existing) {
       const finalProtected = existing.protected === 1 ? 1 : isProtected;
-      const mergedContent = existing.content
-        ? `${existing.content}\n${content}`
-        : content;
-      const mergedConfidence = Math.min(1.0, existing.confidence + confidence * 0.2);
+      const supersedableTypes = ["config", "error", "api", "deploy"];
+      const shouldSupersede = supersedableTypes.includes(type) &&
+        content !== existing.content && content.length > 0;
 
-      this.db
-        .prepare(
-          `UPDATE entities SET content = ?, confidence = ?, updated_at = ?, source_session = ?, protected = ?
-           WHERE id = ?`
-        )
-        .run(mergedContent, mergedConfidence, now, sourceSession, finalProtected, existing.id);
+      if (shouldSupersede) {
+        // MemStrata pattern: mark old entity as superseded, create new one
+        this.db
+          .prepare(`UPDATE entities SET status = 'superseded', superseded_by = NULL, updated_at = ? WHERE id = ?`)
+          .run(now, existing.id);
 
-      return existing.id;
+        const result = this.db
+          .prepare(
+            `INSERT INTO entities (type, name, content, source_session, source, protected, confidence, created_at, updated_at, status, superseded_by, abstracted_from, feedback_score, access_count)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, '', 0, 0)`
+          )
+          .run(type, name, content, sourceSession, source, isProtected, confidence, now, now, existing.id);
+
+        const id = Number(result.lastInsertRowid);
+        this.autoEmbed(id, name, content);
+        return id;
+      } else {
+        // Merge pattern: accumulate knowledge for notes/concepts
+        const mergedContent = existing.content
+          ? `${existing.content}\n${content}`
+          : content;
+        const mergedConfidence = Math.min(1.0, existing.confidence + confidence * 0.2);
+
+        this.db
+          .prepare(
+            `UPDATE entities SET content = ?, confidence = ?, updated_at = ?, source_session = ?, protected = ?
+             WHERE id = ?`
+          )
+          .run(mergedContent, mergedConfidence, now, sourceSession, finalProtected, existing.id);
+
+        return existing.id;
+      }
     }
 
     const result = this.db
       .prepare(
-        `INSERT INTO entities (type, name, content, source_session, source, protected, confidence, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO entities (type, name, content, source_session, source, protected, confidence, created_at, updated_at, status, abstracted_from, feedback_score, access_count)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', '', 0, 0)`
       )
       .run(type, name, content, sourceSession, source, isProtected, confidence, now, now);
 
     const id = Number(result.lastInsertRowid);
+    this.autoEmbed(id, name, content);
+    return id;
+  }
 
-    // Auto-generate embedding for vector search
+  private autoEmbed(id: number, name: string, content: string): void {
     try {
       const emb = generateSimpleEmbedding(`${name} ${content}`.slice(0, 500));
       this.setEmbedding(id, Buffer.from(emb.buffer, emb.byteOffset, emb.byteLength));
     } catch { /* best-effort */ }
-
-    return id;
   }
 
   findEntityByName(name: string, type?: string): EntityRow | null {
@@ -307,6 +360,9 @@ export class MnemosyneStore implements MemoryStore {
             source: row.source ?? "auto", protected: row.protected ?? 0,
             tags: row.tags ?? "", embedding: row.embedding as Buffer | null,
             confidence: row.confidence, created_at: row.created_at, updated_at: row.updated_at,
+            status: row.status ?? "active", superseded_by: row.superseded_by as number | null ?? null,
+            abstracted_from: row.abstracted_from ?? "", feedback_score: row.feedback_score ?? 0,
+            access_count: row.access_count ?? 0,
           },
           relation: {
             id: row.rel_id, source_id: row.rel_source, target_id: row.rel_target,
@@ -324,7 +380,7 @@ export class MnemosyneStore implements MemoryStore {
 
   recordAccess(entityId: number, sessionId: string): void {
     this.db.prepare(`INSERT INTO access_log (entity_id, accessed_at, source_session) VALUES (?, ?, ?)`).run(entityId, Date.now(), sessionId);
-    this.db.prepare(`UPDATE entities SET updated_at = ? WHERE id = ?`).run(Date.now(), entityId);
+    this.db.prepare(`UPDATE entities SET updated_at = ?, access_count = access_count + 1 WHERE id = ?`).run(Date.now(), entityId);
   }
 
   getForgottenCandidates(olderThanDays = 30): EntityRow[] {
@@ -439,9 +495,40 @@ export class MnemosyneStore implements MemoryStore {
 
   // ---- Feedback Log ----
 
-  recordFeedback(memoryId: number, sessionId: string, eventType: "injected" | "user_corrected" | "tool_success" | "tool_failed", scoreDelta = 0, context: Record<string, unknown> = {}): void {
-    this.db.prepare(`INSERT INTO feedback_log (memory_id, session_id, event_type, score_delta, context, timestamp) VALUES (?, ?, ?, ?, ?, ?)`)
-      .run(memoryId, sessionId, eventType, scoreDelta, JSON.stringify(context), Date.now());
+  recordFeedback(memoryId: number, sessionId: string, eventType: "injected" | "referenced" | "ignored" | "user_corrected" | "tool_success" | "tool_failed", scoreDelta = 0, context: Record<string, unknown> = {}): void {
+    this.db.prepare(`INSERT INTO feedback_log (memory_id, session_id, event_type, score_delta, context, signal_type, retrieval_source, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(memoryId, sessionId, eventType, scoreDelta, JSON.stringify(context), eventType, "", Date.now());
+  }
+
+  /** Record feedback with retrieval source tracking (for strategy adaptation) */
+  recordFeedbackSignal(memoryId: number, sessionId: string, signalType: "injected" | "referenced" | "ignored", retrievalSource: string, context: Record<string, unknown> = {}): void {
+    const scoreDelta = signalType === "referenced" ? 0.1 : signalType === "ignored" ? -0.05 : 0;
+    this.db.prepare(`INSERT INTO feedback_log (memory_id, session_id, event_type, score_delta, context, signal_type, retrieval_source, timestamp) VALUES (?, ?, 'injected', ?, ?, ?, ?, ?)`)
+      .run(memoryId, sessionId, scoreDelta, JSON.stringify(context), signalType, retrievalSource, Date.now());
+    // Update entity's cumulative feedback score
+    this.db.prepare(`UPDATE entities SET feedback_score = feedback_score + ? WHERE id = ?`).run(scoreDelta, memoryId);
+  }
+
+  /** Record that a memory was referenced by the AI in its response */
+  markReferenced(memoryId: number, sessionId: string, retrievalSource: string): void {
+    this.recordFeedbackSignal(memoryId, sessionId, "referenced", retrievalSource);
+  }
+
+  /** Mark all injected-but-not-referenced memories as ignored */
+  markIgnoredForSession(sessionId: string): void {
+    const injected = this.db.prepare(
+      `SELECT DISTINCT memory_id FROM feedback_log WHERE session_id = ? AND signal_type = 'injected'`
+    ).all(sessionId) as Array<{ memory_id: number }>;
+    const referenced = new Set(
+      (this.db.prepare(
+        `SELECT DISTINCT memory_id FROM feedback_log WHERE session_id = ? AND signal_type = 'referenced'`
+      ).all(sessionId) as Array<{ memory_id: number }>).map((r) => r.memory_id)
+    );
+    for (const { memory_id } of injected) {
+      if (!referenced.has(memory_id)) {
+        this.recordFeedbackSignal(memory_id, sessionId, "ignored", "");
+      }
+    }
   }
 
   getFeedbackStats(memoryId: number): { injections: number; successes: number; failures: number } {
@@ -464,6 +551,80 @@ export class MnemosyneStore implements MemoryStore {
   getStrategyWeights(): Array<{ strategy: string; weight: number; totalCalls: number; successRate: number }> {
     const rows = this.db.prepare(`SELECT * FROM strategy_weights ORDER BY weight DESC`).all() as Array<{ strategy: string; weight: number; total_calls: number; success_calls: number }>;
     return rows.map((r) => ({ strategy: r.strategy, weight: r.weight, totalCalls: r.total_calls, successRate: r.total_calls > 0 ? r.success_calls / r.total_calls : 0 }));
+  }
+
+  /** Auto-tune strategy weights based on feedback signals */
+  autoTuneStrategyWeights(): void {
+    const rows = this.db.prepare(
+      `SELECT retrieval_source, COUNT(*) as total, SUM(CASE WHEN signal_type = 'referenced' THEN 1 ELSE 0 END) as hits
+       FROM feedback_log WHERE retrieval_source != '' GROUP BY retrieval_source`
+    ).all() as Array<{ retrieval_source: string; total: number; hits: number }>;
+
+    for (const row of rows) {
+      const strategy = row.retrieval_source;
+      const hitRate = row.total > 0 ? row.hits / row.total : 0;
+      // Only update if we have enough data (>= 5 samples)
+      if (row.total >= 5) {
+        this.db.prepare(
+          `UPDATE strategy_weights SET weight = ?, total_calls = total_calls + ?, success_calls = success_calls + ?, updated_at = ?
+           WHERE strategy = ?`
+        ).run(hitRate, row.total, row.hits, Date.now(), strategy);
+      }
+    }
+  }
+
+  /** Get entities that were referenced in recent sessions (positive feedback) */
+  getTopPerforming(limit = 10): EntityRow[] {
+    return this.db.prepare(
+      `SELECT * FROM entities WHERE status = 'active' ORDER BY feedback_score DESC LIMIT ?`
+    ).all(limit) as EntityRow[];
+  }
+
+  // ---- Pending Consolidation (RecMem lazy pattern) ----
+
+  /** Check if similar entities should be consolidated */
+  checkConsolidationThreshold(groupHash: string, threshold = 3): boolean {
+    const row = this.db.prepare(
+      `SELECT trigger_count FROM pending_consolidation WHERE group_hash = ?`
+    ).get(groupHash) as { trigger_count: number } | undefined;
+    return (row?.trigger_count ?? 0) >= threshold;
+  }
+
+  /** Add or bump a pending consolidation group */
+  upsertPendingConsolidation(groupHash: string, entityIds: number[], similarity: number): void {
+    const existing = this.db.prepare(
+      `SELECT id, trigger_count, entity_ids FROM pending_consolidation WHERE group_hash = ?`
+    ).get(groupHash) as { id: number; trigger_count: number; entity_ids: string } | undefined;
+
+    if (existing) {
+      const mergedIds = [...new Set([...existing.entity_ids.split(",").map(Number), ...entityIds])];
+      this.db.prepare(
+        `UPDATE pending_consolidation SET entity_ids = ?, trigger_count = trigger_count + 1, similarity = ?, last_seen_at = ? WHERE id = ?`
+      ).run(mergedIds.join(","), similarity, Date.now(), existing.id);
+    } else {
+      this.db.prepare(
+        `INSERT INTO pending_consolidation (group_hash, entity_ids, similarity, trigger_count, first_seen_at, last_seen_at)
+         VALUES (?, ?, ?, 1, ?, ?)`
+      ).run(groupHash, entityIds.join(","), similarity, Date.now(), Date.now());
+    }
+  }
+
+  getPendingConsolidations(): Array<{ groupHash: string; entityIds: number[]; triggerCount: number; similarity: number }> {
+    return (this.db.prepare(
+      `SELECT * FROM pending_consolidation WHERE trigger_count >= 3 ORDER BY trigger_count DESC`
+    ).all() as Array<{ group_hash: string; entity_ids: string; trigger_count: number; similarity: number }>)
+      .map((r) => ({ groupHash: r.group_hash, entityIds: r.entity_ids.split(",").map(Number), triggerCount: r.trigger_count, similarity: r.similarity }));
+  }
+
+  // ---- Memory Health ----
+
+  getHealthReport(): { active: number; superseded: number; deprecated: number; pendingConsolidation: number; vectorReady: boolean } {
+    const active = (this.db.prepare(`SELECT COUNT(*) as c FROM entities WHERE status = 'active'`).get() as { c: number }).c;
+    const superseded = (this.db.prepare(`SELECT COUNT(*) as c FROM entities WHERE status = 'superseded'`).get() as { c: number }).c;
+    const deprecated = (this.db.prepare(`SELECT COUNT(*) as c FROM entities WHERE status = 'deprecated'`).get() as { c: number }).c;
+    const pending = (this.db.prepare(`SELECT COUNT(*) as c FROM pending_consolidation WHERE trigger_count >= 3`).get() as { c: number }).c;
+    const embeddedCount = (this.db.prepare(`SELECT COUNT(*) as c FROM entities WHERE embedding IS NOT NULL`).get() as { c: number }).c;
+    return { active, superseded, deprecated, pendingConsolidation: pending, vectorReady: embeddedCount > 0 };
   }
 
   // ---- Query Rewrite Rules ----

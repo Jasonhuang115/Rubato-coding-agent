@@ -37,6 +37,7 @@ import { PlanManager } from "../plan/manager.js";
 import type { PlanDoc } from "../plan/tree.js";
 import { sessionStartRecall } from "../journal/recall.js";
 import { persistKnowledge } from "../journal/extractor.js";
+import { getMnemosyneStore } from "../memory/store.js";
 import { sessionStartHook, sessionEndHook, prePushHook, preCommitHook, conflictCheckHook } from "../git/hooks.js";
 
 // ---- Configuration constants ----
@@ -595,13 +596,23 @@ export async function* agentLoop(
     // Best-effort
   }
 
-  // Trigger Consolidator if conditions are met
+  // Self-evolving RAG feedback: mark injected-but-not-referenced as ignored
   try {
-    const { shouldConsolidate, consolidateMemories } = await import("../memory/consolidator.js");
-    if (shouldConsolidate()) {
+    const store = getMnemosyneStore();
+    store.markIgnoredForSession(sessionId);
+    store.autoTuneStrategyWeights();
+  } catch { /* best-effort */ }
+
+  // Lazy consolidation (RecMem pattern): only run when threshold is reached
+  try {
+    const store = getMnemosyneStore();
+    const pendingConsolidations = store.getPendingConsolidations();
+    if (pendingConsolidations.length > 0) {
+      yield { type: "warning", message: `🧠 记忆系统检测到 ${pendingConsolidations.length} 组相似记忆等待合并，将在后台处理...` };
+      const { consolidateMemories } = await import("../memory/consolidator.js");
       const result = await consolidateMemories();
-      if (result.merged > 0 || result.abstracted > 0 || result.deleted > 0) {
-        yield { type: "warning", message: `🧹 Mnemosyne 后台整理完成：合并 ${result.merged} | 抽象 ${result.abstracted} | 清理 ${result.deleted} | 降级 ${result.deprecated}` };
+      if (result.merged > 0 || result.abstracted > 0) {
+        yield { type: "warning", message: `🧹 Mnemosyne 合并完成：合并 ${result.merged} | 抽象 ${result.abstracted} | 清理 ${result.deleted}` };
       }
     }
   } catch {

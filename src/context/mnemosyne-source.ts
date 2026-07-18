@@ -31,10 +31,11 @@ export class MnemosyneSource implements ContextSource {
         lines.push("");
       }
 
-      // Record access for decay reset
-      for (const { entity } of toInject.slice(0, 5)) {
+      // Record access + feedback signals for self-evolving RAG
+      for (const { entity, sources } of toInject.slice(0, 5)) {
         store.recordAccess(entity.id, ctx.sessionId);
-        store.recordFeedback(entity.id, ctx.sessionId, "injected", 0, { query, source: "mnemosyne-source" });
+        const retrievalSource = sources.length > 0 ? sources.join(",") : "fts5";
+        store.recordFeedbackSignal(entity.id, ctx.sessionId, "injected", retrievalSource, { query });
       }
 
       return { content: lines.join("\n"), priority: this.priority, source: this.name };

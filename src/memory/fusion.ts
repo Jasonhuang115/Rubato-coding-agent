@@ -96,11 +96,21 @@ export async function hybridRetrieve(query: string, limit = 10): Promise<FusionS
     const graphHit = graphResults.get(entityId);
     if (graphHit) { const s = wGraph / (RRF_K + graphHit.rank); rrfScore += s; sources.push("graph"); rankContributions.graph = { rank: graphHit.rank, score: s }; }
 
-    fused.push({ entity: fts5Hit?.entity ?? vecHit?.entity ?? graphHit!.entity, score: rrfScore, sources, rankContributions });
+    // Skip inactive entities (superseded/deprecated)
+    const entity = fts5Hit?.entity ?? vecHit?.entity ?? graphHit!.entity;
+    if (entity && entity.status !== "superseded" && entity.status !== "deprecated") {
+      fused.push({ entity, score: rrfScore, sources, rankContributions });
+    }
   }
 
   fused.sort((a, b) => b.score - a.score);
   timing.totalMs = Date.now() - startTime;
+
+  // Auto-tune strategy weights every 100 queries
+  if (Math.random() < 0.01) {
+    const store = getMnemosyneStore();
+    store.autoTuneStrategyWeights();
+  }
 
   return { results: fused.slice(0, limit), query, variantsUsed: allQueries, strategyWeights: weightMap, timing };
 }

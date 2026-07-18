@@ -1002,6 +1002,14 @@ async function main(): Promise<void> {
     if (n > 0) console.log(`🔢 Generated embeddings for ${n} entities`);
   } catch { /* best-effort */ }
 
+  // Memory health report
+  try {
+    const store = getMnemosyneStore();
+    const health = store.getHealthReport();
+    const pending = health.pendingConsolidation > 0 ? ` | 待合并 ${health.pendingConsolidation}` : "";
+    console.log(`🧠 记忆健康: 活跃 ${health.active} | 过期 ${health.superseded} | 弃用 ${health.deprecated}${pending} | 向量 ${health.vectorReady ? "✅" : "⏳"}`);
+  } catch { /* best-effort */ }
+
   // Bootstrap memory seeder on first project open
   if (config.mnemosyne.bootstrap_on_first_open) {
     try {
