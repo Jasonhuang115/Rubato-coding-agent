@@ -967,7 +967,7 @@ async function main(): Promise<void> {
   }
 
   // ---- Handle --continue / --resume ----
-  let effectivePrompt = prompt || "Hello! What would you like to work on?";
+  let effectivePrompt = prompt || (interactive ? "" : "Hello! What would you like to work on?");
   let initialResumeSummary: string | undefined;
 
   if (continueSession) {
@@ -1183,9 +1183,17 @@ async function main(): Promise<void> {
       onSessionFinalize();
     }
 
-    // If restarting, reset prompt for the new session
+    // If restarting, wait for user input instead of auto-sending a prompt
     if (loopState.shouldRestart) {
-      effectivePrompt = "Hello! What would you like to work on?";
+      effectivePrompt = await new Promise<string>((resolve) => {
+        rl!.question("\n▸ You: ", (answer) => {
+          resolve(answer.trim() || "/exit");
+        });
+      });
+      if (effectivePrompt === "/exit") {
+        console.log("Exiting...");
+        break;
+      }
       loopOptions.forceCompaction = false;
     }
   } while (loopState.shouldRestart);
