@@ -490,15 +490,26 @@ export async function* agentLoop(
       // Git hooks: pre-push / pre-commit checks
       if (tu.name === "Bash") {
         const cmd = (tu.input.command as string) ?? "";
+
+        // Extract actual git repo from command (handles `cd /path && git ...`)
+        const cdMatch = cmd.match(/\bcd\s+(\S+?)\s*&&/);
+        const repoDir = cdMatch ? cdMatch[1].replace(/['"]/g, "") : workingDir;
+
         if (/\bgit\s+push\b/.test(cmd)) {
-          const pushHook = await prePushHook(workingDir).catch(() => null);
+          let pushHook = null;
+          try {
+            pushHook = await prePushHook(repoDir);
+          } catch { /* best-effort */ }
           if (pushHook) {
             for (const w of pushHook.warnings) yield { type: "warning", message: w };
             for (const s of pushHook.suggestions) yield { type: "warning", message: `💡 ${s}` };
           }
         }
         if (/\bgit\s+commit\b/.test(cmd)) {
-          const commitHook = await preCommitHook(workingDir, planManager.getActivePlan() as PlanDoc | null).catch(() => null);
+          let commitHook = null;
+          try {
+            commitHook = await preCommitHook(repoDir, planManager.getActivePlan() as PlanDoc | null);
+          } catch { /* best-effort */ }
           if (commitHook) {
             for (const w of commitHook.warnings) yield { type: "warning", message: w };
             for (const s of commitHook.suggestions) yield { type: "warning", message: `💡 ${s}` };
