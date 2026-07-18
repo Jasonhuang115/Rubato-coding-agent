@@ -409,7 +409,7 @@ export async function* agentLoop(
         messages.push({ role: "user", content: nextMessage.trim() });
         sessionStore.writeMessage({ role: "user", content: nextMessage.trim() });
         sessionMeta.messageCount = (sessionMeta.messageCount ?? 0) + 1;
-        renderer.renderUserMessage(nextMessage.trim());
+        // Don't renderUserMessage — readline already echoes user input
         continue;
       }
       // Non-interactive mode: exit after first turn
@@ -552,7 +552,7 @@ export async function* agentLoop(
         messages.push({ role: "user", content: nextMessage.trim() });
         sessionStore.writeMessage({ role: "user", content: nextMessage.trim() });
         sessionMeta.messageCount = (sessionMeta.messageCount ?? 0) + 1;
-        renderer.renderUserMessage(nextMessage.trim());
+        // Don't renderUserMessage — readline already echoes user input
         continue;
       }
       // Non-interactive mode: stop immediately
