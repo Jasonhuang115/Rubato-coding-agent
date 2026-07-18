@@ -332,7 +332,7 @@ npm test              # 85 tests, 6 suites
 
 - **TypeScript** + Node.js (ES2022, ESM)
 - **better-sqlite3** — SQLite + FTS5 全文搜索 + WAL 模式
-- **trigram-hash embedding** — 384 维，零依赖（ONNX 模型 lazily downloaded，待接入）
+- **trigram-hash embedding** — 384 维，零依赖，本地即时生成，无需 GPU
 - **RRF (Reciprocal Rank Fusion)** — 三路检索融合排序
 - **openai** v4 + **@anthropic-ai/sdk** — LLM 提供商
 - **vitest** — 测试框架
