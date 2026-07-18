@@ -23,7 +23,7 @@ describe("PolicyEngine", () => {
       bash: "confirm",
     });
 
-    const result = engine.check("Bash", { command: "ls" });
+    const result = engine.check("Bash", { command: "mkdir test-dir" });
     expect(result.allowed).toBe(false);
     expect("mode" in result && result.mode).toBe("confirm");
   });
@@ -64,14 +64,14 @@ describe("PolicyEngine", () => {
     });
 
     // First call needs confirmation
-    const first = engine.check("Bash", { command: "ls" });
+    const first = engine.check("Bash", { command: "mkdir test-dir" });
     expect(first.allowed).toBe(false);
 
     // Allow it
     engine.allowTool("Bash");
 
     // Now it should be allowed
-    const second = engine.check("Bash", { command: "ls" });
+    const second = engine.check("Bash", { command: "mkdir test-dir" });
     expect(second.allowed).toBe(true);
   });
 
@@ -83,7 +83,7 @@ describe("PolicyEngine", () => {
 
     engine.denyTool("Bash");
 
-    const result = engine.check("Bash", { command: "ls" });
+    const result = engine.check("Bash", { command: "mkdir test-dir" });
     expect(result.allowed).toBe(false);
     expect("reason" in result && result.reason).toContain("denied earlier");
   });
@@ -98,7 +98,7 @@ describe("PolicyEngine", () => {
     engine.resetTool("Bash");
 
     // Should be back to confirm
-    const result = engine.check("Bash", { command: "ls" });
+    const result = engine.check("Bash", { command: "mkdir test-dir" });
     expect(result.allowed).toBe(false);
     expect("mode" in result && result.mode).toBe("confirm");
   });

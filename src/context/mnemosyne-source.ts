@@ -1,10 +1,9 @@
 // Mnemosyne context source — injects relevant memories into the system prompt
-// Uses Evaluator scoring to filter memories above the inject threshold
+// Uses Fusion multi-strategy retrieval (vector + FTS5 + graph, RRF merged)
 
 import type { ContextSource, ContextBlock, AgentContext } from "../core-types.js";
 import { getMnemosyneStore } from "../memory/store.js";
-import type { EntityRow } from "../memory/store.js";
-import { evaluateMemory, THRESHOLDS, getInjectCandidates } from "../memory/evaluator.js";
+import { hybridRetrieve, type FusionResult } from "../memory/fusion.js";
 
 export class MnemosyneSource implements ContextSource {
   readonly name = "mnemosyne";
@@ -14,42 +13,25 @@ export class MnemosyneSource implements ContextSource {
     try {
       const store = getMnemosyneStore();
 
-      const candidates = getInjectCandidates(query, 8);
-      const searchResults = store.searchWithRelevance(query, 5);
+      // Use Fusion multi-strategy hybrid retrieval (replaces manual candidate+search merge)
+      const fusionResult = await hybridRetrieve(query, 8);
+      const toInject = fusionResult.results.filter((r) => r.score >= 0.3);
 
-      const seen = new Set<number>();
-      const merged: Array<{ entity: EntityRow; relevance: number; evaluatorScore: number }> = [];
-
-      for (const c of candidates) {
-        const entity = store.getEntity(c.entityId);
-        if (entity && !seen.has(entity.id)) {
-          seen.add(entity.id);
-          merged.push({ entity, relevance: c.score.total, evaluatorScore: c.score.total });
-        }
-      }
-
-      for (const { entity, relevance } of searchResults) {
-        if (!seen.has(entity.id)) {
-          seen.add(entity.id);
-          const evalResult = evaluateMemory(entity.id);
-          merged.push({ entity, relevance, evaluatorScore: evalResult?.score.total ?? 0.5 });
-        }
-      }
-
-      const toInject = merged.filter((m) => m.evaluatorScore >= THRESHOLDS.inject || m.relevance >= 0.5);
       if (toInject.length === 0) return null;
 
       const lines = ["## 💡 Related Knowledge (Mnemosyne)", ""];
 
-      for (const { entity, relevance, evaluatorScore } of toInject.slice(0, 5)) {
-        const sourceTag = entity.source === "manual" ? " [📓 manual]" : entity.source === "memories_md" ? " [📓 MEMORY.md]" : entity.source === "seeder" ? " [🌱 seeded]" : "";
+      for (const { entity, score, sources } of toInject.slice(0, 5)) {
+        const sourceTag = entity.source === "manual" ? " [📓]" : entity.source === "seeder" ? " [🌱]" : "";
+        const strategyHint = sources.length > 1 ? ` (via ${sources.join("+")})` : "";
         const neighborStr = this.formatWithNeighbors(store, entity);
-        lines.push(`### ${entity.name} (${entity.type}, score: ${evaluatorScore.toFixed(2)}, rel: ${relevance.toFixed(2)})${sourceTag}`);
+        lines.push(`### ${entity.name} (${entity.type}, score: ${score.toFixed(2)})${strategyHint}${sourceTag}`);
         if (entity.content) lines.push(`> ${entity.content.slice(0, 200)}`);
         if (neighborStr) lines.push(neighborStr);
         lines.push("");
       }
 
+      // Record access for decay reset
       for (const { entity } of toInject.slice(0, 5)) {
         store.recordAccess(entity.id, ctx.sessionId);
         store.recordFeedback(entity.id, ctx.sessionId, "injected", 0, { query, source: "mnemosyne-source" });

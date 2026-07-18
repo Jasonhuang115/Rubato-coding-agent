@@ -33,6 +33,9 @@ import { initCustomDefinitions } from "../agent/agent-defs.js";
 import { initEmbeddings } from "../embedding/generate.js";
 import { getGitState, getCurrentBranch } from "../git/advisor.js";
 import { getBranchHealth } from "../git/branch-health.js";
+import { McpClient } from "../mcp/client.js";
+import { connectMcpServer, adaptMcpTool } from "../mcp/adapter.js";
+import type { McpServerConfig } from "../mcp/types.js";
 import { loadAllSkills } from "../skills/loader.js";
 import { getSkillRegistry } from "../skills/registry.js";
 import type { SkillDefinition } from "../skills/types.js";
@@ -184,6 +187,36 @@ REPL Commands:
 Config:
   Place .rubato.yml in your project root or ~/.rubato/config.yml
 `);
+}
+
+// ---- MCP Config Loader ----
+
+function loadMcpConfigs(workingDir: string): McpServerConfig[] {
+  const configs: McpServerConfig[] = [];
+  const paths = [
+    path.join(workingDir, ".agent", "mcp.json"),
+    path.join(process.env.HOME ?? "/tmp", ".rubato", "mcp.json"),
+  ];
+
+  for (const p of paths) {
+    try {
+      if (fs.existsSync(p)) {
+        const raw = JSON.parse(fs.readFileSync(p, "utf-8"));
+        const servers = (raw.servers ?? raw) as McpServerConfig[] | Record<string, Omit<McpServerConfig, "name">>;
+        if (Array.isArray(servers)) {
+          configs.push(...servers);
+        } else {
+          for (const [name, cfg] of Object.entries(servers)) {
+            configs.push({ name, ...cfg });
+          }
+        }
+      }
+    } catch {
+      // Invalid JSON or missing file — skip
+    }
+  }
+
+  return configs;
 }
 
 // ---- Git command handler ----
@@ -907,6 +940,26 @@ async function main(): Promise<void> {
   const planSummary = planManager.getPlanSummary();
   if (planSummary) {
     console.log(`\n${planSummary}`);
+  }
+
+  // ---- MCP Server Startup ----
+  const mcpConfigs = loadMcpConfigs(workdir);
+  for (const cfg of mcpConfigs) {
+    try {
+      const client = new McpClient(cfg);
+      const toolNames = await connectMcpServer(client, cfg.name);
+      for (const name of toolNames) {
+        const toolDef = adaptMcpTool(
+          { name: name.replace(`mcp:${cfg.name}:`, ""), description: `MCP tool from ${cfg.name}`, inputSchema: { type: "object", properties: {} } },
+          client
+        );
+        register({ ...toolDef, name: `mcp:${cfg.name}:${name.replace(`mcp:${cfg.name}:`, "")}` });
+      }
+      console.log(`MCP: ${cfg.name} connected (${toolNames.length} tools)`);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.log(`MCP: ${cfg.name} failed — ${msg}`);
+    }
   }
 
   if (interactive) {

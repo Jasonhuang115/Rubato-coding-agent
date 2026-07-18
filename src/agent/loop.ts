@@ -34,8 +34,10 @@ import { SessionStore } from "../session/storage.js";
 import { createSessionMeta, finalizeSessionMeta } from "../session/meta.js";
 import type { SessionManager } from "../session/manager.js";
 import { PlanManager } from "../plan/manager.js";
+import type { PlanDoc } from "../plan/tree.js";
 import { sessionStartRecall } from "../journal/recall.js";
 import { persistKnowledge } from "../journal/extractor.js";
+import { sessionStartHook, sessionEndHook, prePushHook, preCommitHook, conflictCheckHook } from "../git/hooks.js";
 
 // ---- Configuration constants ----
 
@@ -163,9 +165,17 @@ export async function* agentLoop(
   // Journal recall: inject relevant past knowledge
   const journalRecall = sessionStartRecall(workingDir);
 
+  // Git branch health at session start
+  const gitHealth = await sessionStartHook(workingDir).catch(() => null);
+
+  // Check for ongoing merge conflicts
+  const conflictWarning = await conflictCheckHook(workingDir).catch(() => null);
+
   const systemPrompt = buildSystemPrompt(ctx, tools) +
     (contextText ? `\n\n## Project Context\n${contextText}` : "") +
     (journalRecall ? `\n\n${journalRecall}` : "") +
+    (gitHealth ? `\n\n${gitHealth}` : "") +
+    (conflictWarning ? `\n\n${conflictWarning}` : "") +
     (options.resumeSummary ? `\n\n## Previous Session Context\nThe following is a summary of a previous session in this project. Use this context to understand what was previously discussed:\n\n${options.resumeSummary}` : "");
 
   // System prompt tokens — counted once since it's sent on every API call
@@ -476,6 +486,26 @@ export async function* agentLoop(
       if (toolWarning) {
         yield { type: "warning", message: toolWarning };
       }
+
+      // Git hooks: pre-push / pre-commit checks
+      if (tu.name === "Bash") {
+        const cmd = (tu.input.command as string) ?? "";
+        if (/\bgit\s+push\b/.test(cmd)) {
+          const pushHook = await prePushHook(workingDir).catch(() => null);
+          if (pushHook) {
+            for (const w of pushHook.warnings) yield { type: "warning", message: w };
+            for (const s of pushHook.suggestions) yield { type: "warning", message: `💡 ${s}` };
+          }
+        }
+        if (/\bgit\s+commit\b/.test(cmd)) {
+          const commitHook = await preCommitHook(workingDir, planManager.getActivePlan() as PlanDoc | null).catch(() => null);
+          if (commitHook) {
+            for (const w of commitHook.warnings) yield { type: "warning", message: w };
+            for (const s of commitHook.suggestions) yield { type: "warning", message: `💡 ${s}` };
+          }
+        }
+      }
+
       const result = await executeToolCall(tu, permissionManager, ctx, renderer, options.onConfirmTool);
       if (result.denied) toolDenied = true;
       yield {
@@ -532,6 +562,18 @@ export async function* agentLoop(
   }
 
   // ---- Finalize ----
+  // Git workflow learning at session end
+  try {
+    const gitEnd = await sessionEndHook(workingDir).catch(() => null);
+    if (gitEnd && gitEnd.advice.length > 0) {
+      for (const a of gitEnd.advice.slice(0, 3)) {
+        yield { type: "warning", message: `📐 ${a}` };
+      }
+    }
+  } catch {
+    // Best-effort
+  }
+
   // Extract knowledge into Mnemosyne (not old Journal)
   try {
     const extracted = persistKnowledge(messages, sessionId, workingDir);
