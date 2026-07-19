@@ -5,7 +5,7 @@ import path from "path";
 import { MnemosyneStore, closeMnemosyneStore, setMnemosyneStore } from "../src/memory/store.js";
 import { evaluateMemory, evaluateAll, getInjectCandidates, THRESHOLDS } from "../src/memory/evaluator.js";
 import { rewriteQuery, learnQueryRewrite } from "../src/memory/rewriter.js";
-import { shouldConsolidate, consolidateMemories } from "../src/memory/consolidator.js";
+import { shouldConsolidate, consolidateMemories, parseConsolidationJson } from "../src/memory/consolidator.js";
 import { generateSimpleEmbedding, cosineSimilarity } from "../src/memory/embedding/setup.js";
 
 const TEST_DB = "/tmp/test-mnemosyne.db";
@@ -523,6 +523,45 @@ describe("Consolidator", () => {
     const result = await consolidateMemories();
     expect(result.errors.length).toBe(0);
     // Should not crash
+  });
+
+  it("parses LLM consolidation JSON conservatively", () => {
+    const parsed = parseConsolidationJson(`\`\`\`json
+{"action":"create_principle","name":"rubato-memory","type":"concept","summary":"Rubato should keep personal project preferences as stable reusable memory.","scope":"Use in Rubato memory work.","confidence":0.82,"validity":"Review when memory storage changes.","conflicts":[]}
+\`\`\``, "note");
+
+    expect(parsed?.name).toBe("rubato-memory");
+    expect(parsed?.type).toBe("concept");
+    expect(parsed?.confidence).toBe(0.82);
+  });
+
+  it("uses LLM summarizer to create traceable semantic memory", async () => {
+    store.upsertEntity("rubato/memory/preference/a", "concept", "Rubato should keep long-term user preferences recoverable instead of deleting old preferences.", "s1", 0.8, "auto", 0);
+    store.upsertEntity("rubato/memory/preference/b", "concept", "Rubato memory lifecycle should prefer dormant archival for stale personal preferences.", "s1", 0.8, "auto", 0);
+    store.upsertEntity("rubato/memory/preference/c", "concept", "Personal preference memories should be recoverable through explicit recall even when not injected by default.", "s1", 0.8, "auto", 0);
+
+    const result = await consolidateMemories({
+      summarizer: async () => ({
+        action: "create_principle",
+        name: "rubato-memory-lifecycle",
+        type: "concept",
+        summary: "Rubato should preserve personal memory as recoverable dormant knowledge before considering deletion.",
+        scope: "Use when changing Mnemosyne lifecycle, retrieval, or pruning behavior.",
+        confidence: 0.86,
+        validity: "Review if memory volume or storage backend changes.",
+        conflicts: [],
+      }),
+    });
+
+    const principle = store.findEntityByName("principle/rubato-memory-lifecycle", "concept");
+    expect(result.abstracted).toBeGreaterThan(0);
+    expect(principle?.content).toContain("Scope: Use when changing Mnemosyne lifecycle");
+    expect(principle?.abstracted_from.split(",").length).toBe(3);
+    expect(store.getRelations(principle!.id, "RELATED_TO").length).toBe(3);
+
+    const dormant = ["rubato/memory/preference/a", "rubato/memory/preference/b", "rubato/memory/preference/c"]
+      .map((name) => store.findEntityByName(name, "concept")?.status);
+    expect(dormant).toEqual(["dormant", "dormant", "dormant"]);
   });
 });
 

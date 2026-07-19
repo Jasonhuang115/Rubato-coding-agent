@@ -10,6 +10,27 @@ export interface ConsolidationResult {
   errors: string[];
 }
 
+export interface MemoryConsolidationSummary {
+  action: "create_principle" | "merge" | "keep_separate";
+  name: string;
+  type: EntityRow["type"];
+  summary: string;
+  scope: string;
+  confidence: number;
+  validity: string;
+  conflicts: string[];
+}
+
+export type MemorySummarizer = (cluster: {
+  subject: string;
+  cohesion: number;
+  entities: EntityRow[];
+}) => Promise<MemoryConsolidationSummary | null>;
+
+export interface ConsolidationOptions {
+  summarizer?: MemorySummarizer;
+}
+
 let sessionCount = 0;
 let lastConsolidationTime = 0;
 
@@ -20,7 +41,7 @@ export function shouldConsolidate(): boolean {
   return sessionCount >= 5 && (stats.entities > 50 || timeElapsed > 30 * 60 * 1000);
 }
 
-export async function consolidateMemories(): Promise<ConsolidationResult> {
+export async function consolidateMemories(options: ConsolidationOptions = {}): Promise<ConsolidationResult> {
   const store = getMnemosyneStore();
   const result: ConsolidationResult = { merged: 0, abstracted: 0, dormant: 0, deleted: 0, errors: [] };
   lastConsolidationTime = Date.now();
@@ -35,7 +56,7 @@ export async function consolidateMemories(): Promise<ConsolidationResult> {
 
     // Abstract each cluster
     for (const cluster of clusters) {
-      try { if (abstractCluster(store, cluster)) result.abstracted++; }
+      try { if (await abstractCluster(store, cluster, options.summarizer)) result.abstracted++; }
       catch (err) { result.errors.push(`Abstract "${cluster.subject}": ${err}`); }
     }
 
@@ -96,22 +117,121 @@ function computeCohesion(entities: EntityRow[]): number {
   return pairs > 0 ? total / pairs : 0;
 }
 
-function abstractCluster(store: ReturnType<typeof getMnemosyneStore>, cluster: { entities: EntityRow[]; subject: string }): boolean {
+async function abstractCluster(
+  store: ReturnType<typeof getMnemosyneStore>,
+  cluster: { entities: EntityRow[]; subject: string; cohesion?: number },
+  summarizer?: MemorySummarizer,
+): Promise<boolean> {
   if (cluster.entities.length < 2) return false;
-  const avgConf = cluster.entities.reduce((s, e) => s + e.confidence, 0) / cluster.entities.length;
-  const abstractContent = [
-    `Abstracted from ${cluster.entities.length} related memories: ${cluster.entities.map((e) => e.name).join(", ")}`,
-    `Subject: ${cluster.subject}`, `Type: ${cluster.entities[0].type}`,
-    `Coverage: ${cluster.entities.map((e) => e.content.slice(0, 100)).join(" | ")}`,
-  ].join("\n");
+  const summary = summarizer ? await summarizer({
+    subject: cluster.subject,
+    cohesion: cluster.cohesion ?? computeCohesion(cluster.entities),
+    entities: cluster.entities,
+  }) : null;
 
-  store.upsertEntity(`principle/${cluster.subject}`, cluster.entities[0].type, abstractContent, "consolidator", Math.min(1.0, avgConf + 0.1), "auto", 0);
-  const principle = store.findEntityByName(`principle/${cluster.subject}`);
+  const consolidation = summary ?? buildRuleBasedSummary(cluster);
+  if (consolidation.action === "keep_separate") return false;
+
+  const sourceIds = cluster.entities.map((entity) => entity.id);
+  const name = consolidation.name.startsWith("principle/")
+    ? consolidation.name
+    : `principle/${sanitizeName(consolidation.name || cluster.subject)}`;
+  const content = formatConsolidatedMemory(consolidation, sourceIds);
+
+  store.upsertEntity(
+    name,
+    consolidation.type,
+    content,
+    "consolidator",
+    clamp(consolidation.confidence),
+    "consolidator",
+    0,
+  );
+  const principle = store.findEntityByName(name, consolidation.type);
   if (principle) {
-    for (const member of cluster.entities)
-      store.addRelation(principle.id, member.id, "RELATED_TO", 0.7, `Clustered by Consolidator`);
+    store.markAbstractedFrom(principle.id, sourceIds);
+    for (const member of cluster.entities) {
+      store.addRelation(principle.id, member.id, "RELATED_TO", 0.8, `Consolidated by Mnemosyne`);
+      if (consolidation.confidence >= 0.7 && member.protected === 0 && member.source !== "manual") {
+        store.markDormant(member.id);
+      }
+    }
   }
   return true;
+}
+
+function buildRuleBasedSummary(cluster: { entities: EntityRow[]; subject: string }): MemoryConsolidationSummary {
+  const avgConf = cluster.entities.reduce((s, e) => s + e.confidence, 0) / cluster.entities.length;
+  return {
+    action: "create_principle",
+    name: cluster.subject,
+    type: cluster.entities[0].type,
+    summary: `Related memories indicate a stable pattern about ${cluster.subject}.`,
+    scope: `Use when working on ${cluster.subject} or adjacent project behavior.`,
+    confidence: Math.min(1.0, avgConf + 0.1),
+    validity: "Review when the related files, APIs, or project conventions change.",
+    conflicts: [],
+  };
+}
+
+function formatConsolidatedMemory(summary: MemoryConsolidationSummary, sourceIds: number[]): string {
+  const conflicts = summary.conflicts.length > 0 ? summary.conflicts.join("; ") : "none";
+  return [
+    `Summary: ${summary.summary}`,
+    `Scope: ${summary.scope}`,
+    `Validity: ${summary.validity}`,
+    `Confidence: ${clamp(summary.confidence).toFixed(2)}`,
+    `Conflicts: ${conflicts}`,
+    `Abstracted from memory ids: ${sourceIds.join(",")}`,
+  ].join("\n");
+}
+
+export function parseConsolidationJson(raw: string, fallbackType: EntityRow["type"]): MemoryConsolidationSummary | null {
+  const text = raw.trim().replace(/^```(?:json)?/i, "").replace(/```$/i, "").trim();
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start < 0 || end <= start) return null;
+
+  try {
+    const parsed = JSON.parse(text.slice(start, end + 1)) as Record<string, unknown>;
+    const action = parsed.action === "merge" || parsed.action === "keep_separate"
+      ? parsed.action
+      : "create_principle";
+    const type = isEntityType(parsed.type) ? parsed.type : fallbackType;
+    const confidence = typeof parsed.confidence === "number" ? parsed.confidence : 0.65;
+    const conflicts = Array.isArray(parsed.conflicts)
+      ? parsed.conflicts.filter((item): item is string => typeof item === "string").slice(0, 5)
+      : [];
+
+    if (typeof parsed.summary !== "string" || parsed.summary.trim().length < 12) return null;
+    return {
+      action,
+      name: typeof parsed.name === "string" && parsed.name.trim() ? parsed.name.trim() : "consolidated-memory",
+      type,
+      summary: parsed.summary.trim(),
+      scope: typeof parsed.scope === "string" && parsed.scope.trim() ? parsed.scope.trim() : "Apply when the same project context appears.",
+      confidence,
+      validity: typeof parsed.validity === "string" && parsed.validity.trim() ? parsed.validity.trim() : "Review when source evidence changes.",
+      conflicts,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function isEntityType(value: unknown): value is EntityRow["type"] {
+  return typeof value === "string" && [
+    "file", "function", "class", "concept", "config", "error",
+    "deploy", "api", "dependency", "test", "note",
+  ].includes(value);
+}
+
+function sanitizeName(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fa5/_-]+/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "") || "memory";
+}
+
+function clamp(value: number, min = 0, max = 1): number {
+  return Math.max(min, Math.min(max, value));
 }
 
 function mergeDuplicates(store: ReturnType<typeof getMnemosyneStore>): number {

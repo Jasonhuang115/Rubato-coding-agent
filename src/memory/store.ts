@@ -444,6 +444,14 @@ export class MnemosyneStore implements MemoryStore {
     return result.changes > 0;
   }
 
+  markAbstractedFrom(entityId: number, sourceIds: number[]): boolean {
+    const uniqueIds = [...new Set(sourceIds)].filter((id) => Number.isFinite(id));
+    const result = this.db.prepare(
+      `UPDATE entities SET abstracted_from = ?, updated_at = ? WHERE id = ?`
+    ).run(uniqueIds.join(","), Date.now(), entityId);
+    return result.changes > 0;
+  }
+
   /** Physical deletion is reserved for evaluator-confirmed, recoverable auto-generated noise. */
   deleteNoiseCandidates(entityIds: number[]): number {
     if (entityIds.length === 0) return 0;
