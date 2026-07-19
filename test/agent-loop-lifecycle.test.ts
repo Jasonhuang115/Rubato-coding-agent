@@ -3,7 +3,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import type { AgentConfig, ModelProvider, StreamRenderer } from "../src/shared/core-types.js";
+import type { AgentConfig, ModelProvider, StreamRenderer, ToolDefinition } from "../src/shared/core-types.js";
 
 const fakeProvider = vi.hoisted(() => ({
   name: "test",
@@ -148,7 +148,8 @@ describe("agentLoop lifecycle", () => {
     });
 
     const { agentLoop } = await import("../src/agent/loop.js");
-    for await (const _event of agentLoop({
+    const events = [];
+    for await (const event of agentLoop({
       config,
       workingDir: homeDir,
       prompt: "hello",
@@ -156,10 +157,67 @@ describe("agentLoop lifecycle", () => {
       tools: [],
       sessionId: "answered-session",
       maxTurns: 1,
-    })) { /* consume */ }
+    })) {
+      events.push(event);
+    }
 
+    expect(events).toContainEqual({ type: "text", text: "A complete answer" });
     expect(getInjectedMemoriesForSession).toHaveBeenCalledWith("answered-session");
     expect(markIgnoredForSession).toHaveBeenCalledWith("answered-session");
     expect(autoTuneStrategyWeights).toHaveBeenCalled();
+  });
+
+  it("deterministically delegates broad project exploration", async () => {
+    const agentHandler = vi.fn(async () => ({ content: "exploration report" }));
+    const agentTool: ToolDefinition = {
+      name: "Agent",
+      description: "delegate work",
+      inputSchema: { type: "object", properties: {} },
+      type: "write",
+      handler: agentHandler,
+    };
+    const { register, clear } = await import("../src/tools/registry.js");
+    clear();
+    register(agentTool);
+
+    let modelMessages: unknown;
+    fakeProvider.chat.mockImplementation(async function* (params) {
+      modelMessages = structuredClone(params.messages);
+      yield { type: "text_delta" as const, text: "evaluation based on the report" };
+      yield {
+        type: "message_stop" as const,
+        stopReason: "end_turn" as const,
+        usage: { inputTokens: 1, outputTokens: 3 },
+      };
+    });
+
+    try {
+      const { agentLoop } = await import("../src/agent/loop.js");
+      const events = [];
+      for await (const event of agentLoop({
+        config,
+        workingDir: homeDir,
+        prompt: "探索一下这个项目并评价架构，不要进行改动",
+        renderer,
+        tools: [agentTool],
+        sessionId: "delegation-session",
+        maxTurns: 1,
+      })) {
+        events.push(event);
+      }
+
+      expect(agentHandler).toHaveBeenCalledOnce();
+      expect(agentHandler.mock.calls[0][0]).toMatchObject({
+        subagent_type: "explore",
+        description: "Explore requested project",
+      });
+      expect(events.some((event) => event.type === "tool_result" && event.name === "Agent")).toBe(true);
+      expect(modelMessages).toEqual([{
+        role: "user",
+        content: expect.stringContaining("[Runtime-provided Explore subagent result]\nexploration report"),
+      }]);
+    } finally {
+      clear();
+    }
   });
 });

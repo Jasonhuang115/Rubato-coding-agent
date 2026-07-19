@@ -213,6 +213,21 @@ describe("FsSandbox path traversal", () => {
     const r = sandbox.validate("Write", { file_path: "/Users/test/project/new-file.ts" }, WS);
     expect(r.allowed).toBe(true);
   });
+
+  it("allows reading Rubato subagent artifacts", () => {
+    expect(check("/tmp/rubato-subagent-session-sub-1234.md").allowed).toBe(true);
+    expect(check("/tmp/rubato-subagent-session-sub-1234.transcript.md").allowed).toBe(true);
+  });
+
+  it("allows reading offloaded Rubato tool results", () => {
+    expect(check("/tmp/rubato-tool-results/Glob-ffd59274.txt").allowed).toBe(true);
+  });
+
+  it("does not broaden temporary-file access", () => {
+    expect(check("/tmp/unrelated.txt").allowed).toBe(false);
+    expect(check("/tmp/rubato-tool-results/../secret.txt").allowed).toBe(false);
+    expect(sandbox.validate("Write", { file_path: "/tmp/rubato-tool-results/fake.txt" }, WS).allowed).toBe(false);
+  });
 });
 
 // ============================================================

@@ -135,13 +135,112 @@ interface TranscriptTurn {
   timestamp: number;
 }
 
+interface SpawnSubagentOptions {
+  agentId?: string;
+}
+
+export function getSubagentResultPath(agentId: string): string {
+  return `/tmp/rubato-subagent-${agentId}.md`;
+}
+
+export function getSubagentTranscriptPath(agentId: string): string {
+  return `/tmp/rubato-subagent-${agentId}.transcript.md`;
+}
+
+function formatResultArtifact(
+  definition: SubagentDefinition,
+  task: string,
+  result: SubagentResult,
+): string {
+  return [
+    `# Subagent Result: ${definition.name}`,
+    `**Agent ID:** ${result.agentId}`,
+    `**Status:** ${result.status}`,
+    `**Tokens:** ${result.usage.inputTokens} in / ${result.usage.outputTokens} out | **Tool calls:** ${result.usage.toolCalls}`,
+    `**Transcript:** ${result.transcriptPath}`,
+    "",
+    "## Task",
+    "",
+    task,
+    "",
+    "## Final Report",
+    "",
+    result.output || "(no final report)",
+    "",
+  ].join("\n");
+}
+
+function formatTranscriptArtifact(
+  definition: SubagentDefinition,
+  task: string,
+  agentId: string,
+  turns: TranscriptTurn[],
+): string {
+  const sections = turns.map((turn) => {
+    const toolCalls = turn.toolCalls.length === 0
+      ? "(none)"
+      : turn.toolCalls.map((call) => [
+          `### ${call.name}${call.isError ? " (error)" : ""}`,
+          "",
+          "```text",
+          call.result,
+          "```",
+        ].join("\n")).join("\n\n");
+
+    return [
+      `## Turn ${turn.turn}`,
+      "",
+      "### Assistant Text",
+      "",
+      turn.text || "(none)",
+      "",
+      "### Tool Results",
+      "",
+      toolCalls,
+    ].join("\n");
+  });
+
+  return [
+    `# Subagent Transcript: ${definition.name}`,
+    `**Agent ID:** ${agentId}`,
+    "",
+    "## Task",
+    "",
+    task,
+    "",
+    ...sections,
+    "",
+  ].join("\n");
+}
+
+function persistSubagentArtifacts(
+  definition: SubagentDefinition,
+  task: string,
+  result: SubagentResult,
+  turns: TranscriptTurn[],
+): SubagentResult {
+  const resultPath = getSubagentResultPath(result.agentId);
+  const transcriptPath = getSubagentTranscriptPath(result.agentId);
+  const resultWithPaths = { ...result, resultPath, transcriptPath };
+
+  try {
+    fs.writeFileSync(transcriptPath, formatTranscriptArtifact(definition, task, result.agentId, turns), "utf-8");
+    fs.writeFileSync(resultPath, formatResultArtifact(definition, task, resultWithPaths), "utf-8");
+  } catch {
+    // Artifact persistence is best-effort; the in-memory result remains usable.
+  }
+
+  return resultWithPaths;
+}
+
 export async function spawnSubagent(
   definition: SubagentDefinition,
   task: string,
   parentCtx: AgentContext,
-  parentConfig: AgentConfig
+  parentConfig: AgentConfig,
+  options: SpawnSubagentOptions = {},
 ): Promise<SubagentResult> {
-  const agentId = `${parentCtx.sessionId}-sub-${randomUUID().slice(0, 8)}`;
+  const agentId = options.agentId ?? `${parentCtx.sessionId}-sub-${randomUUID().slice(0, 8)}`;
   const depth = (parentCtx.depth ?? 0) + 1;
 
   // 1. Budget check (deterministic counters only)
@@ -149,12 +248,12 @@ export async function spawnSubagent(
   if (budgetManager) {
     const allocation = budgetManager.tryAllocate(depth);
     if (!allocation.allowed) {
-      return {
+      return persistSubagentArtifacts(definition, task, {
         status: "failed",
         agentId,
         output: `Spawn denied: ${allocation.reason}`,
         usage: { inputTokens: 0, outputTokens: 0, toolCalls: 0 },
-      };
+      }, []);
     }
   }
 
@@ -173,7 +272,6 @@ export async function spawnSubagent(
 
   const subConfig: AgentConfig = { ...parentConfig, model: modelConfig };
 
-  const outputParts: string[] = [];
   let totalInputTokens = 0;
   let totalOutputTokens = 0;
   let toolCallCount = 0;
@@ -196,8 +294,7 @@ export async function spawnSubagent(
       tools,
       depth,
       budgetManager,
-      maxTurns: 999, // subagents run until natural completion
-      skipCompaction: true,
+      maxTurns: definition.maxTurns ?? Number.POSITIVE_INFINITY,
     })) {
       switch (event.type) {
         case "turn_start":
@@ -209,7 +306,6 @@ export async function spawnSubagent(
           currentToolCalls = [];
           break;
         case "text":
-          outputParts.push(event.text);
           currentText += event.text;
           break;
         case "tool_result":
@@ -223,7 +319,6 @@ export async function spawnSubagent(
           }
           break;
         case "error":
-          outputParts.push(`[Error] ${event.message}`);
           currentText += `\n[Error] ${event.message}`;
           break;
         case "done":
@@ -239,7 +334,7 @@ export async function spawnSubagent(
     }
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
-    outputParts.push(`[Fatal] ${message}`);
+    currentText += `${currentText ? "\n" : ""}[Fatal] ${message}`;
     finalStatus = "failed";
   } finally {
     // Always release the parallel slot
@@ -278,7 +373,14 @@ export async function spawnSubagent(
     }
   } catch { /* best-effort */ }
 
-  return { status: finalStatus, agentId, output: outputParts.join("\n"), usage };
+  const finalTurn = [...turns].reverse().find((turn) => turn.text.trim().length > 0);
+  const output = finalTurn?.text.trim() ?? currentText.trim();
+  return persistSubagentArtifacts(
+    definition,
+    task,
+    { status: finalStatus, agentId, output, summary: output, usage },
+    turns,
+  );
 }
 
 // ---- Worktree isolation ----
@@ -354,17 +456,34 @@ export function spawnSubagentInBackground(
 
   const resultPromise = (async (): Promise<SubagentResult> => {
     try {
-      const result = await spawnSubagent(definition, task, parentCtx, parentConfig);
-      if (cancelled) return { status: "failed", agentId, output: "Cancelled", usage: { inputTokens: 0, outputTokens: 0, toolCalls: 0 } };
+      const result = await spawnSubagent(definition, task, parentCtx, parentConfig, { agentId });
+      if (cancelled) {
+        return persistSubagentArtifacts(definition, task, {
+          status: "failed",
+          agentId,
+          output: "Cancelled",
+          usage: result.usage,
+        }, []);
+      }
       status = result.status === "completed" ? "completed" : "failed";
       return result;
     } catch (err) {
       status = "failed";
-      return { status: "failed", agentId, output: err instanceof Error ? err.message : String(err), usage: { inputTokens: 0, outputTokens: 0, toolCalls: 0 } };
+      return persistSubagentArtifacts(definition, task, {
+        status: "failed",
+        agentId,
+        output: err instanceof Error ? err.message : String(err),
+        usage: { inputTokens: 0, outputTokens: 0, toolCalls: 0 },
+      }, []);
     }
   })();
 
-  return { agentId, status: "running", wait: () => resultPromise, cancel: () => { cancelled = true; } };
+  return {
+    agentId,
+    get status() { return status; },
+    wait: () => resultPromise,
+    cancel: () => { cancelled = true; },
+  };
 }
 
 // ---- No-op renderer ----

@@ -264,6 +264,10 @@ export interface SubagentResult {
   agentId: string;
   output: string;
   usage: { inputTokens: number; outputTokens: number; toolCalls: number };
+  /** Stable path containing the complete final report. */
+  resultPath?: string;
+  /** Stable path containing the multi-turn execution transcript. */
+  transcriptPath?: string;
   /** Machine-extractable summary (for parent agent to merge). */
   summary?: string;
   /** Files modified by this subagent. */

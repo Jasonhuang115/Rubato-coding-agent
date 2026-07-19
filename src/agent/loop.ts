@@ -34,6 +34,7 @@ import { sessionEndHook } from "../tools/git/hooks.js";
 import { assembleContext } from "../runtime/context-assembler.js";
 import { checkAndCompact, runMicroCompact } from "../runtime/compaction-controller.js";
 import { executeTurn, UserInterruptError, CircuitBreakerError, MaxRetriesError } from "../runtime/step-executor.js";
+import { getRequiredDelegation } from "./delegation-policy.js";
 
 // ---- Configuration ----
 
@@ -150,6 +151,42 @@ export async function* agentLoop(
   const messages: Message[] = [
     { role: "user", content: prompt },
   ];
+
+  // Broad project exploration is a deterministic delegation boundary. Relying
+  // on model tool choice made identical requests delegate inconsistently.
+  const requiredDelegation = getRequiredDelegation(prompt, options.depth ?? 0, tools);
+  if (requiredDelegation) {
+    const toolUseId = `auto-delegate-${randomUUID()}`;
+    const toolInput = {
+      description: requiredDelegation.description,
+      prompt: requiredDelegation.prompt,
+      subagent_type: requiredDelegation.subagentType,
+    };
+
+    renderer.renderToolUse("Agent", toolInput);
+    yield { type: "tool_call", id: toolUseId, name: "Agent", input: toolInput };
+
+    const delegated = await toolRuntime.execute("Agent", toolInput, ctx);
+    yield {
+      type: "tool_result",
+      id: toolUseId,
+      name: "Agent",
+      result: delegated.content,
+      isError: delegated.isError,
+    };
+
+    messages[0] = {
+      role: "user",
+      content: [
+        prompt,
+        "",
+        "[Runtime-provided Explore subagent result]",
+        delegated.content,
+        "",
+        "Use this delegated report to answer the original request. Read its full-report path only if the preview is insufficient. Do not repeat the exploration yourself.",
+      ].join("\n"),
+    };
+  }
 
   // ---- Compaction tracking ----
   let consecutiveCompactionFailures = 0;
@@ -351,8 +388,42 @@ export async function* agentLoop(
     const pendingConsolidations = store.getPendingConsolidations();
     if (pendingConsolidations.length > 0) {
       yield { type: "warning", message: `🧠 记忆系统检测到 ${pendingConsolidations.length} 组相似记忆等待合并，将在后台处理...` };
-      const { consolidateMemories } = await import("../memory/consolidator.js");
-      const result = await consolidateMemories();
+      const { consolidateMemories, parseConsolidationJson } = await import("../memory/consolidator.js");
+      const result = await consolidateMemories({
+        summarizer: async (cluster) => {
+          const memories = cluster.entities.map((entity) => ({
+            id: entity.id,
+            name: entity.name,
+            type: entity.type,
+            confidence: entity.confidence,
+            status: entity.status,
+            content: entity.content.slice(0, 700),
+          }));
+          const prompt = [
+            "Consolidate these related long-term memories for a personal coding agent.",
+            "Return only one JSON object with these fields:",
+            `{"action":"create_principle|merge|keep_separate","name":"short stable key","type":"concept|config|error|api|deploy|dependency|test|note|file|function|class","summary":"stable reusable memory","scope":"when to use it","confidence":0.0,"validity":"when to review or invalidate","conflicts":["optional conflict notes"]}`,
+            "Prefer keep_separate when the memories are merely keyword-similar but do not support one reusable fact, preference, or project convention.",
+            "",
+            `Subject: ${cluster.subject}`,
+            `Cohesion: ${cluster.cohesion.toFixed(3)}`,
+            `Memories: ${JSON.stringify(memories)}`,
+          ].join("\n");
+
+          let raw = "";
+          for await (const event of provider.chat({
+            model: config.model.model,
+            system: "You are Mnemosyne's memory consolidator. Produce compact, conservative JSON. Do not call tools.",
+            messages: [{ role: "user", content: prompt }],
+            tools: [],
+            maxTokens: 700,
+          })) {
+            if (event.type === "text_delta") raw += event.text;
+            if (event.type === "error") return null;
+          }
+          return parseConsolidationJson(raw, cluster.entities[0]?.type ?? "concept");
+        },
+      });
       if (result.merged > 0 || result.abstracted > 0) {
         yield { type: "warning", message: `🧹 Mnemosyne 合并完成：合并 ${result.merged} | 抽象 ${result.abstracted} | 清理 ${result.deleted}` };
       }

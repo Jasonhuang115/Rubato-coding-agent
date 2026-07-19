@@ -1,10 +1,43 @@
 // Agent tool — spawn a subagent to handle independent subtasks
 // Supports: built-in types, custom definitions, worktree isolation, background execution
 
-import fs from "fs";
 import type { ToolDefinition, AgentContext } from "../shared/core-types.js";
-import { getBuiltinDefinition, spawnSubagent, spawnSubagentInWorktree, spawnSubagentInBackground } from "../agent/subagent.js";
+import {
+  getBuiltinDefinition,
+  getSubagentResultPath,
+  spawnSubagent,
+  spawnSubagentInWorktree,
+  spawnSubagentInBackground,
+} from "../agent/subagent.js";
 import { findDefinition, getAllDefinitions } from "../agent/agent-defs.js";
+
+const RESULT_PREVIEW_LENGTH = 4_000;
+
+function formatCompletedResult(
+  definitionName: string,
+  isolation: string,
+  result: Awaited<ReturnType<typeof spawnSubagent>>,
+): string {
+  const isolationNote = isolation === "worktree" ? " [isolated worktree]" : "";
+  const resultPath = result.resultPath ?? getSubagentResultPath(result.agentId);
+  const preview = result.output.slice(0, RESULT_PREVIEW_LENGTH);
+  const previewNote = result.output.length > RESULT_PREVIEW_LENGTH
+    ? `\n\n... [full report: ${resultPath}]`
+    : "";
+
+  const lines = [
+    `## Subagent: ${definitionName}${isolationNote} (${result.status})`,
+    `**Agent ID:** ${result.agentId}`,
+    `**Tokens:** ${result.usage.inputTokens} in / ${result.usage.outputTokens} out | **Tool calls:** ${result.usage.toolCalls}`,
+    `**Full report:** ${resultPath}`,
+    ...(result.transcriptPath ? [`**Transcript:** ${result.transcriptPath}`] : []),
+    "",
+    "### Final Report Preview",
+    "",
+    (preview || "(no final report)") + previewNote,
+  ];
+  return lines.join("\n");
+}
 
 async function getAvailableTypes(): Promise<string> {
   const defs = await getAllDefinitions();
@@ -64,23 +97,7 @@ export const agentTool: ToolDefinition = {
     // Background execution — write results to a file the agent can Read later
     if (runInBackground) {
       const handle = spawnSubagentInBackground(definition, prompt, ctx, ctx.config);
-      const resultsPath = `/tmp/rubato-subagent-${handle.agentId}.md`;
-
-      // Fire-and-forget: wait for result, ALWAYS write to file
-      handle.wait().then((r) => {
-        try {
-          const content = `# Subagent Result: ${definition.name}\n**Agent ID:** ${handle.agentId}\n**Status:** ${r.status}\n**Tokens:** ${r.usage.inputTokens} in / ${r.usage.outputTokens} out | **Tool calls:** ${r.usage.toolCalls}\n\n---\n\n${r.output || "(no output)"}`;
-          fs.writeFileSync(resultsPath, content, "utf-8");
-        } catch {
-          // Last-resort: write even if everything above failed
-          try { fs.writeFileSync(resultsPath, `# Subagent Result: ${definition.name}\n**Status:** failed to produce output`, "utf-8"); } catch {}
-        }
-      }).catch((err) => {
-        // Subagent itself crashed — still write a file so agent knows it's done
-        try {
-          fs.writeFileSync(resultsPath, `# Subagent Result: ${definition.name}\n**Agent ID:** ${handle.agentId}\n**Status:** failed\n**Error:** ${err instanceof Error ? err.message : String(err)}`, "utf-8");
-        } catch {}
-      });
+      const resultsPath = getSubagentResultPath(handle.agentId);
 
       return {
         content:
@@ -105,9 +122,9 @@ export const agentTool: ToolDefinition = {
       result = await spawnSubagent(definition, prompt, ctx, ctx.config);
     }
 
-    const isolationNote = isolation === "worktree" ? " [isolated worktree]" : "";
-    const header = `## Subagent: ${definition.name}${isolationNote} (${result.status})\n**Agent ID:** ${result.agentId}\n**Tokens:** ${result.usage.inputTokens} in / ${result.usage.outputTokens} out | **Tool calls:** ${result.usage.toolCalls}\n\n---\n\n`;
-
-    return { content: header + result.output, isError: result.status === "failed" };
+    return {
+      content: formatCompletedResult(definition.name, isolation, result),
+      isError: result.status !== "completed",
+    };
   },
 };

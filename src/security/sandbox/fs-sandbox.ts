@@ -13,6 +13,9 @@ const SENSITIVE_PATHS = [
   ".git/config", ".env", ".env.local",
 ];
 
+const SUBAGENT_ARTIFACT_PATTERN = /^\/tmp\/rubato-subagent-[A-Za-z0-9_-]+(?:\.transcript)?\.md$/;
+const TOOL_RESULT_PATTERN = /^\/tmp\/rubato-tool-results\/[A-Za-z0-9_-]+\.txt$/;
+
 export class FsSandbox implements ISandbox {
   readonly name = "fs-sandbox";
 
@@ -23,8 +26,11 @@ export class FsSandbox implements ISandbox {
     const resolved = this.resolvePath(filePath, workingDir);
     const workspaceRoot = path.resolve(workingDir);
 
-    // 0. Allow subagent result files (background subagents write to /tmp)
-    if (resolved.startsWith("/tmp/rubato-subagent-")) {
+    // 0. Allow reads of Rubato-owned temporary artifacts, but no arbitrary /tmp access.
+    if (
+      toolName === "Read" &&
+      (SUBAGENT_ARTIFACT_PATTERN.test(resolved) || TOOL_RESULT_PATTERN.test(resolved))
+    ) {
       return { allowed: true, sanitizedInput: { ...input, file_path: resolved } };
     }
 

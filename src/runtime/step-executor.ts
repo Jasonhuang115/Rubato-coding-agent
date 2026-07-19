@@ -243,6 +243,12 @@ export async function* executeTurn(
   }
   messages.push({ role: "assistant", content: assistantBlocks });
 
+  // The interactive renderer already streamed this text to the terminal, but
+  // non-interactive consumers (notably subagents) need it on the event channel.
+  if (text) {
+    yield { type: "text", text };
+  }
+
   // ---- Execute tool calls ----
   const readCalls: ToolUseBlock[] = [];
   const writeCalls: ToolUseBlock[] = [];
@@ -350,7 +356,13 @@ export async function* executeTurn(
     });
   }
 
-  return { assistantBlocks: [], toolUses, usage, stopReason, toolDenied };
+  return {
+    assistantBlocks: text ? [{ type: "text", text }] : [],
+    toolUses,
+    usage,
+    stopReason,
+    toolDenied,
+  };
 }
 
 // ---- Tool execution ----
