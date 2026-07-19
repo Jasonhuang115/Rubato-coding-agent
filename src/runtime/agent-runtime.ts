@@ -1,9 +1,14 @@
-// AgentRuntime — lifecycle container for agent execution
-// Wraps agentLoop() with state machine tracking, event emission, and resource management.
-// AgentLoop remains the core execution engine; Runtime adds observability and control.
+// AgentRuntime — lifecycle container for agent execution.
+// Wraps agentLoop() with:
+//   - State machine tracking (IDLE → EXECUTING → VERIFYING → DONE)
+//   - Event emission (step, tool, error, compaction events)
+//   - Token usage tracking
+//   - Abort mechanism
 
 import { EventBus } from "./event-bus.js";
 import { AgentStateMachine, AgentState } from "./state-machine.js";
+import { Telemetry } from "./telemetry.js";
+import { AuditLog } from "../security/audit-log.js";
 import type { AgentConfig, StreamRenderer, ConfirmDecision, TokenUsage } from "../shared/core-types.js";
 import type { AgentEvent } from "../agent/loop.js";
 import type { SessionManager } from "./session/manager.js";
@@ -23,38 +28,59 @@ export class AgentRuntime {
   readonly eventBus: EventBus;
   readonly stateMachine: AgentStateMachine;
   readonly options: RuntimeOptions;
+  readonly telemetry: Telemetry;
+  readonly auditLog: AuditLog;
 
   private _totalTokens: TokenUsage = { inputTokens: 0, outputTokens: 0 };
   private _totalSteps = 0;
   private _startTime = 0;
+  private _unsubTelemetry?: () => void;
 
   constructor(options: RuntimeOptions) {
     this.options = options;
     this.eventBus = new EventBus();
     this.stateMachine = new AgentStateMachine(this.eventBus);
+    this.telemetry = new Telemetry();
+    this.auditLog = new AuditLog(1000);
+
+    // Wire telemetry to event bus
+    this._unsubTelemetry = this.telemetry.attach(this.eventBus);
+
+    // Wire audit log: record security decisions
+    this.eventBus.on("security.decision", (e) => {
+      if (e.type === "security.decision") {
+        this.auditLog.record({
+          sessionId: this.options.sessionId ?? "unknown",
+          toolName: e.tool,
+          inputPreview: "",
+          verdict: e.verdict,
+          risk: e.risk,
+          reason: e.reason,
+          outcome: e.verdict === "deny" ? "blocked" : "allowed",
+          latencyMs: 0,
+          workspaceRoot: this.options.workingDir,
+        });
+      }
+    });
   }
 
-  /** Total tokens consumed across all steps. */
   get totalTokens(): TokenUsage {
     return { ...this._totalTokens };
   }
 
-  /** Total steps executed. */
   get totalSteps(): number {
     return this._totalSteps;
   }
 
-  /** Elapsed time since run() started. */
   get elapsedMs(): number {
     return this._startTime > 0 ? Date.now() - this._startTime : 0;
   }
 
   /**
    * Run the agent loop and return a summary.
-   * Delegates to the existing agentLoop() generator.
+   * Emits events for every significant lifecycle moment.
    */
   async run(): Promise<{ totalSteps: number; totalTokens: TokenUsage }> {
-    // Lazy import to avoid circular dependency
     const { agentLoop } = await import("../agent/loop.js");
 
     this._startTime = Date.now();
@@ -62,6 +88,13 @@ export class AgentRuntime {
     this.stateMachine.transition(AgentState.EXECUTING, "Starting agent loop");
 
     const { config, workingDir, prompt, renderer, sessionId, sessionManager, onConfirmTool, resumeSummary } = this.options;
+    const taskId = sessionId ?? "unknown";
+
+    this.eventBus.emit({
+      type: "task.started",
+      taskId,
+      timestamp: Date.now(),
+    });
 
     try {
       for await (const event of agentLoop({
@@ -74,33 +107,8 @@ export class AgentRuntime {
         onConfirmTool,
         resumeSummary,
       })) {
-        // Track step completion
-        if (event.type === "turn_end") {
-          this._totalSteps++;
-        }
-
-        // Track token usage from done/completed events
-        if (event.type === "done") {
-          this.stateMachine.transition(AgentState.DONE, "Agent loop completed");
-          this.eventBus.emit({
-            type: "task.completed",
-            taskId: sessionId ?? "",
-            timestamp: Date.now(),
-            totalSteps: this._totalSteps,
-            totalTokens: this._totalTokens,
-          });
-        }
-
-        // Track errors
-        if (event.type === "error") {
-          this.eventBus.emit({
-            type: "error",
-            timestamp: Date.now(),
-            error: typeof event === "object" && "message" in event ? String((event as any).message) : "Unknown error",
-            context: "agent_loop",
-            recoverable: true,
-          });
-        }
+        // Map agent events to runtime events
+        this.dispatchEvent(event, taskId);
       }
     } catch (err) {
       this.stateMachine.transition(AgentState.ERROR, String(err));
@@ -113,12 +121,107 @@ export class AgentRuntime {
       });
     }
 
+    this.stateMachine.transition(AgentState.DONE, "Agent loop completed");
+
+    this.eventBus.emit({
+      type: "task.completed",
+      taskId,
+      timestamp: Date.now(),
+      totalSteps: this._totalSteps,
+      totalTokens: this._totalTokens,
+    });
+
+    // Log telemetry summary
+    const snap = this.telemetry.snapshot();
+    if (snap.totalSteps > 0) {
+      this.eventBus.emit({
+        type: "compaction.triggered", // reuse — actually a telemetry report
+        timestamp: Date.now(),
+        reason: `Telemetry: ${snap.totalSteps} steps, ${snap.totalToolCalls} tools, ${snap.totalErrors} errors, ` +
+          `${snap.totalTokens.input + snap.totalTokens.output} tokens, ${snap.modelCalls} model calls`,
+        messagesBefore: 0, messagesAfter: 0,
+      });
+    }
+
     return { totalSteps: this._totalSteps, totalTokens: this._totalTokens };
   }
 
+  /** Clean up event bus listeners. Call when the runtime is no longer needed. */
+  dispose(): void {
+    this._unsubTelemetry?.();
+  }
+
   /**
-   * Abort the currently running agent loop (set by entry.ts).
-   * This is a signal-based approach — the loop checks the abort signal.
+   * Map AgentEvent → RuntimeEvent + update counters.
    */
-  // The abort mechanism is handled externally via abortCurrentRequest() from loop.ts
+  private dispatchEvent(event: AgentEvent, taskId: string): void {
+    switch (event.type) {
+      case "turn_start":
+        this.eventBus.emit({
+          type: "step.started",
+          stepIndex: event.turn,
+          timestamp: Date.now(),
+        });
+        break;
+
+      case "turn_end":
+        this._totalSteps++;
+        if (event.usage) {
+          this._totalTokens.inputTokens += event.usage.input;
+          this._totalTokens.outputTokens += event.usage.output;
+        }
+        this.eventBus.emit({
+          type: "step.completed",
+          stepIndex: this._totalSteps,
+          timestamp: Date.now(),
+          usage: {
+            inputTokens: event.usage?.input ?? 0,
+            outputTokens: event.usage?.output ?? 0,
+          },
+          latencyMs: 0,
+        });
+        break;
+
+      case "tool_result":
+        this.eventBus.emit({
+          type: "tool.executed",
+          timestamp: Date.now(),
+          tool: event.name,
+          input: {},
+          output: event.result.slice(0, 500), // preview only
+          isError: event.isError,
+          latencyMs: 0,
+        });
+        break;
+
+      case "compacting":
+        this.eventBus.emit({
+          type: "compaction.triggered",
+          timestamp: Date.now(),
+          reason: event.reason,
+          messagesBefore: 0, // approximate
+          messagesAfter: 0,
+        });
+        break;
+
+      case "error":
+        this.eventBus.emit({
+          type: "error",
+          timestamp: Date.now(),
+          error: event.message,
+          context: "agent_loop",
+          recoverable: event.retryable,
+        });
+        break;
+
+      case "done":
+      case "warning":
+      case "thinking":
+      case "text":
+      case "tool_call":
+      case "waiting_for_input":
+        // Pass through for now — these are user-facing
+        break;
+    }
+  }
 }

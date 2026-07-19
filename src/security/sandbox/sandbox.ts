@@ -52,6 +52,8 @@ export interface SecurityDecision {
   constraints: SecurityConstraints;
   risk: RiskLevel;
   reason: string;
+  /** Input after sandbox normalization. Tool execution must prefer this. */
+  sanitizedInput?: Record<string, unknown>;
   /** When verdict is "deny" or "confirm", structured error for the model. */
   block?: SecurityBlock;
 }

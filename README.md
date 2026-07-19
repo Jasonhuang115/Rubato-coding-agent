@@ -1,26 +1,49 @@
 # Rubato
 
-从零构建的 AI Coding Agent。名字来自古典音乐术语 *rubato*（弹性节奏）——好的 Agent 应该适应用户的节奏，而非相反。
+> 面向个人的编程助手。它记得你的项目、理解你的工作习惯，并在动手前和你把事情想清楚。
 
-**核心理念：有记忆、会追问、懂 Git、能进化。**
+Rubato 不是一次性完成指令的代码生成器。它围绕一个人的长期编程工作而设计：跨会话积累项目决策与排障经验，按你的节奏澄清需求、制定计划、执行修改，并把每次有效的记忆反馈给下一次检索。
 
-> 全文由 Rubato 自己编写，SWE-bench 测试也由 Rubato 自己跑。未调用任何外部 Agent 框架。
+名字来自古典音乐术语 *rubato*（弹性节奏）——新任务先慢下来理解，目标明确后稳步推进，简单问题则直接回答。
 
-## 进度
+## 为什么是个人助手
 
-| 阶段 | 状态 | 内容 |
-|------|------|------|
-| Phase 1 | ✅ | Agent 骨架：核心循环、12 工具、多提供商、权限、上下文注入 |
-| Phase 2 | ✅ | 自进化 RAG + Subagent + 意图树 + Git 顾问 + SWE-bench |
-| Phase 3 | ✅ | Agent Runtime：状态机、EventBus、递归 SubAgent、Security Runtime (5 Sandbox)、Prompt 四层架构、ToolRuntime、BudgetManager |
+长期写代码，真正稀缺的不是再调用一次模型，而是让助手逐渐知道：这个项目为什么这样组织、你偏好怎样取舍、哪些坑刚踩过、哪些改动不该轻易碰。Rubato 把这些上下文留在本地、可检索、可更新，也始终把执行权留给你。
+
+| 你需要的事 | Rubato 的做法 |
+|------------|---------------|
+| 接续上次工作 | 通过项目级会话、Mnemosyne 记忆图谱和个人知识库恢复上下文 |
+| 避免误解需求 | 先澄清关键决策，维护可恢复的意图树，并提醒偏离 |
+| 安心执行修改 | 读写与危险操作经过权限策略和五层 Sandbox，Git 操作提供风险说明 |
+| 越用越贴合 | 记忆的引用与忽略会回流到检索策略，让下一次更容易找到真正有用的经验 |
+
+## 核心能力
+
+### 长期项目记忆
+
+Rubato 会把对话、项目扫描和手动记录沉淀为本地 SQLite 知识图谱。它保存的不只是文件名，也包括配置、错误、设计决策、依赖关系和可复用的个人经验。
+
+- 同一事实出现新版本时保留历史并标记旧版为 `superseded`，而非直接删除
+- 支持 FTS5 全文、向量相似度与图遍历三路检索，RRF 融合后只注入活跃记忆
+- 支持 `/remember`、`/memory search` 和 `/journal search`，让重要结论可以显式沉淀
+
+### 先理解，再执行
+
+Plan 模式和 Grill Me 将模糊需求转成可执行计划。它会针对认证、数据库、API、前端、测试等关键决策追问，并在后续输入和工具调用偏离计划时提示你。计划可跨会话恢复，适合需要连续几天推进的个人项目。
+
+### 可控的动手能力
+
+Rubato 提供读写文件、代码搜索、Bash、Web、Git 顾问和可递归的子 Agent。所有工具调用经过统一的 Security Runtime；路径越界、危险 Shell、敏感环境变量、SSRF 和高风险 Git 操作都有独立防线。它会帮你做事，但不替你偷偷越权。
+
+### 贴合个人的 Git 顾问
+
+它不仅能执行 Git 命令，还会根据你的项目状态解释风险：改动是否偏离计划、是否可能和其他分支冲突、某段代码为什么会这样写，以及当前工作流是否符合已观察到的个人习惯和团队协作习惯。
 
 ---
 
-## 四大创新
+## 自进化记忆：让每次对话留下可用经验
 
-### 1. 自进化 RAG 记忆系统
-
-不是静态 MEMORY.md，而是一个**会自己变聪明**的知识图谱。记忆越用越准——被引用过的记忆自动强化，被忽略的自动降权，过时的自动退休。
+Mnemosyne 不是静态的 `MEMORY.md`。它是一个会维护时效、合并重复信息、根据实际回答效果调节检索的本地知识图谱。重点不在“存得更多”，而在于让下一次拿到更合适的上下文。
 
 **参考论文：**
 
@@ -31,7 +54,7 @@
 | EvoRAG (2026) | 反馈反向传播——用户引用了某条记忆就回溯给三元组加分，忽略了就降权 |
 | SegMem-RAG (AAAI 2026) | 自适应路由——检索策略权重随反馈自动收敛 |
 
-**五维记忆评分：**
+**六维记忆评分：**
 
 ```
 Evaluator(记忆) = 0.25×准确度 + 0.15×新鲜度 + 0.15×相关度
@@ -42,19 +65,25 @@ Evaluator(记忆) = 0.25×准确度 + 0.15×新鲜度 + 0.15×相关度
 - 0.55–0.85 → 活跃，正常检索
 - < 0.15 + 非保护 → 遗忘
 
-**数据流：**
+**从检索到学习的闭环：**
 
 ```
-Seeder(项目扫描播种) → entities 表
-     ↓
-每次对话 → Extractor(信号检测) → 新实体 + 自动 embedding
-     ↓
-会话结束 → FeedbackCollector(引用/忽略标记) → 策略权重自调
-     ↓
-Consolidator(懒惰合并) → 攒够 3 条相似记忆才触发 LLM 抽象
-     ↓
-Evaluator(五维评分) → 升级/保留/遗忘
+项目扫描 / 对话提取 / 手动记录 → entities
+                 ↓
+查询改写 → FTS5 + Vector + Graph → RRF 融合 → 注入记忆并记录来源
+                                                     ↓
+回答文本 → 高置信度引用归因（名称、内容片段、路径、API、技术词）
+                 ↓                         ↓
+             referenced                   ignored
+                 ↓                         ↓
+        记忆加分 + 来源信用          记忆降分 + 来源信用
+                         ↓
+           按 session + memory 聚合 → 检索策略权重平滑更新
+                         ↓
+       懒惰合并 / 时效淘汰 / 六维评分 → 下一次检索
 ```
+
+归因会在每轮回答后写入，避免长会话压缩丢失信号；中断而没有回答的会话不会把记忆误判为 ignored。多来源结果会分别回溯到 `fts5`、`vector`、`graph`，权重具有样本阈值、平滑更新和安全下限，避免早期噪声让任一路检索失效。
 
 **检索架构（三路 RRF 融合）：**
 
@@ -82,7 +111,9 @@ LIKE搜索  cosine   1-hop邻居
 | config / error / api / deploy | 自动 supersede 旧版 | `port=8000` → `port=8080`，旧版标记过期 |
 | note / concept / file / function | 合并追加 | 新知识追加到已有实体 |
 
-### 2. Subagent 递归系统
+## 深度工作能力
+
+### Subagent 递归系统
 
 父 agent 可以 spawn 子 agent，子 agent 还可以继续 spawn 孙 agent（最多 3 层）。共享 `agentLoop()` 引擎，换 tool pool 和 system prompt。
 
@@ -97,7 +128,7 @@ Parent (depth=0, AgentTool ✅)
 
 **内置 Subagent 类型**：Explore / General / Verify，均可自定义（`.rubato/agents/*.md`）。支持 background 异步执行 + worktree 隔离。结果自动写回文件，主 agent 在后续 turn 中 Read + merge。
 
-### 3. Plan 模式 + Grill Me 意图追踪
+### Plan 模式 + Grill Me 意图追踪
 
 防跑偏三阶段闭环：
 
@@ -111,7 +142,7 @@ Parent (depth=0, AgentTool ✅)
 - **意图树** — Markdown 序列化到 `.agent/plans/{branch}.md`，跨会话自动恢复
 - **偏离追踪** — 3 档灵敏度（strict/normal/loose），文件范围 + 语义 + 依赖三维度检测
 
-### 4. Git 顾问系统
+### Git 顾问系统
 
 Agent 定位为信息型顾问，所有写操作需用户确认。
 
@@ -313,14 +344,16 @@ Report issues with file paths and line numbers.
 ## 测试
 
 ```bash
-npm test              # 158 tests, 9 suites
+npm test              # 265 tests, 15 suites
 ```
 
 | Suite | 测试 | 覆盖 |
 |-------|------|------|
-| memory | 35 | CRUD、FTS5、手动记忆、关系、反馈、评分、嵌入、整理 |
-| security-sandbox | 55 | Shell/Fs/Network/Git/Env Sandbox + SecurityRuntime 集成 |
-| subagent-recursion | 22 | resolveTools 工具链、BudgetManager 资源控制、canSpawn |
+| memory | 42 | CRUD、FTS5、手动记忆、关系、反馈、评分、嵌入、整理、引用归因 |
+| security-sandbox | 58 | Shell/Fs/Network/Git/Env Sandbox + SecurityRuntime 集成 |
+| runtime / prompt / security-policy / capability | 94 | Runtime、Prompt、策略与能力边界回归 |
+| agent-loop-lifecycle | 2 | 会话收尾与记忆反馈时序 |
+| subagent-recursion / recursive-subagent | 19 | resolveTools 工具链、BudgetManager 资源控制、递归边界 |
 | tools | 13 | Read/Write/Edit/Bash/Grep/Glob/Web/Todo |
 | context | 10 | CLAUDE.md、Memory.md、Soul、Git Status、Mnemosyne |
 | model | 10 | DeepSeek、OpenAI、Anthropic、Router |

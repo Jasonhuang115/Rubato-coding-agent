@@ -48,6 +48,27 @@ export interface AccessLogRow {
   source_session: string;
 }
 
+export interface InjectedMemory {
+  entity: EntityRow;
+  retrievalSource: string;
+  query: string;
+}
+
+export interface FeedbackSignalRow {
+  memoryId: number;
+  sessionId: string;
+  eventType: string;
+  signalType: string;
+  retrievalSource: string;
+  scoreDelta: number;
+  context: Record<string, unknown>;
+}
+
+const STRATEGIES = ["fts5", "vector", "graph"] as const;
+const MIN_STRATEGY_SAMPLES = 5;
+const MIN_STRATEGY_WEIGHT = 0.1;
+const STRATEGY_LEARNING_RATE = 0.25;
+
 // ---- SQLite Store ----
 
 export class MnemosyneStore implements MemoryStore {
@@ -503,32 +524,102 @@ export class MnemosyneStore implements MemoryStore {
   /** Record feedback with retrieval source tracking (for strategy adaptation) */
   recordFeedbackSignal(memoryId: number, sessionId: string, signalType: "injected" | "referenced" | "ignored", retrievalSource: string, context: Record<string, unknown> = {}): void {
     const scoreDelta = signalType === "referenced" ? 0.1 : signalType === "ignored" ? -0.05 : 0;
-    this.db.prepare(`INSERT INTO feedback_log (memory_id, session_id, event_type, score_delta, context, signal_type, retrieval_source, timestamp) VALUES (?, ?, 'injected', ?, ?, ?, ?, ?)`)
-      .run(memoryId, sessionId, scoreDelta, JSON.stringify(context), signalType, retrievalSource, Date.now());
+    this.db.prepare(`INSERT INTO feedback_log (memory_id, session_id, event_type, score_delta, context, signal_type, retrieval_source, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(memoryId, sessionId, signalType, scoreDelta, JSON.stringify(context), signalType, retrievalSource, Date.now());
     // Update entity's cumulative feedback score
     this.db.prepare(`UPDATE entities SET feedback_score = feedback_score + ? WHERE id = ?`).run(scoreDelta, memoryId);
   }
 
   /** Record that a memory was referenced by the AI in its response */
-  markReferenced(memoryId: number, sessionId: string, retrievalSource: string): void {
-    this.recordFeedbackSignal(memoryId, sessionId, "referenced", retrievalSource);
+  markReferenced(memoryId: number, sessionId: string, retrievalSource: string, context: Record<string, unknown> = {}): void {
+    const exists = this.db.prepare(
+      `SELECT 1 FROM feedback_log WHERE memory_id = ? AND session_id = ? AND signal_type = 'referenced' LIMIT 1`
+    ).get(memoryId, sessionId);
+    if (!exists) {
+      this.recordFeedbackSignal(memoryId, sessionId, "referenced", retrievalSource, context);
+    }
+  }
+
+  /** Return one attribution sample per memory injected during a session. */
+  getInjectedMemoriesForSession(sessionId: string): InjectedMemory[] {
+    const rows = this.db.prepare(
+      `SELECT f.memory_id, f.retrieval_source, f.context, e.*
+       FROM feedback_log f
+       JOIN entities e ON e.id = f.memory_id
+       WHERE f.session_id = ? AND f.signal_type = 'injected'
+       ORDER BY f.timestamp ASC`
+    ).all(sessionId) as Array<EntityRow & {
+      memory_id: number;
+      retrieval_source: string;
+      context: string;
+    }>;
+
+    const combined = new Map<number, { entity: EntityRow; sources: Set<string>; query: string }>();
+    for (const row of rows) {
+      let entry = combined.get(row.memory_id);
+      if (!entry) {
+        entry = { entity: row, sources: new Set<string>(), query: "" };
+        combined.set(row.memory_id, entry);
+      }
+      for (const source of splitRetrievalSources(row.retrieval_source)) {
+        entry.sources.add(source);
+      }
+      if (!entry.query) {
+        try {
+          const context = JSON.parse(row.context) as { query?: unknown };
+          if (typeof context.query === "string") entry.query = context.query;
+        } catch { /* malformed legacy context */ }
+      }
+    }
+
+    return [...combined.values()].map(({ entity, sources, query }) => ({
+      entity,
+      retrievalSource: [...sources].join(","),
+      query,
+    }));
   }
 
   /** Mark all injected-but-not-referenced memories as ignored */
   markIgnoredForSession(sessionId: string): void {
-    const injected = this.db.prepare(
-      `SELECT DISTINCT memory_id FROM feedback_log WHERE session_id = ? AND signal_type = 'injected'`
-    ).all(sessionId) as Array<{ memory_id: number }>;
-    const referenced = new Set(
+    const resolved = new Set(
       (this.db.prepare(
-        `SELECT DISTINCT memory_id FROM feedback_log WHERE session_id = ? AND signal_type = 'referenced'`
-      ).all(sessionId) as Array<{ memory_id: number }>).map((r) => r.memory_id)
+        `SELECT DISTINCT memory_id FROM feedback_log
+         WHERE session_id = ? AND signal_type IN ('referenced', 'ignored')`
+      ).all(sessionId) as Array<{ memory_id: number }>).map((row) => row.memory_id)
     );
-    for (const { memory_id } of injected) {
-      if (!referenced.has(memory_id)) {
-        this.recordFeedbackSignal(memory_id, sessionId, "ignored", "");
+    for (const injected of this.getInjectedMemoriesForSession(sessionId)) {
+      if (!resolved.has(injected.entity.id)) {
+        this.recordFeedbackSignal(injected.entity.id, sessionId, "ignored", injected.retrievalSource);
       }
     }
+  }
+
+  getFeedbackSignalsForSession(sessionId: string): FeedbackSignalRow[] {
+    const rows = this.db.prepare(
+      `SELECT memory_id, session_id, event_type, signal_type, retrieval_source, score_delta, context
+       FROM feedback_log WHERE session_id = ? ORDER BY id ASC`
+    ).all(sessionId) as Array<{
+      memory_id: number;
+      session_id: string;
+      event_type: string;
+      signal_type: string;
+      retrieval_source: string;
+      score_delta: number;
+      context: string;
+    }>;
+    return rows.map((row) => {
+      let context: Record<string, unknown> = {};
+      try { context = JSON.parse(row.context) as Record<string, unknown>; } catch { /* malformed legacy context */ }
+      return {
+        memoryId: row.memory_id,
+        sessionId: row.session_id,
+        eventType: row.event_type,
+        signalType: row.signal_type,
+        retrievalSource: row.retrieval_source,
+        scoreDelta: row.score_delta,
+        context,
+      };
+    });
   }
 
   getFeedbackStats(memoryId: number): { injections: number; successes: number; failures: number } {
@@ -556,20 +647,72 @@ export class MnemosyneStore implements MemoryStore {
   /** Auto-tune strategy weights based on feedback signals */
   autoTuneStrategyWeights(): void {
     const rows = this.db.prepare(
-      `SELECT retrieval_source, COUNT(*) as total, SUM(CASE WHEN signal_type = 'referenced' THEN 1 ELSE 0 END) as hits
-       FROM feedback_log WHERE retrieval_source != '' GROUP BY retrieval_source`
-    ).all() as Array<{ retrieval_source: string; total: number; hits: number }>;
+      `SELECT session_id, memory_id, signal_type, retrieval_source
+       FROM feedback_log
+       WHERE signal_type IN ('injected', 'referenced', 'ignored') AND retrieval_source != ''
+       ORDER BY id ASC`
+    ).all() as Array<{
+      session_id: string;
+      memory_id: number;
+      signal_type: string;
+      retrieval_source: string;
+    }>;
 
+    const samples = new Map<string, { sources: Set<string>; injected: boolean; resolved: boolean; referenced: boolean }>();
     for (const row of rows) {
-      const strategy = row.retrieval_source;
-      const hitRate = row.total > 0 ? row.hits / row.total : 0;
-      // Only update if we have enough data (>= 5 samples)
-      if (row.total >= 5) {
-        this.db.prepare(
-          `UPDATE strategy_weights SET weight = ?, total_calls = total_calls + ?, success_calls = success_calls + ?, updated_at = ?
-           WHERE strategy = ?`
-        ).run(hitRate, row.total, row.hits, Date.now(), strategy);
+      const key = `${row.session_id}:${row.memory_id}`;
+      let sample = samples.get(key);
+      if (!sample) {
+        sample = { sources: new Set<string>(), injected: false, resolved: false, referenced: false };
+        samples.set(key, sample);
       }
+      for (const source of splitRetrievalSources(row.retrieval_source)) {
+        sample.sources.add(source);
+      }
+      if (row.signal_type === "injected") sample.injected = true;
+      if (row.signal_type === "referenced" || row.signal_type === "ignored") sample.resolved = true;
+      if (row.signal_type === "referenced") sample.referenced = true;
+    }
+
+    const totals = new Map<string, { total: number; hits: number }>();
+    for (const strategy of STRATEGIES) totals.set(strategy, { total: 0, hits: 0 });
+    for (const sample of samples.values()) {
+      if (!sample.injected || !sample.resolved) continue;
+      for (const source of sample.sources) {
+        const stat = totals.get(source);
+        if (!stat) continue;
+        stat.total++;
+        if (sample.referenced) stat.hits++;
+      }
+    }
+
+    const current = new Map(this.getStrategyWeights().map((row) => [row.strategy, row]));
+    const candidate = new Map<string, number>();
+    let hasNewEvidence = false;
+    for (const strategy of STRATEGIES) {
+      const stat = totals.get(strategy)!;
+      const currentRow = current.get(strategy);
+      const currentWeight = currentRow?.weight ?? 1 / STRATEGIES.length;
+      if (stat.total >= MIN_STRATEGY_SAMPLES && stat.total > (currentRow?.totalCalls ?? 0)) {
+        const observedRate = (stat.hits + 1) / (stat.total + 2);
+        candidate.set(strategy, currentWeight * (1 - STRATEGY_LEARNING_RATE) + observedRate * STRATEGY_LEARNING_RATE);
+        hasNewEvidence = true;
+      } else {
+        candidate.set(strategy, currentWeight);
+      }
+    }
+
+    const candidateTotal = [...candidate.values()].reduce((sum, weight) => sum + weight, 0);
+    const needsRepair = [...candidate.values()].some((weight) => weight < MIN_STRATEGY_WEIGHT) ||
+      Math.abs(candidateTotal - 1) > 1e-9;
+    const normalized = hasNewEvidence || needsRepair ? normalizeStrategyWeights(candidate) : candidate;
+    const now = Date.now();
+    for (const strategy of STRATEGIES) {
+      const stat = totals.get(strategy)!;
+      this.db.prepare(
+        `UPDATE strategy_weights SET weight = ?, total_calls = ?, success_calls = ?, updated_at = ?
+         WHERE strategy = ?`
+      ).run(normalized.get(strategy), stat.total, stat.hits, now, strategy);
     }
   }
 
@@ -754,6 +897,29 @@ function mapJournalType(journalType: string): EntityRow["type"] {
   }
 }
 
+function splitRetrievalSources(value: string): string[] {
+  return [...new Set(
+    value.split(/[,+]/)
+      .map((source) => source.trim())
+      .filter((source) => (STRATEGIES as readonly string[]).includes(source))
+  )];
+}
+
+function normalizeStrategyWeights(weights: Map<string, number>): Map<string, number> {
+  const excessBudget = 1 - MIN_STRATEGY_WEIGHT * STRATEGIES.length;
+  const excess = STRATEGIES.map((strategy) =>
+    Math.max(0, (weights.get(strategy) ?? MIN_STRATEGY_WEIGHT) - MIN_STRATEGY_WEIGHT)
+  );
+  const excessTotal = excess.reduce((sum, value) => sum + value, 0);
+
+  return new Map(STRATEGIES.map((strategy, index) => [
+    strategy,
+    MIN_STRATEGY_WEIGHT + (excessTotal > 0
+      ? excessBudget * excess[index] / excessTotal
+      : excessBudget / STRATEGIES.length),
+  ]));
+}
+
 // ---- Singleton ----
 
 let defaultStore: MnemosyneStore | null = null;
@@ -763,8 +929,23 @@ export function getMnemosyneStore(dbPath?: string): MnemosyneStore {
   return defaultStore;
 }
 
+export function setMnemosyneStore(store: MnemosyneStore | null): void {
+  if (defaultStore && defaultStore !== store) {
+    try {
+      defaultStore.close();
+    } catch {
+      // Store may already be closed by a test or shutdown hook.
+    }
+  }
+  defaultStore = store;
+}
+
 export function closeMnemosyneStore(): void {
-  if (defaultStore) { defaultStore.close(); defaultStore = null; }
+  const store = defaultStore;
+  defaultStore = null;
+  if (store) {
+    store.close();
+  }
 }
 
 function getDefaultDBPath(): string {

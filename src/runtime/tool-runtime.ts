@@ -80,6 +80,7 @@ export class ToolRuntime {
   ): Promise<ToolRuntimeResult> {
     // 1. Security evaluation (PolicyEngine + CompositeSandbox)
     const decision = this.securityRuntime.evaluate(toolName, input, this.workingDir);
+    const executableInput = decision.sanitizedInput ?? input;
 
     // 2. Handle verdicts
     switch (decision.verdict) {
@@ -87,7 +88,7 @@ export class ToolRuntime {
         return this.denyResult(decision);
 
       case "confirm":
-        return this.handleConfirm(toolName, input, decision, ctx);
+        return this.handleConfirm(toolName, executableInput, decision, ctx);
 
       case "warn":
         // Fall through to dispatch — warn is logged but doesn't block
@@ -99,8 +100,7 @@ export class ToolRuntime {
     }
 
     // 3. Dispatch to tool handler
-    // (Uses sanitizedInput from sandbox when available, otherwise original input)
-    const result = await dispatch(toolName, input, ctx);
+    const result = await dispatch(toolName, executableInput, ctx);
 
     return {
       content: result.content,

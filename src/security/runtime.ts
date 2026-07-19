@@ -1,7 +1,7 @@
 // Security Runtime — unified entry point for policy evaluation + sandbox enforcement
 // Policy says WHAT is allowed; Sandbox enforces HOW it's safely executed.
 
-import { PolicyEngine } from "../permissions/policy.js";
+import { PolicyEngine } from "./policy/engine.js";
 import type { AgentConfig } from "../shared/core-types.js";
 import type { SecurityDecision, SecurityVerdict, RiskLevel } from "./sandbox/sandbox.js";
 import type { SandboxResult } from "./sandbox/sandbox.js";
@@ -64,11 +64,29 @@ export class SecurityRuntime {
         };
       }
 
+      const sandboxResult = this.sandbox.validate(toolName, input, workingDir);
+      if (!sandboxResult.allowed) {
+        const sandboxReason = sandboxResult.reason ?? "Blocked by sandbox";
+        return {
+          verdict: "deny",
+          risk: "high",
+          reason: sandboxReason,
+          block: {
+            type: "security_denied",
+            reason: sandboxReason,
+            target: this.extractTarget(toolName, input),
+            suggestion: this.buildSuggestion(toolName, sandboxReason),
+          },
+          constraints: this.defaultConstraints(),
+        };
+      }
+
       // mode === "confirm" — needs user approval
       return {
         verdict: "confirm",
         risk: "medium",
         reason,
+        sanitizedInput: sandboxResult.sanitizedInput,
         block: {
           type: "security_denied",
           reason,
@@ -107,6 +125,7 @@ export class SecurityRuntime {
         verdict: "warn",
         risk,
         reason: `This ${toolName} operation is allowed but potentially risky.`,
+        sanitizedInput: sandboxResult.sanitizedInput,
         constraints: {
           workspaceOnly: true,
           timeout: toolName === "Bash" ? 600_000 : 120_000,
@@ -122,6 +141,7 @@ export class SecurityRuntime {
       verdict: "allow",
       risk,
       reason: "Approved",
+      sanitizedInput: sandboxResult.sanitizedInput,
       constraints: {
         workspaceOnly: true,
         timeout: toolName === "Bash" ? 600_000 : 120_000,

@@ -7,9 +7,39 @@ import { GitSandbox } from "../src/security/sandbox/git-sandbox.js";
 import { EnvSandbox } from "../src/security/sandbox/env-sandbox.js";
 import { CompositeSandbox } from "../src/security/sandbox/composite.js";
 import { SecurityRuntime } from "../src/security/runtime.js";
+import { ToolRuntime } from "../src/runtime/tool-runtime.js";
 import { DEFAULT_PERMISSIONS } from "../src/permissions/config.js";
+import { ReadGuard } from "../src/agent/read-guard.js";
+import { bashTool } from "../src/tools/bash.js";
+import { getTool, register, unregister } from "../src/tools/registry.js";
+import type { AgentContext } from "../src/shared/core-types.js";
 
 const WS = "/Users/test/project";
+
+function mockCtx(): AgentContext {
+  return {
+    workingDir: WS,
+    sessionId: "security-test-session",
+    readGuard: new ReadGuard(),
+    permissionManager: {
+      check: () => ({ allowed: true }),
+    },
+    config: {
+      model: { provider: "deepseek", model: "deepseek-chat" },
+      permissions: {
+        bash: "auto",
+        read: "auto",
+        write: "auto",
+        edit: "auto",
+        web: "auto",
+      },
+      embedding: { source: "local_onnx" },
+      mnemosyne: { bootstrap_on_first_open: false, bootstrap_max_files: 100 },
+      session: { cleanupPeriodDays: 30 },
+    },
+    depth: 0,
+  };
+}
 
 // ============================================================
 // Shell Sandbox — command injection bypass prevention
@@ -335,6 +365,20 @@ describe("EnvSandbox secret leak prevention", () => {
     expect(filtered.GITHUB_TOKEN).toBeUndefined();
     delete process.env.GITHUB_TOKEN;
   });
+
+  it("Bash tool spawns with filtered environment", async () => {
+    process.env.TEST_API_KEY = "sk-secret-12345";
+    const result = await bashTool.handler(
+      { command: "env", timeout: 10_000, workdir: "/tmp" },
+      mockCtx(),
+    );
+
+    expect(result.isError).toBeFalsy();
+    expect(result.content).not.toContain("TEST_API_KEY");
+    expect(result.content).not.toContain("sk-secret-12345");
+
+    delete process.env.TEST_API_KEY;
+  });
 });
 
 // ============================================================
@@ -355,6 +399,12 @@ describe("SecurityRuntime integration", () => {
     const decision = runtime.evaluate("Read", { file_path: "/Users/test/project/src/file.ts" }, "/Users/test/project");
     expect(decision.verdict).toBe("allow");
     expect(decision.risk).toBe("low");
+  });
+
+  it("returns sandbox-sanitized input for allowed operations", () => {
+    const decision = runtime.evaluate("Read", { file_path: "./src/../src/file.ts" }, "/Users/test/project");
+    expect(decision.verdict).toBe("allow");
+    expect(decision.sanitizedInput?.file_path).toBe("/Users/test/project/src/file.ts");
   });
 
   it("denies path traversal via security decision", () => {
@@ -379,5 +429,36 @@ describe("SecurityRuntime integration", () => {
     const decision = runtime.evaluate("Bash", { command: "npm test" }, "/Users/test/project");
     expect(decision.verdict).toBe("allow");
     expect(decision.risk).toBe("medium");
+  });
+
+  it("ToolRuntime dispatches sanitized input to handlers", async () => {
+    let seenInput: Record<string, unknown> | null = null;
+    const previousRead = getTool("Read");
+    unregister("Read");
+    register({
+      name: "Read",
+      description: "test read",
+      inputSchema: { type: "object", properties: {} },
+      type: "read",
+      handler: async (input) => {
+        seenInput = input;
+        return { content: String(input.file_path) };
+      },
+    });
+
+    try {
+      const toolRuntime = new ToolRuntime({
+        securityRuntime: runtime,
+        workingDir: "/Users/test/project",
+      });
+      const result = await toolRuntime.execute("Read", { file_path: "./src/../src/file.ts" }, mockCtx());
+
+      expect(result.isError).toBe(false);
+      expect(result.content).toBe("/Users/test/project/src/file.ts");
+      expect(seenInput?.file_path).toBe("/Users/test/project/src/file.ts");
+    } finally {
+      unregister("Read");
+      if (previousRead) register(previousRead);
+    }
   });
 });

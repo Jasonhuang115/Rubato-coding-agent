@@ -2,7 +2,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fs from "fs";
 import path from "path";
-import { MnemosyneStore, getMnemosyneStore, closeMnemosyneStore } from "../src/memory/store.js";
+import { MnemosyneStore, closeMnemosyneStore, setMnemosyneStore } from "../src/memory/store.js";
 import { evaluateMemory, evaluateAll, getInjectCandidates, THRESHOLDS } from "../src/memory/evaluator.js";
 import { rewriteQuery, learnQueryRewrite } from "../src/memory/rewriter.js";
 import { shouldConsolidate, consolidateMemories } from "../src/memory/consolidator.js";
@@ -15,8 +15,7 @@ function freshStore(): MnemosyneStore {
   // Force new singleton by closing old one
   try { closeMnemosyneStore(); } catch {}
   const store = new MnemosyneStore(TEST_DB);
-  // Override singleton for subsequent getMnemosyneStore() calls
-  (getMnemosyneStore as unknown as { setStore: (s: MnemosyneStore) => void }).setStore?.(store);
+  setMnemosyneStore(store);
   return store;
 }
 
@@ -26,7 +25,7 @@ describe("MnemosyneStore CRUD", () => {
   let store: MnemosyneStore;
 
   beforeEach(() => { store = freshStore(); });
-  afterEach(() => { store.close(); try { fs.unlinkSync(TEST_DB); } catch {} });
+  afterEach(() => { closeMnemosyneStore(); try { fs.unlinkSync(TEST_DB); } catch {} });
 
   it("upserts and retrieves entities", () => {
     const id = store.upsertEntity("test-entity", "concept", "A test concept", "test-session", 0.8);
@@ -78,7 +77,7 @@ describe("Manual Memories", () => {
   let store: MnemosyneStore;
 
   beforeEach(() => { store = freshStore(); });
-  afterEach(() => { store.close(); try { fs.unlinkSync(TEST_DB); } catch {} });
+  afterEach(() => { closeMnemosyneStore(); try { fs.unlinkSync(TEST_DB); } catch {} });
 
   it("addManualMemory sets source='manual' and protected=1", () => {
     const id = store.addManualMemory("Postgres tip", "Use connection pooling", ["postgres", "performance"], "user-session", "note");
@@ -137,7 +136,7 @@ describe("FTS5 Search", () => {
     store.upsertEntity("React hooks", "concept", "useEffect runs after render", "s1");
     store.upsertEntity("TypeScript generics", "concept", "Generic types in TypeScript", "s1");
   });
-  afterEach(() => { store.close(); try { fs.unlinkSync(TEST_DB); } catch {} });
+  afterEach(() => { closeMnemosyneStore(); try { fs.unlinkSync(TEST_DB); } catch {} });
 
   it("searchEntities finds relevant results", () => {
     const results = store.searchEntities("PostgreSQL", 5);
@@ -173,7 +172,7 @@ describe("Relations & Graph Traversal", () => {
     store.recordAccess(a, "s1");
     store.recordAccess(b, "s1");
   });
-  afterEach(() => { store.close(); try { fs.unlinkSync(TEST_DB); } catch {} });
+  afterEach(() => { closeMnemosyneStore(); try { fs.unlinkSync(TEST_DB); } catch {} });
 
   it("addRelation avoids duplicates", () => {
     const a = store.findEntityByName("Node A")!.id;
@@ -213,7 +212,7 @@ describe("Feedback Log", () => {
   let store: MnemosyneStore;
 
   beforeEach(() => { store = freshStore(); });
-  afterEach(() => { store.close(); try { fs.unlinkSync(TEST_DB); } catch {} });
+  afterEach(() => { closeMnemosyneStore(); try { fs.unlinkSync(TEST_DB); } catch {} });
 
   it("recordFeedback and getFeedbackStats", () => {
     const id = store.upsertEntity("Test", "concept", "test", "s1");
@@ -226,6 +225,34 @@ describe("Feedback Log", () => {
     expect(stats.successes).toBe(1);
     expect(stats.failures).toBe(1);
   });
+
+  it("records real event types and preserves retrieval sources for ignored memories", () => {
+    const id = store.upsertEntity("Pool config", "config", "Use PgBouncer", "s1");
+    store.recordFeedbackSignal(id, "feedback-session", "injected", "fts5,vector", { query: "database pool" });
+
+    const injected = store.getInjectedMemoriesForSession("feedback-session");
+    expect(injected).toHaveLength(1);
+    expect(injected[0]).toMatchObject({ retrievalSource: "fts5,vector", query: "database pool" });
+
+    store.markIgnoredForSession("feedback-session");
+    store.markIgnoredForSession("feedback-session");
+
+    const signals = store.getFeedbackSignalsForSession("feedback-session");
+    expect(signals.map((signal) => signal.eventType)).toEqual(["injected", "ignored"]);
+    expect(signals[1].retrievalSource).toBe("fts5,vector");
+  });
+
+  it("records referenced feedback idempotently", () => {
+    const id = store.upsertEntity("Abort handling", "concept", "Use AbortController", "s1");
+    store.recordFeedbackSignal(id, "reference-session", "injected", "graph");
+    store.markReferenced(id, "reference-session", "graph", { confidence: 0.9 });
+    store.markReferenced(id, "reference-session", "graph", { confidence: 0.9 });
+    store.markIgnoredForSession("reference-session");
+
+    const signals = store.getFeedbackSignalsForSession("reference-session");
+    expect(signals.map((signal) => signal.eventType)).toEqual(["injected", "referenced"]);
+    expect(signals[1].context).toEqual({ confidence: 0.9 });
+  });
 });
 
 // ---- Strategy Weights ----
@@ -234,7 +261,7 @@ describe("Strategy Weights", () => {
   let store: MnemosyneStore;
 
   beforeEach(() => { store = freshStore(); });
-  afterEach(() => { store.close(); try { fs.unlinkSync(TEST_DB); } catch {} });
+  afterEach(() => { closeMnemosyneStore(); try { fs.unlinkSync(TEST_DB); } catch {} });
 
   it("default weights are initialized", () => {
     const weights = store.getStrategyWeights();
@@ -253,6 +280,44 @@ describe("Strategy Weights", () => {
     expect(fts5.totalCalls).toBe(3);
     expect(fts5.successRate).toBeCloseTo(2 / 3, 1);
   });
+
+  it("auto-tunes per source from session-memory samples without double counting", () => {
+    for (let i = 0; i < 6; i++) {
+      const id = store.upsertEntity(`memory-${i}`, "concept", `content-${i}`, `s${i}`);
+      store.recordFeedbackSignal(id, `tune-${i}`, "injected", "fts5,vector");
+      if (i < 3) store.markReferenced(id, `tune-${i}`, "fts5,vector");
+      else store.markIgnoredForSession(`tune-${i}`);
+    }
+
+    store.autoTuneStrategyWeights();
+    const first = store.getStrategyWeights();
+    store.autoTuneStrategyWeights();
+    const second = store.getStrategyWeights();
+
+    for (const strategy of ["fts5", "vector"]) {
+      const firstRow = first.find((row) => row.strategy === strategy)!;
+      const secondRow = second.find((row) => row.strategy === strategy)!;
+      expect(firstRow.totalCalls).toBe(6);
+      expect(firstRow.successRate).toBeCloseTo(0.5, 5);
+      expect(secondRow.totalCalls).toBe(6);
+      expect(secondRow.weight).toBeCloseTo(firstRow.weight, 12);
+    }
+    expect(second.reduce((sum, row) => sum + row.weight, 0)).toBeCloseTo(1, 8);
+    expect(second.every((row) => row.weight >= 0.1)).toBe(true);
+  });
+
+  it("repairs legacy strategy weights below the safety floor", () => {
+    const db = (store as unknown as {
+      db: { prepare: (sql: string) => { run: (...args: unknown[]) => void } };
+    }).db;
+    db.prepare("UPDATE strategy_weights SET weight = CASE strategy WHEN 'fts5' THEN 0 WHEN 'vector' THEN 0.7 ELSE 0.3 END").run();
+
+    store.autoTuneStrategyWeights();
+
+    const weights = store.getStrategyWeights();
+    expect(weights.reduce((sum, row) => sum + row.weight, 0)).toBeCloseTo(1, 8);
+    expect(weights.every((row) => row.weight >= 0.1)).toBe(true);
+  });
 });
 
 // ---- Query Rewrite Rules ----
@@ -261,7 +326,7 @@ describe("Query Rewrite Rules", () => {
   let store: MnemosyneStore;
 
   beforeEach(() => { store = freshStore(); });
-  afterEach(() => { store.close(); try { fs.unlinkSync(TEST_DB); } catch {} });
+  afterEach(() => { closeMnemosyneStore(); try { fs.unlinkSync(TEST_DB); } catch {} });
 
   it("addQueryRewriteRule and getQueryRewrites", () => {
     store.addQueryRewriteRule("slow db", "PostgreSQL connection timeout");
@@ -279,7 +344,7 @@ describe("Stats", () => {
   let store: MnemosyneStore;
 
   beforeEach(() => { store = freshStore(); });
-  afterEach(() => { store.close(); try { fs.unlinkSync(TEST_DB); } catch {} });
+  afterEach(() => { closeMnemosyneStore(); try { fs.unlinkSync(TEST_DB); } catch {} });
 
   it("getStats returns counts", () => {
     store.upsertEntity("e1", "concept", "c1", "s1");
@@ -301,7 +366,7 @@ describe("Evaluator", () => {
     store = freshStore();
     store.upsertEntity("High quality", "concept", "Important knowledge", "s1", 0.9, "auto", 0);
   });
-  afterEach(() => { store.close(); try { fs.unlinkSync(TEST_DB); } catch {} });
+  afterEach(() => { closeMnemosyneStore(); try { fs.unlinkSync(TEST_DB); } catch {} });
 
   it("evaluateMemory returns a score report", () => {
     const entity = store.findEntityByName("High quality")!;
@@ -357,7 +422,7 @@ describe("Query Rewriter", () => {
   let store: MnemosyneStore;
 
   beforeEach(() => { store = freshStore(); });
-  afterEach(() => { store.close(); try { fs.unlinkSync(TEST_DB); } catch {} });
+  afterEach(() => { closeMnemosyneStore(); try { fs.unlinkSync(TEST_DB); } catch {} });
 
   it("rewriteQuery returns variants", () => {
     const result = rewriteQuery("how do I fix the database error");
@@ -416,7 +481,7 @@ describe("Consolidator", () => {
   let store: MnemosyneStore;
 
   beforeEach(() => { store = freshStore(); });
-  afterEach(() => { store.close(); try { fs.unlinkSync(TEST_DB); } catch {} });
+  afterEach(() => { closeMnemosyneStore(); try { fs.unlinkSync(TEST_DB); } catch {} });
 
   it("shouldConsolidate returns false initially (not enough sessions)", () => {
     // In a fresh store with few entities, should NOT consolidate

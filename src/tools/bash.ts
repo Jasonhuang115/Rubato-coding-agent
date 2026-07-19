@@ -1,7 +1,8 @@
 // Bash tool — executes shell commands
 
-import { exec, spawn } from "child_process";
-import type { ToolDefinition, AgentContext } from "../shared/core-types.js";
+import { spawn } from "child_process";
+import type { ToolDefinition } from "../shared/core-types.js";
+import { EnvSandbox } from "../security/sandbox/env-sandbox.js";
 
 const DEFAULT_TIMEOUT_MS = 120_000; // 2 minutes
 const MAX_TIMEOUT_MS = 600_000; // 10 minutes
@@ -50,7 +51,7 @@ export const bashTool: ToolDefinition = {
       const child = spawn(command, {
         shell: true,
         cwd: workdir,
-        env: { ...process.env },
+        env: new EnvSandbox().filterEnv(),
         stdio: ["pipe", "pipe", "pipe"],
       });
 

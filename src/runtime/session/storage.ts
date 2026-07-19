@@ -16,7 +16,7 @@ function getSessionDir(projectHash?: string): string {
 export class SessionStore {
   private dir: string;
   private filePath: string;
-  private writeStream: fs.WriteStream | null = null;
+  private initialized = false;
   private records: SessionRecord[] = [];
 
   constructor(sessionId: string, projectHash?: string) {
@@ -26,14 +26,14 @@ export class SessionStore {
 
   init(): void {
     fs.mkdirSync(this.dir, { recursive: true });
-    // Open write stream in append mode
-    this.writeStream = fs.createWriteStream(this.filePath, { flags: "a" });
+    fs.closeSync(fs.openSync(this.filePath, "a"));
+    this.initialized = true;
   }
 
   append(record: SessionRecord): void {
     this.records.push(record);
-    if (this.writeStream) {
-      this.writeStream.write(JSON.stringify(record) + "\n");
+    if (this.initialized) {
+      fs.appendFileSync(this.filePath, JSON.stringify(record) + "\n", "utf-8");
     }
   }
 
@@ -70,10 +70,7 @@ export class SessionStore {
   }
 
   close(): void {
-    if (this.writeStream) {
-      this.writeStream.end();
-      this.writeStream = null;
-    }
+    this.initialized = false;
   }
 
   getRecords(): ReadonlyArray<SessionRecord> {
