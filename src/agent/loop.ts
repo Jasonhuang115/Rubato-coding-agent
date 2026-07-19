@@ -16,6 +16,7 @@ import type {
   StreamRenderer,
   ToolDefinition,
   ConfirmDecision,
+  BudgetManager,
 } from "../shared/core-types.js";
 import { createProvider } from "../model/router.js";
 import { getAllTools, dispatch, getReadTools, getWriteTools } from "../tools/registry.js";
@@ -29,6 +30,9 @@ import { buildSystemPrompt } from "../context/system-prompt.js";
 import { microCompact, compactViaSubagent } from "../context/compression.js";
 import { microCompactBeforeRequest } from "../context/micro-compact.js";
 import { PolicyEngine } from "../permissions/policy.js";
+import { SecurityRuntime } from "../security/runtime.js";
+import { ToolRuntime } from "../runtime/tool-runtime.js";
+import type { ToolRuntimeResult } from "../runtime/tool-runtime.js";
 import { ReadGuard } from "./read-guard.js";
 import { SessionStore } from "../runtime/session/storage.js";
 import { createSessionMeta, finalizeSessionMeta } from "../runtime/session/meta.js";
@@ -98,6 +102,12 @@ export interface AgentLoopOptions {
   sessionManager?: SessionManager;
   /** If provided, inject this summary as previous session context */
   resumeSummary?: string;
+  /** Recursion depth. 0 = root agent. Set automatically for subagents. */
+  depth?: number;
+  /** Global resource budget shared across the agent tree. */
+  budgetManager?: BudgetManager;
+  /** Max turns for this agent loop (default 100 for root, 999 for subagents). */
+  maxTurns?: number;
 }
 
 // ---- Abort mechanism (exposed for Ctrl+C interrupt) ----
@@ -121,7 +131,20 @@ export async function* agentLoop(
   const sessionId = options.sessionId ?? randomUUID();
   let provider = createProvider(config.model);
   const tools = options.tools ?? getAllTools();
-  const permissionManager = new PolicyEngine(config.permissions);
+
+  // Security runtime — wraps PolicyEngine with sandbox enforcement.
+  // PolicyEngine is shared with ctx so tool handlers can also check permissions.
+  const securityRuntime = new SecurityRuntime(config.permissions);
+  const permissionManager = securityRuntime.policyEngine;
+
+  // Tool runtime — sandboxed dispatcher (方案C).
+  // Every tool call flows through: SecurityRuntime → dispatch → tool handler.
+  const toolRuntime = new ToolRuntime({
+    securityRuntime,
+    workingDir,
+    onConfirmTool: options.onConfirmTool,
+  });
+
   const readGuard = new ReadGuard();
 
   // Use project-scoped storage when sessionManager is available
@@ -156,6 +179,8 @@ export async function* agentLoop(
     permissionManager,
     config,
     planManager,
+    depth: options.depth ?? 0,
+    budgetManager: options.budgetManager,
   };
 
   // ---- Build messages ----
@@ -192,7 +217,8 @@ export async function* agentLoop(
   const errorTimestamps: number[] = [];
 
   // ---- Main turn loop ----
-  for (let turn = 0; turn < DEFAULT_MAX_TURNS; turn++) {
+  const maxTurns = options.maxTurns ?? DEFAULT_MAX_TURNS;
+  for (let turn = 0; turn < maxTurns; turn++) {
     // Support dynamic model/provider switching via /model command
     if (provider.name !== config.model.provider) {
       provider = createProvider(config.model);
@@ -443,7 +469,7 @@ export async function* agentLoop(
     if (readCalls.length > 0) {
       const readResults = await Promise.all(
         readCalls.map(async (tu) => {
-          const result = await executeToolCall(tu, permissionManager, ctx, renderer, options.onConfirmTool);
+          const result = await executeToolCall(tu, permissionManager, ctx, renderer, options.onConfirmTool, toolRuntime);
           sessionStore.writeToolEvent({
             tool: tu.name,
             input: tu.input,
@@ -518,7 +544,7 @@ export async function* agentLoop(
         }
       }
 
-      const result = await executeToolCall(tu, permissionManager, ctx, renderer, options.onConfirmTool);
+      const result = await executeToolCall(tu, permissionManager, ctx, renderer, options.onConfirmTool, toolRuntime);
       if (result.denied) toolDenied = true;
       yield {
         type: "tool_result",
@@ -736,46 +762,27 @@ async function processStream(
 
 async function executeToolCall(
   toolUse: ToolUseBlock,
-  permissionManager: PolicyEngine,
+  _permissionManager: PolicyEngine,
   ctx: AgentContext,
   renderer: StreamRenderer,
-  onConfirmTool?: (
+  _onConfirmTool?: (
     toolName: string,
     input: Record<string, unknown>,
   ) => Promise<ConfirmDecision>,
+  toolRuntime?: ToolRuntime,
 ): Promise<{ content: string; isError: boolean; denied: boolean }> {
-  // Check permission
-  const perm = permissionManager.check(toolUse.name, toolUse.input);
+  // Route through ToolRuntime — SecurityRuntime.evaluate() + dispatch()
+  // If no ToolRuntime provided (shouldn't happen), fall back to direct dispatch
+  const result: ToolRuntimeResult = toolRuntime
+    ? await toolRuntime.execute(toolUse.name, toolUse.input, ctx)
+    : await dispatch(toolUse.name, toolUse.input, ctx).then(r => ({ content: r.content, isError: r.isError ?? false, denied: false }));
 
-  if (!perm.allowed) {
-    if (perm.mode === "manual") {
-      return { content: `Permission denied: ${perm.reason}`, isError: true, denied: false };
-    }
-
-    // "confirm" mode — ask user interactively if callback is provided
-    if (onConfirmTool) {
-      const decision = await onConfirmTool(toolUse.name, toolUse.input);
-      switch (decision) {
-        case "allow_once":
-          break; // proceed
-        case "allow_always":
-          permissionManager.allowTool(toolUse.name);
-          break; // proceed + remember
-        case "deny_once":
-          return { content: `User denied: ${toolUse.name}`, isError: true, denied: true };
-        case "deny_always":
-          permissionManager.denyTool(toolUse.name);
-          return { content: `User denied (all future ${toolUse.name} blocked this session)`, isError: true, denied: true };
-      }
-    } else {
-      // No callback: auto-approve with warning (subagents, one-shot, etc.)
-      renderer.renderWarning(`Auto-approved: ${toolUse.name} (confirm mode not interactive yet)`);
-    }
+  // Surface "warn" verdicts as renderer warnings
+  if (result.security?.verdict === "warn") {
+    renderer.renderWarning(`⚠️ ${result.security.reason} (risk: ${result.security.risk})`);
   }
 
-  // Dispatch to tool handler
-  const result = await dispatch(toolUse.name, toolUse.input, ctx);
-  return { content: result.content, isError: result.isError ?? false, denied: false };
+  return { content: result.content, isError: result.isError, denied: result.denied };
 }
 
 // ---- Circuit breaker ----

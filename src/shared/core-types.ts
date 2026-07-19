@@ -55,6 +55,11 @@ export interface ToolResult {
 
 // ---- Agent context (passed to every tool) ----
 
+export interface BudgetManager {
+  tryAllocate(depth: number): { allowed: boolean; reason?: string };
+  releaseAgent(): void;
+}
+
 export interface AgentContext {
   workingDir: string;
   sessionId: string;
@@ -62,6 +67,10 @@ export interface AgentContext {
   permissionManager: PermissionManager;
   config: AgentConfig;
   planManager?: PlanManager;
+  /** Recursion depth. 0 = root agent. */
+  depth: number;
+  /** Global resource budget shared across the agent tree. */
+  budgetManager?: BudgetManager;
 }
 
 export interface PlanManager {
@@ -245,12 +254,18 @@ export interface SubagentDefinition {
   model?: string;             // "inherit" | specific model ID
   tools: string[];            // allowlist, ["*"] = all except AgentTool
   readonly: boolean;          // default true
-  maxTurns: number;           // default 15
+  maxTurns?: number;          // optional — subagents run until completion by default
+  /** Whether subagents of this type can spawn further subagents. Default false. */
+  canSpawn?: boolean;
 }
 
 export interface SubagentResult {
-  status: "completed" | "failed" | "timeout";
+  status: "completed" | "failed" | "timeout" | "budget_exceeded";
   agentId: string;
   output: string;
   usage: { inputTokens: number; outputTokens: number; toolCalls: number };
+  /** Machine-extractable summary (for parent agent to merge). */
+  summary?: string;
+  /** Files modified by this subagent. */
+  filesChanged?: string[];
 }

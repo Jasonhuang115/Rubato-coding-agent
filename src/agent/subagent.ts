@@ -33,33 +33,36 @@ export const EXPLORE_DEF: SubagentDefinition = {
     "## Rules",
     "- You have Read, Grep, Glob, and Bash (read-only) tools.",
     "- Search broadly — check multiple directories, naming conventions, and patterns.",
-    "- Return a structured summary of what you found: file paths, relevant code snippets, patterns.",
-    "- Be thorough but concise. The parent agent needs actionable information, not narration.",
     "- Do NOT edit or write files. You are read-only.",
-    "- When done, output your findings and stop.",
+    "- When done, output a structured summary that the parent agent can merge:",
+    "  * Key files found (with paths)",
+    "  * Relevant patterns or code snippets",
+    "  * Any risks or issues identified",
+    "- Be thorough but concise. Take as many steps as you need to be comprehensive.",
   ].join("\n"),
   tools: EXPLORE_TOOLS,
   readonly: true,
-  maxTurns: 15,
+  // No maxTurns — subagents run until completion
 };
 
 export const GENERAL_DEF: SubagentDefinition = {
   name: "general",
   description:
     "General-purpose subagent for researching complex questions, searching for code, " +
-    "and executing multi-step tasks. Has access to all tools except spawning sub-agents.",
+    "and executing multi-step tasks. Can spawn further subagents for deeply nested tasks.",
   systemPrompt: [
     "You are a general-purpose coding subagent. You have access to Read, Write, Edit, Grep, Glob, Bash, and Web tools.",
     "",
     "## Rules",
-    "- Complete the assigned task and report results concisely.",
-    "- Do NOT spawn other subagents (you don't have the Agent tool).",
+    "- Complete the assigned task thoroughly and report results concisely.",
+    "- Use the Agent tool to spawn subagents for independent subtasks. Max depth: 3 levels (root→child→grandchild).",
+    "- Take as many steps as needed — there is no step limit.",
     "- You share the parent agent's working directory. Be careful with writes.",
     "- When done, summarize what you did and what you found.",
   ].join("\n"),
   tools: ["*"],
   readonly: false,
-  maxTurns: 15,
+  canSpawn: true,
 };
 
 export const VERIFY_DEF: SubagentDefinition = {
@@ -80,7 +83,6 @@ export const VERIFY_DEF: SubagentDefinition = {
   ].join("\n"),
   tools: EXPLORE_TOOLS,
   readonly: true,
-  maxTurns: 10,
 };
 
 const BUILTIN_DEFS: Record<string, SubagentDefinition> = {
@@ -101,13 +103,28 @@ export function getBuiltinDefinition(name: string): SubagentDefinition {
 
 // ---- Tool set resolution ----
 
-function resolveTools(allowlist: string[]): ToolDefinition[] {
+function resolveTools(
+  allowlist: string[],
+  opts?: { canSpawn?: boolean; depth?: number; hardDepth?: number }
+): ToolDefinition[] {
+  const hardDepth = opts?.hardDepth ?? 8;
+  // Remove AgentTool if: not allowed to spawn OR depth limit reached
+  const shouldRemoveAgent = !opts?.canSpawn || (opts?.depth ?? 0) >= hardDepth;
+
   if (allowlist.includes("*")) {
-    return getAllTools().filter((t) => t.name !== "Agent" && t.name !== "Skill");
+    let tools = getAllTools();
+    if (shouldRemoveAgent) {
+      tools = tools.filter((t) => t.name !== "Agent" && t.name !== "Skill");
+    }
+    return tools;
   }
-  return allowlist
+  let tools = allowlist
     .map((name) => getTool(name))
-    .filter((t): t is ToolDefinition => t !== undefined && t.name !== "Agent" && t.name !== "Skill");
+    .filter((t): t is ToolDefinition => t !== undefined);
+  if (shouldRemoveAgent) {
+    tools = tools.filter((t) => t.name !== "Agent" && t.name !== "Skill");
+  }
+  return tools;
 }
 
 // ---- Spawn primitive ----
@@ -125,7 +142,29 @@ export async function spawnSubagent(
   parentConfig: AgentConfig
 ): Promise<SubagentResult> {
   const agentId = `${parentCtx.sessionId}-sub-${randomUUID().slice(0, 8)}`;
-  const tools = resolveTools(definition.tools);
+  const depth = (parentCtx.depth ?? 0) + 1;
+
+  // 1. Budget check (deterministic counters only)
+  const budgetManager = parentCtx.budgetManager;
+  if (budgetManager) {
+    const allocation = budgetManager.tryAllocate(depth);
+    if (!allocation.allowed) {
+      return {
+        status: "failed",
+        agentId,
+        output: `Spawn denied: ${allocation.reason}`,
+        usage: { inputTokens: 0, outputTokens: 0, toolCalls: 0 },
+      };
+    }
+  }
+
+  // 2. Tool set: conditional AgentTool based on canSpawn + depth
+  // hardDepth=3: only root → child → grandchild can spawn; great-grandchild stops
+  const tools = resolveTools(definition.tools, {
+    canSpawn: definition.canSpawn,
+    depth,
+    hardDepth: 3,
+  });
 
   const modelConfig = { ...parentConfig.model };
   if (definition.model && definition.model !== "inherit") {
@@ -155,7 +194,10 @@ export async function spawnSubagent(
       renderer: new NoopRenderer(),
       sessionId: agentId,
       tools,
-      skipCompaction: true, // recursion guard: subagents have bounded turns
+      depth,
+      budgetManager,
+      maxTurns: 999, // subagents run until natural completion
+      skipCompaction: true,
     })) {
       switch (event.type) {
         case "turn_start":
@@ -199,6 +241,9 @@ export async function spawnSubagent(
     const message = err instanceof Error ? err.message : String(err);
     outputParts.push(`[Fatal] ${message}`);
     finalStatus = "failed";
+  } finally {
+    // Always release the parallel slot
+    budgetManager?.releaseAgent();
   }
 
   const endedAt = Date.now();

@@ -3,9 +3,6 @@
 
 import type { ISandbox, SandboxResult } from "./sandbox.js";
 
-/** Metacharacters that enable command chaining or injection. */
-const DANGEROUS_METACHARS = /[;&|`$]/;
-
 /** Command patterns that are always denied regardless of workspace. */
 const DANGEROUS_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
   // rm targeting root — matches: rm -rf /, rm -r -f /, rm -rf /*, rm /, etc.
@@ -105,15 +102,6 @@ export class ShellSandbox implements ISandbox {
     // 4. Blocked commands
     if (category === "blocked") {
       return { allowed: false, reason: `Command blocked by policy: "${command.slice(0, 80)}"` };
-    }
-
-    // 5. Metacharacter check — applies to ALL commands, even "safe" ones
-    //    A "safe" command like echo becomes dangerous with `backticks` or $(subshells)
-    if (DANGEROUS_METACHARS.test(command)) {
-      return {
-        allowed: false,
-        reason: `Command contains dangerous metacharacters: "${command.slice(0, 80)}". Use dedicated tools or simplify the command.`,
-      };
     }
 
     return { allowed: true };

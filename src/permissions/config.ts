@@ -3,11 +3,11 @@
 import type { AgentConfig } from "../shared/core-types.js";
 
 export const DEFAULT_PERMISSIONS: AgentConfig["permissions"] = {
-  bash: "confirm",
+  bash: "auto",
   read: "auto",
-  write: "confirm",
-  edit: "confirm",
-  web: "confirm",
+  write: "auto",
+  edit: "auto",
+  web: "auto",
   rules: [],
 };
 

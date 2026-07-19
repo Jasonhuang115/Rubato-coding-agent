@@ -32,6 +32,7 @@ function mockCtx(overrides?: Partial<AgentContext>): AgentContext {
       mnemosyne: { bootstrap_on_first_open: false, bootstrap_max_files: 100 },
       session: { cleanupPeriodDays: 30 },
     },
+    depth: 0,
     ...overrides,
   };
 }

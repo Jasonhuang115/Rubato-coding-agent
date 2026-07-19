@@ -556,6 +556,7 @@ async function handleSkillCommand(
     },
     permissionManager: new PolicyEngine(permissions),
     config: { ...config, permissions },
+    depth: 0,
   };
 
   try {
@@ -659,6 +660,49 @@ interface LoopState {
 
 // ---- First message handler (with slash command support) ----
 
+// Read input. First line via rl.question() (compatible with confirm prompts).
+// If the user continues typing (paste or manual), switches to rl.on('line')
+// for continuation lines. Empty line = send. Slash commands send immediately.
+function readMultiLineInput(
+  rl: readline.Interface,
+  firstPrompt: string,
+): Promise<string> {
+  return new Promise((resolve) => {
+    rl.question(firstPrompt, (firstAnswer) => {
+      const firstLine = firstAnswer.trimEnd();
+
+      if (!firstLine.trim()) { resolve(""); return; }
+      if (firstLine.trim().startsWith("/")) { resolve(firstLine.trim()); return; }
+
+      // Continuation mode: listen for more lines (paste or manual multi-line)
+      const lines = [firstLine];
+      let resolved = false;
+
+      const done = (result: string) => {
+        if (resolved) return;
+        resolved = true;
+        rl.removeListener("line", onLine);
+        rl.setPrompt("");
+        resolve(result);
+      };
+
+      const onLine = (raw: string) => {
+        const line = raw.trimEnd();
+        if (!line.trim()) {
+          done(lines.join("\n"));
+          return;
+        }
+        lines.push(line);
+        rl.prompt();
+      };
+
+      rl.on("line", onLine);
+      rl.setPrompt("  > ");
+      rl.prompt();
+    });
+  });
+}
+
 async function getFirstMessage(
   rl: readline.Interface,
   planManager: PlanManager,
@@ -667,9 +711,7 @@ async function getFirstMessage(
 ): Promise<string> {
   // eslint-disable-next-line no-constant-condition
   while (true) {
-    const trimmed = await new Promise<string>((resolve) => {
-      rl.question("\n▸ You: ", (answer) => resolve(answer.trim()));
-    });
+    const trimmed = await readMultiLineInput(rl, "\n▸ You: ");
     if (!trimmed) return "/exit";
 
     // Handle slash commands locally, loop back for real message
@@ -716,27 +758,25 @@ function createRepl(
   currentSessionId: () => string,
   onSessionFinalize: () => void,
 ): () => Promise<string | null> {
-  return () => {
-    return new Promise((resolve) => {
-      rl.question("\n▸ You: ", (answer) => {
-        const trimmed = answer.trim();
-        if (trimmed === "/") {
-          showSlashMenu();
-          resolve(createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)());
-        } else if (trimmed === "/exit" || trimmed === "/quit") {
+  return async () => {
+    const trimmed = await readMultiLineInput(rl, "\n▸ You: ");
+    if (trimmed === "/") {
+      showSlashMenu();
+      return createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)();
+    } else if (trimmed === "/exit" || trimmed === "/quit") {
           onSessionFinalize();
-          resolve(null);
+          return null;
         } else if (trimmed === "/clear") {
           // Finalize current session and restart
           onSessionFinalize();
           loopState.shouldRestart = true;
           loopState.newSessionId = randomUUID();
           console.log("\n  ✨ Session saved. Starting fresh...");
-          resolve(null);
+          return null;
         } else if (trimmed === "/compact") {
           if (loopOptions) { loopOptions.forceCompaction = true; }
           console.log("\n  Compacting on next turn...");
-          resolve(createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)());
+          return createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)();
         } else if (trimmed.startsWith("/sessions")) {
           const result = handleSessionsCommand(trimmed, sessionManager);
           if (result.restartLoop && result.resumeId) {
@@ -751,9 +791,9 @@ function createRepl(
               console.log(`\n  ✖ Failed to resume: ${err instanceof Error ? err.message : err}`);
               loopState.shouldRestart = false;
             }
-            resolve(null);
+            return null;
           } else {
-            resolve(createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)());
+            return createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)();
           }
         } else if (trimmed === "/help") {
           console.log("\n  REPL Commands:");
@@ -783,40 +823,37 @@ function createRepl(
               console.log(`  /${s.name.padEnd(18)} — ${s.description ?? "(no description)"} [${mode}]`);
             }
           }
-          resolve(createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)());
+          return createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)();
         } else if (trimmed.startsWith("/plan")) {
           handlePlanCommand(trimmed, planManager);
-          resolve(createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)());
+          return createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)();
         } else if (trimmed.startsWith("/grillme")) {
           handleGrillMeCommand(trimmed, planManager);
-          resolve(createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)());
+          return createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)();
         } else if (trimmed.startsWith("/git")) {
           handleGitCommand(trimmed, workdir);
-          resolve(createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)());
+          return createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)();
         } else if (trimmed.startsWith("/journal") || trimmed.startsWith("/remember")) {
           handleJournalCommand(trimmed, workdir);
-          resolve(createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)());
+          return createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)();
         } else if (trimmed.startsWith("/memory")) {
           handleMemoryCommand(trimmed);
-          resolve(createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)());
+          return createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)();
         } else if (trimmed.startsWith("/model")) {
           handleModelCommand(trimmed, config);
-          resolve(createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)());
+          return createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)();
         } else if (trimmed.startsWith("/") && getSkillRegistry().getSkill(trimmed.split(/\s+/)[0].slice(1))) {
-          handleSkillCommand(trimmed, workdir, config).then((passthrough) => {
-            if (typeof passthrough === "string") {
-              // Inline skill: pass through to the model
-              resolve(passthrough);
-            } else {
-              // Fork skill or unknown: already handled, next REPL prompt
-              resolve(createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)());
-            }
-          });
+          const passthrough = await handleSkillCommand(trimmed, workdir, config);
+          if (typeof passthrough === "string") {
+            // Inline skill: pass through to the model
+            return passthrough;
+          } else {
+            // Fork skill or unknown: already handled, next REPL prompt
+            return createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)();
+          }
         } else {
-          resolve(trimmed || null);
+          return trimmed || null;
         }
-      });
-    });
   };
 }
 
@@ -1267,11 +1304,7 @@ async function main(): Promise<void> {
 
     // If restarting, wait for user input instead of auto-sending a prompt
     if (loopState.shouldRestart) {
-      effectivePrompt = await new Promise<string>((resolve) => {
-        rl!.question("\n▸ You: ", (answer) => {
-          resolve(answer.trim() || "/exit");
-        });
-      });
+      effectivePrompt = await readMultiLineInput(rl!, "\n▸ You: ") || "/exit";
       if (effectivePrompt === "/exit") {
         console.log("Exiting...");
         break;

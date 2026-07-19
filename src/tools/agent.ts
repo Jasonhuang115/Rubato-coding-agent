@@ -14,10 +14,14 @@ async function getAvailableTypes(): Promise<string> {
 export const agentTool: ToolDefinition = {
   name: "Agent",
   description:
-    "Launch a subagent to handle complex, multi-step tasks. " +
-    "Subagents have scoped tools (no Agent tool access by default) and run independently. " +
+    "Launch a subagent to handle complex, multi-step tasks autonomously. " +
+    "Subagents have scoped tools and run independently. " +
     "Use for: parallel exploration, codebase research, verification, or any task " +
     "that can be delegated without the full tool set." +
+    "\n\n**Background subagents:** When you spawn a subagent with `run_in_background: true`, " +
+    "continue working on other aspects of the task. In a later turn, Read the results file " +
+    "and merge the subagent's findings into your final answer. " +
+    "Do NOT give your final conclusion until you have incorporated background subagent results." +
     "\n\nAvailable subagent types: explore | general | verify (plus custom from .rubato/agents/*.md)" +
     "\n\nOptions:" +
     "\n- isolation: \"worktree\" runs the subagent in a git worktree for safe writes." +
@@ -86,9 +90,10 @@ export const agentTool: ToolDefinition = {
           `**Status:** running in background\n\n` +
           `The subagent is working independently. ` +
           `When it finishes, results will be written to \`${resultsPath}\`. ` +
-          `To check: Read the file ONCE. If it doesn't exist, the subagent is still running — ` +
-          `wait and try one more time. If still missing after 2 attempts, the subagent failed ` +
-          `and you should proceed without it. Do NOT poll the same file more than 3 times.`,
+          `You can continue with other tasks and Read \`${resultsPath}\` ` +
+          `in a later turn to merge its findings. ` +
+          `If the file doesn't exist yet, the subagent is still running — ` +
+          `check again in the next turn.`,
       };
     }
 

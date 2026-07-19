@@ -23,6 +23,11 @@ export class FsSandbox implements ISandbox {
     const resolved = this.resolvePath(filePath, workingDir);
     const workspaceRoot = path.resolve(workingDir);
 
+    // 0. Allow subagent result files (background subagents write to /tmp)
+    if (resolved.startsWith("/tmp/rubato-subagent-")) {
+      return { allowed: true, sanitizedInput: { ...input, file_path: resolved } };
+    }
+
     // 1. Workspace boundary check
     if (!resolved.startsWith(workspaceRoot + path.sep) && resolved !== workspaceRoot) {
       return {

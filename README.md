@@ -10,8 +10,9 @@
 
 | 阶段 | 状态 | 内容 |
 |------|------|------|
-| Phase 1 | ✅ | Agent 骨架：核心循环、10 工具、多提供商、权限、上下文注入 |
+| Phase 1 | ✅ | Agent 骨架：核心循环、12 工具、多提供商、权限、上下文注入 |
 | Phase 2 | ✅ | 自进化 RAG + Subagent + 意图树 + Git 顾问 + SWE-bench |
+| Phase 3 | ✅ | Agent Runtime：状态机、EventBus、递归 SubAgent、Security Runtime (5 Sandbox)、Prompt 四层架构、ToolRuntime、BudgetManager |
 
 ---
 
@@ -81,21 +82,20 @@ LIKE搜索  cosine   1-hop邻居
 | config / error / api / deploy | 自动 supersede 旧版 | `port=8000` → `port=8080`，旧版标记过期 |
 | note / concept / file / function | 合并追加 | 新知识追加到已有实体 |
 
-### 2. Subagent 并行系统
+### 2. Subagent 递归系统
 
-父 agent 可以 spawn 子 agent 并行处理任务。共享 `agentLoop()` 引擎，换 tool pool 和 system prompt。
+父 agent 可以 spawn 子 agent，子 agent 还可以继续 spawn 孙 agent（最多 3 层）。共享 `agentLoop()` 引擎，换 tool pool 和 system prompt。
 
 ```
-Parent (12 tools, 100 turns)
-  ├─ AgentTool → spawnSubagent()
-  │   ├─ Explore   (Read/Grep/Glob/Bash, 只读, 15 turns)
-  │   ├─ General   (全工具减 Agent, 15 turns)
-  │   ├─ Verify    (对抗性审查, 只读, 10 turns)
-  │   └─ Custom    (.rubato/agents/*.md 定义)
-  │       ├─ isolation: "worktree" → 独立 git worktree
-  │       └─ run_in_background: true → 异步后台
-  └─ 结果自动写回父 agent 上下文
+Parent (depth=0, AgentTool ✅)
+  ├─ General (depth=1, canSpawn=true)
+  │   ├─ General (depth=2, canSpawn=true)
+  │   │   └─ General (depth=3, canSpawn=false — 硬限制)
+  │   └─ Explore (canSpawn=false, 只读)
+  └─ Verify (canSpawn=false, 对抗性审查)
 ```
+
+**内置 Subagent 类型**：Explore / General / Verify，均可自定义（`.rubato/agents/*.md`）。支持 background 异步执行 + worktree 隔离。结果自动写回文件，主 agent 在后续 turn 中 Read + merge。
 
 ### 3. Plan 模式 + Grill Me 意图追踪
 
@@ -176,57 +176,54 @@ rubato -n "帮我写一个 hello world"
 
 ```
 src/
-├── agent/
+├── agent/                   # Agent 核心
 │   ├── loop.ts              # Async generator 核心循环
-│   ├── subagent.ts          # 子 agent 引擎（spawn/worktree/background）
+│   ├── subagent.ts          # 递归子 agent 引擎（spawn/worktree/background）
 │   ├── agent-defs.ts        # 自定义 agent 加载器
-│   └── read-guard.ts        # 读写守卫
-├── tools/
-│   ├── agent.ts             # AgentTool（spawn 子 agent）
-│   ├── read/write/edit.ts   # 文件操作
-│   ├── bash.ts              # Shell
-│   ├── grep/glob.ts         # 搜索
-│   ├── web.ts               # WebFetch + WebSearch
-│   ├── todo.ts / plan.ts    # 任务 / 计划管理
-│   └── skill.ts             # Skill 工具
-├── memory/                  # 自进化 RAG 核心
-│   ├── store.ts             # SQLite + FTS5 + 反馈日志 + 策略权重
-│   ├── seeder.ts            # 项目扫描播种
-│   ├── evaluator.ts         # 五维评分引擎（MemStrata + EvoRAG）
-│   ├── consolidator.ts      # 懒惰合并（RecMem 模式）
-│   ├── rewriter.ts          # 查询改写学习
-│   ├── fusion.ts            # 三路 RRF 融合检索
-│   ├── vector-search.ts     # 向量相似度搜索
-│   └── extractor.ts         # 三元组自动抽取
+│   ├── read-guard.ts        # 读写守卫
+│   └── planner/             # 意图树 + Grill Me
+├── cli/                     # 命令行入口 + REPL（含多行输入）
 ├── context/                 # 优先级上下文注入链
-│   ├── system-prompt.ts     # 12 模块分层 System Prompt
-│   ├── mnemosyne-source.ts  # 记忆注入（fusion 检索 + 反馈信号）
-│   ├── claude-md/memory-md/soul/git-status.ts
-│   └── compression.ts       # MicroCompact
-├── embedding/
-│   ├── setup.ts             # ONNX 模型下载 + trigram-hash (384-dim)
-│   └── generate.ts          # Embedding 生成入口
-├── git/                     # Git 顾问
-│   ├── hooks.ts             # 生命周期 hook（统一入口）
-│   ├── advisor.ts           # 操作拦截 + 解释
-│   ├── preflight.ts         # Push 前检查
-│   ├── team-radar.ts        # 团队冲突检测
-│   ├── intent-verify.ts     # 提交意图验证
-│   ├── archaeology.ts       # 代码考古
-│   ├── semantic-blame.ts    # 语义 Blame
-│   ├── conflict-narrator.ts # 冲突叙事
-│   ├── workflow-learner.ts  # 工作流自学习
-│   ├── newbie-guide.ts      # Git 概念教学
-│   └── branch-health.ts     # 分支健康检查
-├── plan/                    # 意图树 & Grill Me
-├── journal/                 # 知识提取 & 回忆
-├── session/                 # JSONL 会话持久化 + 会话索引
-├── skills/                  # Skill 加载/注册
-├── mcp/                     # MCP 协议客户端/适配器
-├── permissions/             # 权限策略引擎
-├── model/                   # 7 个 LLM 提供商
-├── cli/                     # 命令行入口 + REPL
-└── core-types.ts            # 核心类型
+│   ├── system-prompt.ts     # 委托 PromptAssembler
+│   └── compression.ts       # MicroCompact + Agent Compact
+├── memory/                  # 自进化 RAG（Mnemosyne）
+│   ├── store.ts             # SQLite + FTS5
+│   ├── evaluator.ts         # 五维评分
+│   ├── consolidator.ts      # 懒惰合并
+│   ├── embedding/           # trigram-hash (384-dim)
+│   └── journal/             # 知识提取 & 回忆
+├── model/                   # LLM 提供商（DeepSeek/Anthropic/OpenAI）
+├── prompt/                  # 四层 Prompt 架构
+│   ├── static.ts            # 静态层（~1200 tokens, 可缓存）
+│   ├── capability.ts        # 能力层（~800 tokens, 工具动态）
+│   ├── dynamic.ts           # 动态层（~600 tokens, 会话级）
+│   └── assembler.ts         # PromptAssembler + ModelProfile + Token 预算
+├── runtime/                 # Agent Runtime
+│   ├── agent-runtime.ts     # 生命周期容器（状态机 + EventBus）
+│   ├── state-machine.ts     # IDLE→PLANNING→EXECUTING→VERIFYING→DONE
+│   ├── event-bus.ts         # 类型化 pub/sub
+│   ├── tool-runtime.ts      # SandboxedDispatcher
+│   ├── budget-manager.ts    # Agent 树资源控制（depth + agent count）
+│   └── session/             # JSONL 会话持久化
+├── security/                # Security Runtime
+│   ├── runtime.ts           # PolicyEngine + CompositeSandbox 统一入口
+│   ├── permissions/         # 权限策略（policy/config）
+│   └── sandbox/             # 5 层 Sandbox
+│       ├── shell-sandbox.ts # 危险模式检测（rm -rf /, mkfs, dd, fork bomb）
+│       ├── fs-sandbox.ts    # 路径越界 + symlink 解析 + 敏感路径
+│       ├── network-sandbox.ts # SSRF + 私有 IP 拦截
+│       ├── git-sandbox.ts   # force-push / hard-reset / clean -fd
+│       └── env-sandbox.ts   # API key / secret / token 过滤
+├── tools/                   # 12 工具
+│   ├── agent.ts             # AgentTool（递归 spawn）
+│   ├── fs/                  # Read / Write / Edit / Grep / Glob
+│   ├── shell/               # Bash
+│   ├── git/                 # Git 顾问系统
+│   ├── web/                 # WebFetch + WebSearch
+│   ├── mcp/                 # MCP 协议
+│   └── registry.ts          # Tool 注册/分发（纯 router）
+└── shared/
+    └── core-types.ts        # 核心类型
 ```
 
 ---
@@ -261,9 +258,11 @@ model:
   maxRetries: 3
 
 permissions:
-  bash: confirm
-  write: confirm
-  web: confirm
+  bash: auto      # Sandbox 拦截具体危险操作，权限默认放行
+  read: auto
+  write: auto
+  edit: auto
+  web: auto
 
 mnemosyne:
   bootstrap_on_first_open: true
@@ -314,17 +313,19 @@ Report issues with file paths and line numbers.
 ## 测试
 
 ```bash
-npm test              # 85 tests, 6 suites
+npm test              # 158 tests, 9 suites
 ```
 
 | Suite | 测试 | 覆盖 |
 |-------|------|------|
 | memory | 35 | CRUD、FTS5、手动记忆、关系、反馈、评分、嵌入、整理 |
+| security-sandbox | 55 | Shell/Fs/Network/Git/Env Sandbox + SecurityRuntime 集成 |
+| subagent-recursion | 22 | resolveTools 工具链、BudgetManager 资源控制、canSpawn |
 | tools | 13 | Read/Write/Edit/Bash/Grep/Glob/Web/Todo |
 | context | 10 | CLAUDE.md、Memory.md、Soul、Git Status、Mnemosyne |
 | model | 10 | DeepSeek、OpenAI、Anthropic、Router |
+| permissions | 9 | 策略引擎、规则匹配、Allow/Deny |
 | agent | 8 | AgentLoop、Retry、CircuitBreaker、Compaction |
-| permissions | 9 | Auto/Confirm/Manual、Rules、Deny |
 
 ---
 
