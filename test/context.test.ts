@@ -2,6 +2,7 @@
 import { describe, it, expect } from "vitest";
 import { ContextChain } from "../src/context/sources.js";
 import { microCompact, snipContent, snipLines } from "../src/context/compression.js";
+import { microCompactBeforeRequest } from "../src/context/micro-compact.js";
 import type { ContextSource, ContextBlock, AgentContext } from "../src/shared/core-types.js";
 
 function mockCtx(): AgentContext {
@@ -140,6 +141,43 @@ describe("MicroCompact", () => {
 
     const compressed = microCompact(messages, 10);
     expect(compressed).toHaveLength(5);
+  });
+
+  it("bounds heavyweight tool results accumulated across many model turns", () => {
+    const messages = Array.from({ length: 14 }, (_, index): import("../src/shared/core-types.js").Message[] => [
+      {
+        role: "assistant",
+        content: [{
+          type: "tool_use",
+          id: `read-${index}`,
+          name: "Read",
+          input: { file_path: `/project/file-${index}.ts` },
+        }],
+      },
+      {
+        role: "user",
+        content: [{
+          type: "tool_result",
+          tool_use_id: `read-${index}`,
+          content: `full source ${index} ${"x".repeat(100)}`,
+        }],
+      },
+    ]).flat();
+
+    const compacted = microCompactBeforeRequest(messages);
+    expect(compacted.cleared).toBe(9);
+
+    const liveResults = compacted.messages.flatMap((message) =>
+      typeof message.content === "string"
+        ? []
+        : message.content.filter((block) =>
+          block.type === "tool_result" &&
+          block.content !== "[Old tool result content cleared]"),
+    );
+    expect(liveResults).toHaveLength(5);
+
+    // Running the compactor again without new results is a no-op.
+    expect(microCompactBeforeRequest(compacted.messages).cleared).toBe(0);
   });
 });
 

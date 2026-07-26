@@ -22,6 +22,13 @@ export const HARD_BLACKLIST: PermissionRule[] = [
 
 // Default safe list — common read-only / dev commands
 export const DEFAULT_ALLOW_RULES: PermissionRule[] = [
+  // Read-only subagent task inspection. Mutating actions such as cancel,
+  // cleanup, pin/unpin, and prune intentionally keep the default confirmation.
+  { tool: "Task", pattern: "\"action\":\"list\"", action: "allow", reason: "Safe: list subagent tasks" },
+  { tool: "Task", pattern: "\"action\":\"get\"", action: "allow", reason: "Safe: inspect a subagent task" },
+  { tool: "Task", pattern: "\"action\":\"wait\"", action: "allow", reason: "Safe: wait for a subagent task" },
+  { tool: "Task", pattern: "\"action\":\"watch\"", action: "allow", reason: "Safe: watch a subagent task" },
+  { tool: "Task", pattern: "\"action\":\"stats\"", action: "allow", reason: "Safe: inspect artifact statistics" },
   // Read-only filesystem
   { tool: "Bash", pattern: "ls", action: "allow", reason: "Safe: list directory" },
   { tool: "Bash", pattern: "cat ", action: "allow", reason: "Safe: read file" },

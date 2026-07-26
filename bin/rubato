@@ -1,0 +1,16 @@
+#!/bin/sh
+# Keep the npm-installed command as a small, portable launcher. Invoking the
+# ESM entry file directly through a shebang is unreliable on some macOS/Node
+# combinations (the process can be killed before the module is evaluated).
+set -e
+
+SCRIPT_PATH="$0"
+if command -v realpath >/dev/null 2>&1; then
+  SCRIPT_PATH="$(realpath "$SCRIPT_PATH")"
+else
+  SCRIPT_PATH="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)/$(basename "$SCRIPT_PATH")"
+fi
+
+PACKAGE_DIR="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
+NODE_BIN="${NODE_BIN:-node}"
+exec "$NODE_BIN" "$PACKAGE_DIR/dist/cli/entry.js" "$@"

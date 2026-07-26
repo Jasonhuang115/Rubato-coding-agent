@@ -133,18 +133,27 @@ LIKE搜索  cosine   1-hop邻居
 
 ### Subagent 递归系统
 
-父 agent 可以 spawn 子 agent，子 agent 还可以继续 spawn 孙 agent（最多 3 层）。共享 `agentLoop()` 引擎，换 tool pool 和 system prompt。
+根 Agent 是项目的唯一写者。Subagent 使用 fresh context，只做探索、研究、验证、审查和任务拆解，并通过 `CompleteTask` 返回 Markdown 报告。General 可以继续派发只读 required 子任务（最多 3 层）。
+
+根 Agent 在创建 TodoWrite 或开始大范围读取前先检查独立范围；存在两个以上可并行的重大范围，或材料明显无法装进单个上下文时，必须拆分任务。根 Agent 保留至少一个不重叠的主体范围并立即执行，其余范围通过 advisory 后台运行。advisory 表示“当前不阻塞”，其结果仍可能是最终汇总必需的；只有缺少结果就没有任何安全、有用的下一步时才使用 required。
 
 ```
 Parent (depth=0, AgentTool ✅)
   ├─ General (depth=1, canSpawn=true)
   │   ├─ General (depth=2, canSpawn=true)
-  │   │   └─ General (depth=3, canSpawn=false — 硬限制)
+  │   │   └─ Verify (depth=3, canSpawn=false — 硬限制)
   │   └─ Explore (canSpawn=false, 只读)
+  ├─ Research (canSpawn=false, 只读网络研究)
   └─ Verify (canSpawn=false, 对抗性审查)
 ```
 
-**内置 Subagent 类型**：Explore / General / Verify，均可自定义（`.rubato/agents/*.md`）。支持 background 异步执行 + worktree 隔离。结果自动写回文件，主 agent 在后续 turn 中 Read + merge。
+**内置 Subagent 类型**：Explore / Research / General / Verify，也可在 `.rubato/agents/*.md` 中定义只读角色。
+
+- `required`：结果是下一步的必要决策门；父 Agent 等待，CLI 用单行状态指示器显示存活状态，Ctrl+C 可取消任务树。
+- `advisory`：当前非阻塞的后台任务；结果可以是最终汇总必需的，根 Agent在 join 点通过 Task wait/get 汇合，完成事件也会唤醒空闲会话。
+- 所有 Subagent 的工具都经过不可绕过的 allowlist，不能获得 Write、Edit、Bash、Git、Skill 或可变 MCP 工具。
+- 报告、机器结果和 trace 位于 `~/.rubato/projects/<projectHash>/runs/<sessionId>/`；父 Agent 默认只收到摘要和路径。
+- 普通 Subagent 不创建 worktree、不产生 patch、不并行修改代码。并行写代码保留为未来显式启用的 Batch/Worker 能力。
 
 ### Plan 模式 + Grill Me 意图追踪
 
@@ -189,8 +198,11 @@ npm run build
 export DEEPSEEK_API_KEY=sk-your-key
 export TAVILY_API_KEY=tvly-your-key   # Web Search
 
-# 全局命令
-npm link
+# 全局命令（使用复制安装，避免开发 link 让命令直接执行工作区脚本）
+npm unlink -g rubato coding-agent 2>/dev/null || true
+PACKAGE_TGZ=$(npm pack --silent)
+npm install -g "$PACKAGE_TGZ"
+rm -f "$PACKAGE_TGZ"
 
 # 交互模式
 rubato
@@ -216,6 +228,12 @@ rubato -n "帮我写一个 hello world"
 | `/memory search <q>` | 搜索记忆 |
 | `/journal search <q>` | 搜索知识 |
 | `/model` | 查看/切换模型 |
+| `/tasks` | 查看 Subagent 任务 |
+| `/tasks wait/cancel/cleanup <id>` | 等待、取消或清理任务 |
+| `/tasks watch [id]` | 持续显示一个或全部运行中任务的状态变化 |
+| `/tasks pin/unpin <id>` | 保护或解除保护 artifact |
+| `/tasks stats/prune` | 查看空间占用或按 TTL/LRU 清理 |
+| `/trace [id]` | 查看根 trace 或任务 transcript 路径 |
 | `/help` | 所有命令 |
 | `/exit` | 退出 |
 
@@ -227,7 +245,8 @@ rubato -n "帮我写一个 hello world"
 src/
 ├── agent/                   # Agent 核心
 │   ├── loop.ts              # Async generator 核心循环
-│   ├── subagent.ts          # 递归子 agent 引擎（spawn/worktree/background）
+│   ├── subagent.ts          # 只读角色定义、权限解析和兼容入口
+│   ├── subagents/           # Runtime/Scheduler/Runner/Artifact/Trace/Inbox
 │   ├── agent-defs.ts        # 自定义 agent 加载器
 │   ├── read-guard.ts        # 读写守卫
 │   └── planner/             # 意图树 + Grill Me
@@ -362,18 +381,18 @@ Report issues with file paths and line numbers.
 ## 测试
 
 ```bash
-npm test              # 279 tests, 17 suites
+npm test              # 191 tests, 16 suites
 ```
 
 | Suite | 测试 | 覆盖 |
 |-------|------|------|
 | memory / memory-attribution | 46 | CRUD、FTS5、手动记忆、关系、反馈、评分、嵌入、LLM 蒸馏、引用归因 |
-| security-sandbox | 61 | Shell/Fs/Network/Git/Env Sandbox + SecurityRuntime 集成 |
-| runtime / prompt / security-policy / capability | 94 | Runtime、Prompt、策略与能力边界回归 |
-| agent-loop-lifecycle | 3 | 会话收尾与记忆反馈时序 |
-| subagent-recursion / recursive-subagent / subagent-results / delegation-policy | 25 | resolveTools 工具链、BudgetManager 资源控制、递归边界、结果沉淀 |
+| security-sandbox | 63 | Shell/Fs/Network/Git/Env Sandbox + SecurityRuntime 集成 |
+| runtime / prompt / security-policy | 10 | Runtime、Prompt、策略与能力边界回归 |
+| agent-loop-lifecycle | 6 | 会话收尾、CompleteTask、advisory 唤醒和根 Agent 单写流程 |
+| subagent runtime / policy / scheduler / results | 17 | 只读权限、任务终态、artifact、trace、递归槽释放、取消与超时 |
 | tools | 13 | Read/Write/Edit/Bash/Grep/Glob/Web/Todo |
-| context | 10 | CLAUDE.md、Memory.md、Soul、Git Status、Mnemosyne |
+| context | 9 | CLAUDE.md、Memory.md、Soul、Git Status、Mnemosyne |
 | model | 10 | DeepSeek、OpenAI、Anthropic、Router |
 | permissions | 9 | 策略引擎、规则匹配、Allow/Deny |
 | agent | 8 | AgentLoop、Retry、CircuitBreaker、Compaction |

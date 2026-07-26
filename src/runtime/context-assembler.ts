@@ -16,6 +16,8 @@ import { MnemosyneSource } from "../context/mnemosyne-source.js";
 import { sessionStartRecall } from "../memory/journal/recall.js";
 import { sessionStartHook, conflictCheckHook } from "../tools/git/hooks.js";
 import { getPromptAssembler } from "../prompt/assembler.js";
+import { buildSubagentStaticPrompt } from "../prompt/static.js";
+import { buildCapabilityPrompt } from "../prompt/capability.js";
 
 export interface AssembledContext {
   systemPrompt: string;
@@ -29,6 +31,8 @@ export interface ContextAssemblerOptions {
   tools: ToolDefinition[];
   providerName?: string;
   resumeSummary?: string;
+  roleSystemPrompt?: string;
+  contextProfile?: "root" | "subagent" | "compact";
 }
 
 /**
@@ -42,31 +46,59 @@ export interface ContextAssemblerOptions {
 export async function assembleContext(
   options: ContextAssemblerOptions,
 ): Promise<AssembledContext> {
-  const { workingDir, prompt, ctx, tools, providerName, resumeSummary } = options;
+  const {
+    workingDir,
+    prompt,
+    ctx,
+    tools,
+    providerName,
+    resumeSummary,
+    roleSystemPrompt,
+    contextProfile = "root",
+  } = options;
+
+  if (contextProfile === "compact") {
+    const systemPrompt = roleSystemPrompt?.trim() || "You are a concise text summarizer.";
+    return { systemPrompt, systemTokens: roughTokenEstimate(systemPrompt) };
+  }
 
   // 1. Build prompt layers via PromptAssembler
-  const assembler = getPromptAssembler(providerName);
-  const layeredSystem = assembler.assembleFlat(ctx, tools);
+  const layeredSystem = contextProfile === "subagent"
+    ? [
+        buildSubagentStaticPrompt(roleSystemPrompt || "You are a read-only analysis subagent."),
+        buildCapabilityPrompt(tools),
+      ].join("\n\n")
+    : getPromptAssembler(providerName).assembleFlat(ctx, tools);
 
   // 2. Build context chain
   const contextChain = new ContextChain();
-  contextChain.register(new SoulSource());
-  contextChain.register(new ClaudeMdSource());
-  contextChain.register(new MemoryMdSource());
-  contextChain.register(new MnemosyneSource());
-  contextChain.register(new GitStatusSource());
+  if (contextProfile === "subagent") {
+    // Project rules are useful; parent history, memory, identity and Git session
+    // state are intentionally excluded from the fresh subagent context.
+    contextChain.register(new ClaudeMdSource());
+  } else {
+    contextChain.register(new SoulSource());
+    contextChain.register(new ClaudeMdSource());
+    contextChain.register(new MemoryMdSource());
+    contextChain.register(new MnemosyneSource());
+    contextChain.register(new GitStatusSource());
+  }
 
   const contextBlocks = await contextChain.fetchAll(prompt, ctx);
   const contextText = contextBlocks.map((b) => b.content).join("\n\n");
 
   // 3. Journal recall
-  const journalRecall = sessionStartRecall(workingDir);
+  const journalRecall = contextProfile === "root" ? sessionStartRecall(workingDir) : "";
 
   // 4. Git health
-  const gitHealth = await sessionStartHook(workingDir).catch(() => null);
+  const gitHealth = contextProfile === "root"
+    ? await sessionStartHook(workingDir).catch(() => null)
+    : null;
 
   // 5. Conflict check
-  const conflictWarning = await conflictCheckHook(workingDir).catch(() => null);
+  const conflictWarning = contextProfile === "root"
+    ? await conflictCheckHook(workingDir).catch(() => null)
+    : null;
 
   // 6. Assemble final system prompt
   let systemPrompt = layeredSystem +
@@ -76,7 +108,7 @@ export async function assembleContext(
     (conflictWarning ? `\n\n${conflictWarning}` : "");
 
   // 7. Resume summary (from previous session)
-  if (resumeSummary) {
+  if (resumeSummary && contextProfile === "root") {
     systemPrompt += `\n\n## Previous Session Context\nThe following is a summary of a previous session in this project. Use this context to understand what was previously discussed:\n\n${resumeSummary}`;
   }
 

@@ -1,125 +1,222 @@
-// Agent tool — spawn a subagent to handle independent subtasks
-// Supports: built-in types, custom definitions, worktree isolation, background execution
-
-import type { ToolDefinition, AgentContext } from "../shared/core-types.js";
+import fs from "fs";
+import type {
+  AgentTaskInput,
+  TaskResult,
+  ToolDefinition,
+} from "../shared/core-types.js";
+import { findDefinition, getAllDefinitions } from "../agent/agent-defs.js";
 import {
   getBuiltinDefinition,
-  getSubagentResultPath,
-  spawnSubagent,
-  spawnSubagentInWorktree,
-  spawnSubagentInBackground,
+  resolveSubagentTools,
 } from "../agent/subagent.js";
-import { findDefinition, getAllDefinitions } from "../agent/agent-defs.js";
+import { processSubagentRegistry } from "../agent/subagents/registry.js";
 
-const RESULT_PREVIEW_LENGTH = 4_000;
-
-function formatCompletedResult(
-  definitionName: string,
-  isolation: string,
-  result: Awaited<ReturnType<typeof spawnSubagent>>,
-): string {
-  const isolationNote = isolation === "worktree" ? " [isolated worktree]" : "";
-  const resultPath = result.resultPath ?? getSubagentResultPath(result.agentId);
-  const preview = result.output.slice(0, RESULT_PREVIEW_LENGTH);
-  const previewNote = result.output.length > RESULT_PREVIEW_LENGTH
-    ? `\n\n... [full report: ${resultPath}]`
-    : "";
-
-  const lines = [
-    `## Subagent: ${definitionName}${isolationNote} (${result.status})`,
-    `**Agent ID:** ${result.agentId}`,
-    `**Tokens:** ${result.usage.inputTokens} in / ${result.usage.outputTokens} out | **Tool calls:** ${result.usage.toolCalls}`,
-    `**Full report:** ${resultPath}`,
-    ...(result.transcriptPath ? [`**Transcript:** ${result.transcriptPath}`] : []),
-    "",
-    "### Final Report Preview",
-    "",
-    (preview || "(no final report)") + previewNote,
-  ];
-  return lines.join("\n");
-}
+// Leave room for task metadata so the entire tool result stays below the
+// parent's 4,000-character preview budget in practice.
+const RESULT_PREVIEW_LENGTH = 3_500;
 
 export const agentTool: ToolDefinition = {
   name: "Agent",
   description:
-    "Launch a subagent to handle complex, multi-step tasks autonomously. " +
-    "Subagents have scoped tools and run independently. " +
-    "Use for: parallel exploration, codebase research, verification, or any task " +
-    "that can be delegated without the full tool set." +
-    "\n\n**Background subagents:** When you spawn a subagent with `run_in_background: true`, " +
-    "continue working on other aspects of the task. In a later turn, Read the results file " +
-    "and merge the subagent's findings into your final answer. " +
-    "Do NOT give your final conclusion until you have incorporated background subagent results." +
-    "\n\nAvailable subagent types: explore | general | verify (plus custom from .rubato/agents/*.md)" +
-    "\n\nOptions:" +
-    "\n- isolation: \"worktree\" runs the subagent in a git worktree for safe writes." +
-    "\n- run_in_background: true to run asynchronously.",
+    "Create a fresh-context, read-only subagent task. Subagents investigate, research, " +
+    "verify, decompose, and return Markdown reports; they cannot edit files, run Bash, or use Git. " +
+    "Use dependency='advisory' when the root has other independent work it can do now; the result may " +
+    "still be required at final synthesis. Use dependency='required' only when no safe useful next action " +
+    "is possible until this result arrives.",
   inputSchema: {
     type: "object",
     properties: {
-      description: { type: "string", description: "A short (3-5 word) description of the task" },
-      prompt: { type: "string", description: "The task for the subagent to perform" },
-      subagent_type: { type: "string", description: "Type: 'explore', 'general', 'verify', or custom name from .rubato/agents/*.md" },
-      model: { type: "string", description: "Optional model override. Use 'inherit' (default) or a specific model ID." },
-      isolation: { type: "string", enum: ["none", "worktree"], description: "Isolation mode. 'worktree' creates a git worktree. Default: 'none'." },
-      run_in_background: { type: "boolean", description: "Run subagent in background. Default: false." },
+      description: { type: "string", description: "Short task description" },
+      prompt: {
+        type: "string",
+        description: "Self-contained objective, scope, constraints, necessary context, and expected output",
+      },
+      subagent_type: {
+        type: "string",
+        description: "explore | research | general | verify | custom definition",
+      },
+      dependency: {
+        type: "string",
+        enum: ["advisory", "required"],
+        description: "Scheduling dependency: advisory=work can continue now; required=immediate next action is blocked",
+      },
+      model: { type: "string" },
+      timeout_ms: { type: "number" },
+      coverage: {
+        type: "string",
+        enum: ["auto", "exhaustive"],
+        description:
+          "Use exhaustive when the assignment promises every-file/every-line inspection; runtime coverage must close before completed is accepted.",
+      },
+      run_in_background: {
+        type: "boolean",
+        description: "Deprecated compatibility alias: true=advisory, false=required",
+      },
+      isolation: {
+        type: "string",
+        description: "Deprecated compatibility input. Accepted but ignored; no worktree is created.",
+      },
     },
-    required: ["description", "prompt"],
+    required: ["description", "prompt", "dependency"],
   },
-  type: "write",
+  // Orchestration is non-mutating with respect to the project workspace.
+  type: "read",
+  isConcurrencySafe: false,
   requiresApproval: false,
-  async handler(input, ctx: AgentContext) {
-    const subagentType = (input.subagent_type as string) ?? "general";
-    const prompt = input.prompt as string;
-    const model = input.model as string | undefined;
-    const isolation = (input.isolation as string) ?? "none";
-    const runInBackground = input.run_in_background === true;
+  async handler(rawInput, ctx) {
+    const description = String(rawInput.description ?? "").trim();
+    const prompt = String(rawInput.prompt ?? "").trim();
+    if (!description || !prompt) {
+      return { content: "Agent requires non-empty description and prompt.", isError: true };
+    }
 
+    const subagentType = String(rawInput.subagent_type ?? "general");
     let definition;
     try {
       definition = getBuiltinDefinition(subagentType);
     } catch {
-      const customDef = await findDefinition(subagentType);
-      if (!customDef) {
-        const defs = await getAllDefinitions();
-        return { content: `Unknown subagent type "${subagentType}". Available: ${defs.map((d) => d.name).join(", ")}.`, isError: true };
+      definition = await findDefinition(subagentType);
+      if (!definition) {
+        const definitions = await getAllDefinitions();
+        return {
+          content: `Unknown subagent type "${subagentType}". Available: ${definitions.map((item) => item.name).join(", ")}.`,
+          isError: true,
+        };
       }
-      definition = customDef;
     }
 
-    if (model) definition.model = model;
+    const requestedDependency = rawInput.dependency === "advisory" ||
+      rawInput.dependency === "required"
+      ? rawInput.dependency
+      : rawInput.run_in_background === true
+        ? "advisory"
+        : "required";
+    const dependency = ctx.taskRuntime ? "required" : requestedDependency;
+    const input: AgentTaskInput = {
+      description,
+      prompt,
+      subagent_type: definition.name,
+      dependency,
+      model: typeof rawInput.model === "string" ? rawInput.model : undefined,
+      timeout_ms: typeof rawInput.timeout_ms === "number" ? rawInput.timeout_ms : undefined,
+      coverage: rawInput.coverage === "exhaustive" ? "exhaustive" : "auto",
+    };
+    const rootSessionId = ctx.taskRuntime?.rootSessionId ?? ctx.sessionId;
+    const runtime = processSubagentRegistry.getOrCreate(rootSessionId, ctx.workingDir, ctx.config);
+    const depth = (ctx.taskRuntime?.depth ?? ctx.depth ?? 0) + 1;
+    const tools = resolveSubagentTools(definition, depth, runtime.limits.maxDepth);
+    const submitted = runtime.submit(input, ctx, definition, tools);
+    const deprecation = rawInput.isolation === "worktree"
+      ? "\nDeprecated: isolation=worktree was ignored; this read-only task did not create a worktree."
+      : "";
 
-    // Background execution — write results to a file the agent can Read later
-    if (runInBackground) {
-      const handle = spawnSubagentInBackground(definition, prompt, ctx, ctx.config);
-      const resultsPath = getSubagentResultPath(handle.agentId);
-
+    if (dependency === "advisory") {
       return {
-        content:
-          `## Background Subagent Spawned\n` +
-          `**Agent ID:** ${handle.agentId}\n` +
-          `**Type:** ${definition.name}\n` +
-          `**Status:** running in background\n\n` +
-          `The subagent is working independently. ` +
-          `When it finishes, results will be written to \`${resultsPath}\`. ` +
-          `You can continue with other tasks and Read \`${resultsPath}\` ` +
-          `in a later turn to merge its findings. ` +
-          `If the file doesn't exist yet, the subagent is still running — ` +
-          `check again in the next turn.`,
+        content: [
+          `Background task queued: ${submitted.task.taskId}`,
+          `Status: ${submitted.task.status}`,
+          `Report: ${submitted.task.artifacts.report}`,
+          `Result: ${submitted.task.artifacts.result}`,
+          `Coverage: ${submitted.task.artifacts.coverage}`,
+          "The parent may continue and provide an initial answer. Completion will be delivered through the session inbox.",
+          deprecation,
+        ].filter(Boolean).join("\n"),
       };
     }
 
-    // Worktree isolation
-    let result;
-    if (isolation === "worktree") {
-      result = await spawnSubagentInWorktree(definition, prompt, ctx, ctx.config);
-    } else {
-      result = await spawnSubagent(definition, prompt, ctx, ctx.config);
+    // Keep required tasks visibly alive without flooding the terminal. Detailed
+    // activity stays in trace; the interactive UI only redraws one compact line.
+    const stopProgress = startRequiredProgressIndicator(
+      runtime,
+      submitted.task.taskId,
+      description,
+    );
+    let result: TaskResult;
+    try {
+      result = await submitted.result;
+    } finally {
+      stopProgress();
     }
-
     return {
-      content: formatCompletedResult(definition.name, isolation, result),
-      isError: result.status !== "completed",
+      content: formatRequiredResult(result, deprecation),
+      isError: result.status === "failed" || result.status === "timed_out" ||
+        result.status === "cancelled" || result.status === "orphaned",
     };
   },
 };
+
+function formatRequiredResult(result: TaskResult, deprecation: string): string {
+  let preview = "";
+  try {
+    preview = fs.readFileSync(result.reportPath, "utf8").slice(0, RESULT_PREVIEW_LENGTH);
+  } catch {
+    preview = "(report could not be read)";
+  }
+  return [
+    `Task completed: ${result.summary}`,
+    `Task ID: ${result.taskId}`,
+    `Status: ${result.status}`,
+    `Report: ${result.reportPath}`,
+    `Result: ${result.resultPath}`,
+    `Transcript: ${result.transcriptPath}`,
+    `Coverage: ${result.coveragePath}`,
+    deprecation,
+    "",
+    "Report preview:",
+    preview,
+  ].filter((line) => line !== "").join("\n");
+}
+
+function startRequiredProgressIndicator(
+  runtime: ReturnType<typeof processSubagentRegistry.getOrCreate>,
+  taskId: string,
+  description: string,
+): () => void {
+  if (!process.stderr.isTTY) return () => {};
+
+  const label = compactLabel(description, 44);
+  let stopped = false;
+
+  const render = () => {
+    if (stopped) return;
+    const task = runtime.get(taskId);
+    if (!task || task.endedAt) return;
+    const elapsed = formatDuration(Date.now() - (task.startedAt ?? task.createdAt));
+    const childSuffix = task.childCount > 0 ? ` · ${task.childCount} 个子任务` : "";
+    process.stderr.write(
+      `\r\x1b[2K  … Subagent：${label} · ${elapsed}${childSuffix} · Ctrl+C 取消`,
+    );
+  };
+
+  render();
+  const unsubscribe = runtime.subscribe((task) => {
+    if (task.taskId === taskId) render();
+  });
+  // Elapsed time is informational, not an animation. Refreshing every five
+  // seconds keeps required work visibly alive without making the terminal
+  // look stuck or repainting continuously.
+  const timer = setInterval(render, 5_000);
+  timer.unref?.();
+
+  return () => {
+    if (stopped) return;
+    stopped = true;
+    clearInterval(timer);
+    unsubscribe();
+    process.stderr.write("\r\x1b[2K");
+  };
+}
+
+function compactLabel(value: string, maxLength: number): string {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  return normalized.length > maxLength
+    ? `${normalized.slice(0, maxLength - 1)}…`
+    : normalized;
+}
+
+function formatDuration(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1_000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}

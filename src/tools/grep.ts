@@ -55,6 +55,7 @@ export const grepTool: ToolDefinition = {
     const ignoreCase = (input.ignore_case as boolean) ?? false;
 
     return new Promise((resolve) => {
+      let aborted = false;
       // Try ripgrep first, fall back to grep
       const useRg = true; // try rg first
       const cmd = useRg ? "rg" : "grep";
@@ -86,6 +87,12 @@ export const grepTool: ToolDefinition = {
         stdio: ["pipe", "pipe", "pipe"],
         cwd: ctx.workingDir ?? process.cwd(),
       });
+      const onAbort = () => {
+        aborted = true;
+        child.kill("SIGTERM");
+        resolve({ content: "Search cancelled.", isError: true });
+      };
+      ctx.abortSignal?.addEventListener("abort", onAbort, { once: true });
 
       let stdout = "";
       let stderr = "";
@@ -101,6 +108,8 @@ export const grepTool: ToolDefinition = {
       });
 
       child.on("close", (code: number | null) => {
+        ctx.abortSignal?.removeEventListener("abort", onAbort);
+        if (aborted) return;
         // rg exits with 1 for "no matches", which is fine
         if (code !== 0 && code !== 1) {
           // rg failed — try grep as fallback (not just code 127: -2, 2, etc.)
@@ -113,6 +122,12 @@ export const grepTool: ToolDefinition = {
                 cwd: ctx.workingDir ?? process.cwd(),
               }
             );
+            const onFallbackAbort = () => {
+              aborted = true;
+              grepChild.kill("SIGTERM");
+              resolve({ content: "Search cancelled.", isError: true });
+            };
+            ctx.abortSignal?.addEventListener("abort", onFallbackAbort, { once: true });
 
             let grepOut = "";
             grepChild.stdout?.on("data", (data: Buffer) => {
@@ -122,6 +137,8 @@ export const grepTool: ToolDefinition = {
             });
 
             grepChild.on("close", () => {
+              ctx.abortSignal?.removeEventListener("abort", onFallbackAbort);
+              if (aborted) return;
               const lines = grepOut.trim().split("\n").filter(Boolean);
               resolve({
                 content: formatResults(pattern, searchPath, lines, maxMatches),
@@ -129,6 +146,8 @@ export const grepTool: ToolDefinition = {
             });
 
             grepChild.on("error", () => {
+              ctx.abortSignal?.removeEventListener("abort", onFallbackAbort);
+              if (aborted) return;
               resolve({
                 content: `Search failed: neither rg nor grep available`,
                 isError: true,
@@ -151,6 +170,8 @@ export const grepTool: ToolDefinition = {
       });
 
       child.on("error", () => {
+        ctx.abortSignal?.removeEventListener("abort", onAbort);
+        if (aborted) return;
         // rg not installed, try grep
         const grepChild = spawn(
           "grep",
@@ -160,6 +181,12 @@ export const grepTool: ToolDefinition = {
             cwd: ctx.workingDir ?? process.cwd(),
           }
         );
+        const onFallbackAbort = () => {
+          aborted = true;
+          grepChild.kill("SIGTERM");
+          resolve({ content: "Search cancelled.", isError: true });
+        };
+        ctx.abortSignal?.addEventListener("abort", onFallbackAbort, { once: true });
 
         let grepOut = "";
         grepChild.stdout?.on("data", (data: Buffer) => {
@@ -169,6 +196,8 @@ export const grepTool: ToolDefinition = {
         });
 
         grepChild.on("close", () => {
+          ctx.abortSignal?.removeEventListener("abort", onFallbackAbort);
+          if (aborted) return;
           const lines = grepOut.trim().split("\n").filter(Boolean);
           resolve({
             content: formatResults(pattern, searchPath, lines, maxMatches),
@@ -176,6 +205,8 @@ export const grepTool: ToolDefinition = {
         });
 
         grepChild.on("error", () => {
+          ctx.abortSignal?.removeEventListener("abort", onFallbackAbort);
+          if (aborted) return;
           resolve({
             content: `Search failed: neither rg nor grep available on this system`,
             isError: true,

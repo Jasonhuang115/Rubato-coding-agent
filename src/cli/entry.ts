@@ -16,6 +16,9 @@ import {
   handleSkillCommand,
   handlePlanCommand,
   handleGrillMeCommand,
+  handleTasksCommand,
+  handleTraceCommand,
+  handleScrubCommand,
 } from "./command-handlers.js";
 import { AnsiStreamRenderer } from "./stream-renderer.js";
 import { agentLoop, abortCurrentRequest } from "../agent/loop.js";
@@ -35,16 +38,20 @@ import { todoWriteTool } from "../tools/todo.js";
 import { planTool } from "../tools/plan.js";
 import { agentTool } from "../tools/agent.js";
 import { skillTool } from "../tools/skill.js";
+import { taskTool } from "../tools/task.js";
 import { PlanManager } from "../agent/planner/manager.js";
 import { getMnemosyneStore } from "../memory/store.js";
 import { initCustomDefinitions } from "../agent/agent-defs.js";
 import { McpClient } from "../tools/mcp/client.js";
+import { readMultiLineInput } from "./multiline-input.js";
+import { readClipboardPrompt } from "./clipboard-input.js";
 import { connectMcpServer, disconnectMcpServer } from "../tools/mcp/adapter.js";
 import { loadAllSkills } from "../skills/loader.js";
 import { getSkillRegistry } from "../skills/registry.js";
 import type { AgentConfig } from "../shared/core-types.js";
 import { warnRecoverable } from "../shared/diagnostics.js";
 import { SessionManager } from "../runtime/session/manager.js";
+import { processSubagentRegistry } from "../agent/subagents/registry.js";
 
 // Register all tools
 register(readTool);
@@ -58,13 +65,14 @@ register(webSearchTool);
 register(todoWriteTool);
 register(planTool);
 register(agentTool);
+register(taskTool);
 register(skillTool);
 
 // ---- Tab completion & / menu ----
 
 function getSlashCompletions(): string[] {
   const builtin = [
-    "/exit", "/quit", "/compact", "/clear", "/help",
+    "/exit", "/quit", "/compact", "/clear", "/help", "/paste",
     "/plan", "/plan new", "/plan list", "/plan done", "/plan show",
     "/grillme", "/grillme on", "/grillme off", "/grillme strict", "/grillme normal", "/grillme loose",
     "/git", "/git health",
@@ -73,6 +81,9 @@ function getSlashCompletions(): string[] {
     "/memory", "/memory stats", "/memory search",
     "/model",
     "/sessions", "/sessions list", "/sessions resume",
+    "/tasks", "/tasks wait", "/tasks watch", "/tasks cancel", "/tasks cleanup",
+    "/tasks pin", "/tasks unpin", "/tasks stats", "/tasks prune", "/trace",
+    "/scrub", "/scrub --dry-run",
   ];
 
   // Add skill commands
@@ -104,6 +115,7 @@ function showSlashMenu(): void {
 
   console.log("\n  ── Commands ──");
   console.log("  /exit, /quit       Exit");
+  console.log("  /paste             Send the full text currently in the clipboard");
   console.log("  /clear              Start a fresh session");
   console.log("  /compact            Compact context");
   console.log("  /plan               Show plan | /plan new <desc> | /plan done");
@@ -114,6 +126,9 @@ function showSlashMenu(): void {
   console.log("  /memory             Memory stats | /memory search <q>");
   console.log("  /model              Switch model | /model <name>");
   console.log("  /sessions           List sessions | /sessions resume <#>");
+  console.log("  /tasks              List/inspect/wait/cancel/cleanup subagent tasks");
+  console.log("  /trace [task-id]    Show root trace or task transcript path");
+  console.log("  /scrub [path]       Redact secrets in persisted traces/sessions/artifacts");
   console.log("  /help               Full help");
 
   if (skills.length > 0) {
@@ -137,49 +152,6 @@ interface LoopState {
 
 // ---- First message handler (with slash command support) ----
 
-// Read input. First line via rl.question() (compatible with confirm prompts).
-// If the user continues typing (paste or manual), switches to rl.on('line')
-// for continuation lines. Empty line = send. Slash commands send immediately.
-function readMultiLineInput(
-  rl: readline.Interface,
-  firstPrompt: string,
-): Promise<string> {
-  return new Promise((resolve) => {
-    rl.question(firstPrompt, (firstAnswer) => {
-      const firstLine = firstAnswer.trimEnd();
-
-      if (!firstLine.trim()) { resolve(""); return; }
-      if (firstLine.trim().startsWith("/")) { resolve(firstLine.trim()); return; }
-
-      // Continuation mode: listen for more lines (paste or manual multi-line)
-      const lines = [firstLine];
-      let resolved = false;
-
-      const done = (result: string) => {
-        if (resolved) return;
-        resolved = true;
-        rl.removeListener("line", onLine);
-        rl.setPrompt("");
-        resolve(result);
-      };
-
-      const onLine = (raw: string) => {
-        const line = raw.trimEnd();
-        if (!line.trim()) {
-          done(lines.join("\n"));
-          return;
-        }
-        lines.push(line);
-        rl.prompt();
-      };
-
-      rl.on("line", onLine);
-      rl.setPrompt("  > ");
-      rl.prompt();
-    });
-  });
-}
-
 async function getFirstMessage(
   rl: readline.Interface,
   planManager: PlanManager,
@@ -193,6 +165,16 @@ async function getFirstMessage(
 
     // Handle slash commands locally, loop back for real message
     if (trimmed === "/exit" || trimmed === "/quit") return "/exit";
+    if (trimmed === "/paste") {
+      try {
+        const pasted = readClipboardPrompt();
+        console.log(`  ✓ Clipboard prompt loaded (${pasted.length} chars, ${pasted.split("\n").length} lines)`);
+        return pasted;
+      } catch (error) {
+        console.log(`  ✖ Unable to read clipboard: ${error instanceof Error ? error.message : error}`);
+        continue;
+      }
+    }
     if (trimmed === "/help") { showHelp(); continue; }
     if (trimmed.startsWith("/plan")) { handlePlanCommand(trimmed, planManager); continue; }
     if (trimmed.startsWith("/grillme")) { handleGrillMeCommand(trimmed, planManager); continue; }
@@ -218,6 +200,7 @@ function showHelp(): void {
   console.log("  /memory             Memory stats | /memory search <q> | /memory list");
   console.log("  /model              List / switch models");
   console.log("  /help               Show this help");
+  console.log("  /paste              Send the full clipboard as one prompt");
   console.log("  /exit, /quit        Exit");
   console.log("  Ctrl+C              Exit");
 }
@@ -234,15 +217,36 @@ function createRepl(
   loopState: LoopState,
   currentSessionId: () => string,
   onSessionFinalize: () => void,
-): () => Promise<string | null> {
-  return async () => {
-    const trimmed = await readMultiLineInput(rl, "\n▸ You: ");
+): (signal?: AbortSignal) => Promise<string | null> {
+  return async (signal?: AbortSignal) => {
+    const promptAgain = () => createRepl(
+      rl,
+      planManager,
+      workdir,
+      config,
+      loopOptions,
+      sessionManager,
+      loopState,
+      currentSessionId,
+      onSessionFinalize,
+    )(signal);
+    const trimmed = await readMultiLineInput(rl, "\n▸ You: ", signal);
+    if (trimmed === null) return null;
     if (trimmed === "/") {
       showSlashMenu();
-      return createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)();
+      return promptAgain();
     } else if (trimmed === "/exit" || trimmed === "/quit") {
           onSessionFinalize();
           return null;
+        } else if (trimmed === "/paste") {
+          try {
+            const pasted = readClipboardPrompt();
+            console.log(`  ✓ Clipboard prompt loaded (${pasted.length} chars, ${pasted.split("\n").length} lines)`);
+            return pasted;
+          } catch (error) {
+            console.log(`  ✖ Unable to read clipboard: ${error instanceof Error ? error.message : error}`);
+            return promptAgain();
+          }
         } else if (trimmed === "/clear") {
           // Finalize current session and restart
           onSessionFinalize();
@@ -253,7 +257,7 @@ function createRepl(
         } else if (trimmed === "/compact") {
           if (loopOptions) { loopOptions.forceCompaction = true; }
           console.log("\n  Compacting on next turn...");
-          return createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)();
+          return promptAgain();
         } else if (trimmed.startsWith("/sessions")) {
           const result = handleSessionsCommand(trimmed, sessionManager);
           if (result.restartLoop && result.resumeId) {
@@ -270,11 +274,12 @@ function createRepl(
             }
             return null;
           } else {
-            return createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)();
+            return promptAgain();
           }
         } else if (trimmed === "/help") {
           console.log("\n  REPL Commands:");
           console.log("  /exit, /quit      — Exit the chat");
+          console.log("  /paste            — Send the full clipboard as one prompt");
           console.log("  /clear             — Start a fresh session (saves current)");
           console.log("  /compact           — Summarize earlier context to free space");
           console.log("  /plan             — Show current plan");
@@ -289,6 +294,8 @@ function createRepl(
           console.log("  /memory stats     — Show Mnemosyne memory stats");
           console.log("  /model            — List / switch models");
           console.log("  /sessions         — List project sessions | /sessions resume <#>");
+          console.log("  /scrub --dry-run [path] — Audit persisted data without changing files");
+          console.log("  /scrub [path]     — Redact persisted trace/session/artifact files in place");
           console.log("  /help             — Show this help");
           console.log("  Ctrl+C            — Interrupt / Exit when idle");
           // List loaded skills
@@ -300,25 +307,34 @@ function createRepl(
               console.log(`  /${s.name.padEnd(18)} — ${s.description ?? "(no description)"} [${mode}]`);
             }
           }
-          return createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)();
+          return promptAgain();
         } else if (trimmed.startsWith("/plan")) {
           handlePlanCommand(trimmed, planManager);
-          return createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)();
+          return promptAgain();
         } else if (trimmed.startsWith("/grillme")) {
           handleGrillMeCommand(trimmed, planManager);
-          return createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)();
+          return promptAgain();
         } else if (trimmed.startsWith("/git")) {
           handleGitCommand(trimmed, workdir);
-          return createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)();
+          return promptAgain();
         } else if (trimmed.startsWith("/journal") || trimmed.startsWith("/remember")) {
           handleJournalCommand(trimmed, workdir);
-          return createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)();
+          return promptAgain();
         } else if (trimmed.startsWith("/memory")) {
           handleMemoryCommand(trimmed);
-          return createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)();
+          return promptAgain();
         } else if (trimmed.startsWith("/model")) {
           handleModelCommand(trimmed, config);
-          return createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)();
+          return promptAgain();
+        } else if (trimmed.startsWith("/tasks")) {
+          await handleTasksCommand(trimmed, currentSessionId());
+          return promptAgain();
+        } else if (trimmed.startsWith("/trace")) {
+          handleTraceCommand(trimmed, currentSessionId());
+          return promptAgain();
+        } else if (trimmed.startsWith("/scrub")) {
+          handleScrubCommand(trimmed);
+          return promptAgain();
         } else if (trimmed.startsWith("/") && getSkillRegistry().getSkill(trimmed.split(/\s+/)[0].slice(1))) {
           const passthrough = await handleSkillCommand(trimmed, workdir, config);
           if (typeof passthrough === "string") {
@@ -326,11 +342,56 @@ function createRepl(
             return passthrough;
           } else {
             // Fork skill or unknown: already handled, next REPL prompt
-            return createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, currentSessionId, onSessionFinalize)();
+            return promptAgain();
           }
         } else {
           return trimmed || null;
         }
+  };
+}
+
+function createRequiredTaskCommandRouter(
+  rl: readline.Interface,
+  rootSessionId: string,
+): () => void {
+  const runtime = processSubagentRegistry.get(rootSessionId);
+  if (!runtime) return () => {};
+  let listening = false;
+
+  const onLine = (raw: string) => {
+    const input = raw.trim();
+    if (input.startsWith("/tasks")) {
+      void handleTasksCommand(input, rootSessionId);
+    } else if (input.startsWith("/trace")) {
+      handleTraceCommand(input, rootSessionId);
+    } else if (input) {
+      console.log(
+        "\n  A required subagent is still running. " +
+        "Available commands: /tasks, /tasks cancel <id>, /trace, or Ctrl+C.",
+      );
+    }
+  };
+
+  const refresh = () => {
+    const hasRequired = runtime.list().some((task) =>
+      task.dependency === "required" &&
+      (task.status === "queued" || task.status === "running" || task.status === "waiting_child"),
+    );
+    if (hasRequired && !listening) {
+      listening = true;
+      rl.on("line", onLine);
+      console.log("\n  Required subagent running — /tasks and /trace remain available.");
+    } else if (!hasRequired && listening) {
+      listening = false;
+      rl.removeListener("line", onLine);
+    }
+  };
+
+  const unsubscribe = runtime.subscribe(refresh);
+  refresh();
+  return () => {
+    unsubscribe();
+    if (listening) rl.removeListener("line", onLine);
   };
 }
 
@@ -397,6 +458,14 @@ async function main(): Promise<void> {
   loadEnvFiles(workdir);
 
   const config = loadConfig(workdir);
+
+  const recoveredOrphans = processSubagentRegistry.recoverProjectOrphans(workdir);
+  if (recoveredOrphans.length > 0) {
+    console.warn(
+      `Recovered ${recoveredOrphans.length} interrupted subagent task(s) as orphaned. ` +
+      "Use /trace or inspect their result.json files for details.",
+    );
+  }
 
   // CLI overrides
   if (model) config.model.model = model;
@@ -587,10 +656,27 @@ async function main(): Promise<void> {
   // Ctrl+C handling: abort current request when processing, exit when idle
   const onSigInt = () => {
     if (processing) {
-      abortCurrentRequest();
-      console.log("\n  ⏹ Interrupted — returning to prompt...");
+      const runtime = processSubagentRegistry.get(activeSessionId);
+      const requiredTask = runtime?.list().slice().reverse().find((task) =>
+        task.dependency === "required" &&
+        (task.status === "queued" || task.status === "running" || task.status === "waiting_child"),
+      );
+      if (requiredTask) {
+        void runtime?.cancel(requiredTask.taskId, true);
+        console.log(`\n  ⏹ Cancelling required subagent ${requiredTask.taskId}...`);
+      } else {
+        abortCurrentRequest();
+        console.log("\n  ⏹ Interrupted — returning to prompt...");
+      }
     } else {
       console.log("\n  Exiting...");
+      for (const runtime of processSubagentRegistry.list()) {
+        for (const task of runtime.list()) {
+          if (task.status === "queued" || task.status === "running" || task.status === "waiting_child") {
+            void runtime.cancel(task.taskId, true);
+          }
+        }
+      }
       if (rl) rl.close();
       process.exit(0);
     }
@@ -607,11 +693,20 @@ async function main(): Promise<void> {
 
   // Called by REPL before restarting/exiting to save session state
   const onSessionFinalize = () => {
-    if (activeSessionId && sessionManager) {
-      sessionManager.updateSession(activeSessionId, {
+    const finalizedSessionId = activeSessionId;
+    if (finalizedSessionId && sessionManager) {
+      sessionManager.updateSession(finalizedSessionId, {
         tokenCount: sessionTokens,
         status: "ended",
       });
+    }
+    const runtime = processSubagentRegistry.get(finalizedSessionId);
+    if (runtime) {
+      const pending = runtime.list().filter((task) =>
+        task.status === "queued" || task.status === "running" || task.status === "waiting_child",
+      );
+      void Promise.all(pending.map((task) => runtime.cancel(task.taskId, true)))
+        .finally(() => processSubagentRegistry.remove(finalizedSessionId));
     }
   };
 
@@ -622,6 +717,7 @@ async function main(): Promise<void> {
 
     const resumeSummary = loopState.resumeSummary ?? initialResumeSummary;
     initialResumeSummary = undefined; // only inject on first iteration
+    let stopRequiredTaskRouter: (() => void) | undefined;
 
     try {
       for await (const event of agentLoop({
@@ -641,6 +737,9 @@ async function main(): Promise<void> {
         switch (event.type) {
           case "turn_start":
             processing = true;
+            if (rl && !stopRequiredTaskRouter) {
+              stopRequiredTaskRouter = createRequiredTaskCommandRouter(rl, activeSessionId);
+            }
             break;
 
           case "text":
@@ -688,6 +787,8 @@ async function main(): Promise<void> {
       const message = err instanceof Error ? err.message : String(err);
       renderer.renderError(`Fatal: ${message}`);
       process.exit(1);
+    } finally {
+      stopRequiredTaskRouter?.();
     }
 
     // Finalize session if it was active
@@ -707,6 +808,13 @@ async function main(): Promise<void> {
   } while (loopState.shouldRestart);
 
   process.off("SIGINT", onSigInt);
+  for (const runtime of processSubagentRegistry.list()) {
+    for (const task of runtime.list()) {
+      if (task.status === "queued" || task.status === "running" || task.status === "waiting_child") {
+        await runtime.cancel(task.taskId, true);
+      }
+    }
+  }
   if (rl) rl.close();
   for (const cfg of mcpConfigs) {
     for (const toolName of disconnectMcpServer(cfg.name)) unregister(toolName);

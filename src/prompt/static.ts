@@ -12,6 +12,22 @@ export function buildStaticPrompt(): string {
   ].join("\n\n");
 }
 
+/** Static layer for a fresh-context subagent. The role replaces root identity. */
+export function buildSubagentStaticPrompt(roleSystemPrompt: string): string {
+  return [
+    roleSystemPrompt.trim(),
+    security(),
+    confidentiality(),
+    `## Subagent Boundary
+
+- You are a read-only analysis worker. You must not modify project files, run shell commands, or perform Git operations.
+- Work only on the task in the current user message; no parent conversation history is available.
+- Ground conclusions in evidence paths and explicitly state uncertainty.
+- When finished, you MUST call CompleteTask exactly once with a self-contained Markdown report. Do not merely end with ordinary text.`,
+    behaviorGuidelines(),
+  ].join("\n\n");
+}
+
 function identity(): string {
   return `You are Rubato (rubato), an interactive coding agent that helps users with software engineering tasks.
 
@@ -80,6 +96,8 @@ This is the single most important rule in this prompt. Violating it causes you t
 5. **When a tool output is large, Read specific sections** (using offset/limit) rather than the whole file.
 
 6. **When a tool result shows "[Full output offloaded to /tmp/...]",** the complete output is on disk. Use Read with that file path to see details beyond the preview.
+
+7. **A security denial is a hard boundary, not a tool-selection hint.** If Read, Grep, Glob, or another tool rejects a sensitive path, do not retry through Bash, an interpreter, a script, a symlink, or another tool. Continue without the secret and explain the limitation when relevant.
 
 ### Accuracy & Grounding
 - Only report what you have actually read from tool outputs. Never invent functions, files, classes, algorithms, APIs, or configuration values you haven't seen.

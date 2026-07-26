@@ -123,9 +123,12 @@ API Keys:
 
 REPL Commands:
   /exit, /quit         Exit the chat
+  /paste               Send the full clipboard as one prompt
   /clear               Start a fresh session (saves current)
   /sessions            List project sessions
   /sessions resume <n> Resume a past session
+  /scrub --dry-run     Audit persisted traces/sessions/artifacts for secrets
+  /scrub [path]        Redact secrets from persisted Rubato data
   /help                Show REPL help
   Ctrl+C               Interrupt output / Exit when idle
 
@@ -163,4 +166,3 @@ export function loadMcpConfigs(workingDir: string): McpServerConfig[] {
 
   return configs;
 }
-

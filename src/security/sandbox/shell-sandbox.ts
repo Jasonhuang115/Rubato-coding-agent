@@ -2,7 +2,14 @@
 // Detects dangerous metacharacters, command patterns, and enforces allowlists.
 
 import type { ISandbox, SandboxResult } from "./sandbox.js";
+import fs from "fs";
+import os from "os";
 import path from "path";
+import { FsSandbox } from "./fs-sandbox.js";
+import {
+  matchSensitivePath,
+  matchSensitiveShellReference,
+} from "./sensitive-paths.js";
 
 /** Command patterns that are always denied regardless of workspace. */
 const DANGEROUS_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
@@ -33,6 +40,9 @@ const COMMAND_CATEGORIES: Record<string, { mode: "safe" | "modify" | "network" |
   tail: { mode: "safe", command: /^tail\b/ },
   find: { mode: "safe", command: /^find\b/ },
   grep: { mode: "safe", command: /^grep\b/ },
+  rg: { mode: "safe", command: /^rg\b/ },
+  sed: { mode: "safe", command: /^sed\b/ },
+  awk: { mode: "safe", command: /^awk\b/ },
   wc: { mode: "safe", command: /^wc\b/ },
   file: { mode: "safe", command: /^file\b/ },
   pwd: { mode: "safe", command: /^pwd$/ },
@@ -76,6 +86,7 @@ const COMMAND_CATEGORIES: Record<string, { mode: "safe" | "modify" | "network" |
 
 export class ShellSandbox implements ISandbox {
   readonly name = "shell-sandbox";
+  private readonly fsSandbox = new FsSandbox();
 
   validate(toolName: string, input: Record<string, unknown>, workingDir: string): SandboxResult {
     if (toolName !== "Bash") return { allowed: true };
@@ -90,6 +101,9 @@ export class ShellSandbox implements ISandbox {
         return { allowed: false, reason: `Bash workdir must stay inside the workspace: "${requestedWorkdir}"` };
       }
     }
+    const effectiveWorkdir = requestedWorkdir
+      ? path.resolve(workingDir, requestedWorkdir)
+      : workingDir;
 
     // 1. Check dangerous patterns (hard blocklist)
     for (const { pattern, reason } of DANGEROUS_PATTERNS) {
@@ -108,7 +122,28 @@ export class ShellSandbox implements ISandbox {
     const segments = command.split(/(?:&&|\|\||;|\|)/).map((segment) => segment.trim()).filter(Boolean);
     const categories = segments.map((segment) => this.categorize(segment));
 
-    // 3. Network commands — require WebFetch/WebSearch tool instead
+    // 3. A shell is otherwise an alternate file reader. Apply the same
+    // sensitive-path and workspace boundary policy used by Read/Grep/Glob
+    // before the command is handed to a child process.
+    const sensitiveReference = matchSensitiveShellReference(command);
+    if (sensitiveReference) {
+      return {
+        allowed: false,
+        reason: `Sensitive path blocked in Bash command (${sensitiveReference.label}). ` +
+          "A security denial must not be bypassed with another command or interpreter.",
+      };
+    }
+    for (let index = 0; index < segments.length; index++) {
+      const pathResult = this.validateSegmentPaths(
+        segments[index],
+        categories[index],
+        effectiveWorkdir,
+        workingDir,
+      );
+      if (!pathResult.allowed) return pathResult;
+    }
+
+    // 4. Network commands — require WebFetch/WebSearch tool instead
     if (categories.includes("network")) {
       return {
         allowed: false,
@@ -116,7 +151,7 @@ export class ShellSandbox implements ISandbox {
       };
     }
 
-    // 4. Blocked commands
+    // 5. Blocked commands
     if (categories.includes("blocked")) {
       return { allowed: false, reason: `Command blocked by policy: "${command.slice(0, 80)}"` };
     }
@@ -132,4 +167,168 @@ export class ShellSandbox implements ISandbox {
     // Unknown commands default to blocked
     return "blocked";
   }
+
+  private validateSegmentPaths(
+    segment: string,
+    category: "safe" | "modify" | "network" | "blocked",
+    effectiveWorkdir: string,
+    workspaceRoot: string,
+  ): SandboxResult {
+    const words = tokenizeShellWords(segment);
+    if (words.length === 0) return { allowed: true };
+    const commandName = path.basename(words[0]).toLowerCase();
+
+    // Inline programs are intentionally not treated as a second unrestricted
+    // file-reading language. Normal scripts, builds and tests remain allowed.
+    if (
+      ["python", "python3", "node", "ruby", "perl", "bash", "sh", "zsh"].includes(commandName) &&
+      hasInlineProgram(words) &&
+      /\b(?:open|readFile(?:Sync)?|createReadStream|read_text|read_bytes|File\.read|IO\.read)\s*\(/i.test(segment)
+    ) {
+      return {
+        allowed: false,
+        reason:
+          "Inline interpreter filesystem reads are blocked in Bash. " +
+          "Use Read/Grep/Glob so the filesystem policy can validate the path.",
+      };
+    }
+
+    const directReader = [
+      "cat", "head", "tail", "sed", "awk", "grep", "rg", "wc", "file",
+      "less", "more", "strings", "xxd", "od",
+    ].includes(commandName);
+    const simpleReader = [
+      "cat", "head", "tail", "wc", "file", "less", "more", "strings", "xxd", "od",
+    ].includes(commandName);
+    if (
+      simpleReader &&
+      words.slice(1).some((word) =>
+        /(?:^|[^\\])\$(?:\{|[A-Za-z_])/.test(word) || /[*?[\]]/.test(word),
+      )
+    ) {
+      return {
+        allowed: false,
+        reason:
+          "Dynamic file paths are blocked for shell file-reading commands. " +
+          "Use Read/Grep/Glob with an explicit path.",
+      };
+    }
+    for (const candidate of potentialPathOperands(words.slice(1), effectiveWorkdir)) {
+      if (directReader && candidate.dynamic) {
+        return {
+          allowed: false,
+          reason:
+            "Dynamic file paths are blocked for shell file-reading commands. " +
+            "Use Read/Grep/Glob with an explicit path.",
+        };
+      }
+      const filePath = candidate.value;
+      const sensitive = matchSensitivePath(filePath, effectiveWorkdir);
+      if (sensitive) {
+        return {
+          allowed: false,
+          reason: `Sensitive path blocked in Bash command (${sensitive.label}). ` +
+            "A security denial must not be bypassed with another command or interpreter.",
+        };
+      }
+      const concretePath = path.isAbsolute(filePath)
+        ? path.resolve(filePath)
+        : path.resolve(effectiveWorkdir, filePath);
+      const result = this.fsSandbox.validate(
+        category === "safe" ? "Read" : "Write",
+        { file_path: concretePath },
+        workspaceRoot,
+      );
+      if (!result.allowed) {
+        return {
+          allowed: false,
+          reason: `Bash path blocked by filesystem policy: ${result.reason ?? "path denied"}`,
+        };
+      }
+    }
+    return { allowed: true };
+  }
+}
+
+function hasInlineProgram(words: string[]): boolean {
+  return words.some((word) =>
+    word === "-c" ||
+    word === "-e" ||
+    word === "--eval" ||
+    word.startsWith("-c=") ||
+    word.startsWith("-e=") ||
+    word.startsWith("--eval="),
+  );
+}
+
+function tokenizeShellWords(command: string): string[] {
+  const words: string[] = [];
+  let current = "";
+  let quote: "'" | "\"" | undefined;
+  let escaped = false;
+  for (const char of command) {
+    if (escaped) {
+      current += char;
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (char === quote) quote = undefined;
+      else current += char;
+      continue;
+    }
+    if (char === "'" || char === "\"") {
+      quote = char;
+      continue;
+    }
+    if (/\s/.test(char)) {
+      if (current) words.push(current);
+      current = "";
+      continue;
+    }
+    if (char === ">" || char === "<") {
+      if (current) words.push(current);
+      words.push(char);
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+  if (escaped) current += "\\";
+  if (current) words.push(current);
+  return words;
+}
+
+function potentialPathOperands(
+  operands: string[],
+  workingDir: string,
+): Array<{ value: string; dynamic: boolean }> {
+  const candidates: Array<{ value: string; dynamic: boolean }> = [];
+  for (const operand of operands) {
+    if (!operand || operand === ">" || operand === "<" || operand === ">>" || operand === "<<") continue;
+    let value = operand;
+    const equals = value.indexOf("=");
+    if (value.startsWith("-") && equals < 0) continue;
+    if (equals >= 0) value = value.slice(equals + 1);
+    if (!value || /^(?:https?|git|ssh):\/\//i.test(value)) continue;
+
+    const dynamic = /(?:^|[^\\])\$(?:\{|[A-Za-z_])/.test(value) || /[*?[\]]/.test(value);
+    if (value.startsWith("~/")) {
+      value = path.join(os.homedir(), value.slice(2));
+    }
+    const resolved = path.isAbsolute(value) ? path.resolve(value) : path.resolve(workingDir, value);
+    const pathLike =
+      path.isAbsolute(value) ||
+      value.startsWith("./") ||
+      value.startsWith("../") ||
+      value.includes("/") ||
+      Boolean(matchSensitivePath(value, workingDir)) ||
+      fs.existsSync(resolved);
+    if (pathLike) candidates.push({ value, dynamic });
+  }
+  return candidates;
 }

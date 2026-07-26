@@ -28,6 +28,11 @@ export const globTool: ToolDefinition = {
         type: "number",
         description: `Maximum results to return (default: ${MAX_RESULTS})`,
       },
+      include_hidden: {
+        type: "boolean",
+        description:
+          "Include dotfiles and hidden directories. Exhaustive discovery must set this to true.",
+      },
     },
     required: ["pattern"],
   },
@@ -38,19 +43,32 @@ export const globTool: ToolDefinition = {
     const pattern = input.pattern as string;
     const searchPath = resolveToolPath((input.path as string) ?? ".", ctx.workingDir);
     const maxResults = (input.max_results as number) ?? MAX_RESULTS;
+    const includeHidden = input.include_hidden === true;
 
     // Ensure the search path exists
     if (!fs.existsSync(searchPath)) {
       return { content: `Path not found: ${searchPath}`, isError: true };
     }
 
-    const results = await globWalk(searchPath, pattern, maxResults);
-
-    if (results.length === 0) {
-      return { content: `No files matching "${pattern}" in ${searchPath}` };
+    let walkResult: GlobWalkResult;
+    try {
+      walkResult = await globWalk(
+        searchPath,
+        pattern,
+        maxResults,
+        includeHidden,
+        ctx.abortSignal,
+      );
+    } catch (error) {
+      if (ctx.abortSignal?.aborted) {
+        return { content: "Glob cancelled.", isError: true };
+      }
+      throw error;
     }
 
-    const truncated = results.length >= maxResults;
+    const { results, skipped, policyExclusions, reachedLimit } = walkResult;
+
+    const truncated = reachedLimit;
     const output =
       results
         .map((f) => {
@@ -62,46 +80,102 @@ export const globTool: ToolDefinition = {
         })
         .join("\n");
 
-    const header = `${results.length} file${results.length === 1 ? "" : "s"} matching "${pattern}" in ${searchPath}${truncated ? ` (limited to ${maxResults})` : ""}:\n\n`;
+    const header = results.length === 0
+      ? `No files matching "${pattern}" in ${searchPath}`
+      : `${results.length} file${results.length === 1 ? "" : "s"} matching "${pattern}" in ${searchPath}${truncated ? ` (limited to ${maxResults})` : ""}:\n\n${output}`;
+    const diagnostics = [
+      ...policyExclusions.map((entry) =>
+        `Glob policy exclusion: ${entry.path} (${entry.reason})`),
+      ...skipped.map((entry) =>
+        `Glob incomplete: skipped ${entry.path} (${entry.reason})`),
+    ];
 
-    return { content: header + output };
+    return {
+      content: [header, diagnostics.join("\n")].filter(Boolean).join("\n\n"),
+    };
   },
 };
+
+interface GlobWalkResult {
+  results: string[];
+  skipped: Array<{ path: string; reason: string }>;
+  policyExclusions: Array<{ path: string; reason: string }>;
+  reachedLimit: boolean;
+}
 
 async function globWalk(
   root: string,
   pattern: string,
-  maxResults: number
-): Promise<string[]> {
+  maxResults: number,
+  includeHidden: boolean,
+  signal?: AbortSignal,
+): Promise<GlobWalkResult> {
   const results: string[] = [];
+  const skipped: GlobWalkResult["skipped"] = [];
+  const policyExclusions: GlobWalkResult["policyExclusions"] = [];
+  let reachedLimit = false;
 
   // Convert glob to regex for matching
   const regex = globToRegex(pattern);
 
   async function walk(dir: string) {
-    if (results.length >= maxResults) return;
+    if (signal?.aborted) throw signal.reason ?? new Error("Glob cancelled");
+    if (results.length >= maxResults) {
+      reachedLimit = true;
+      return;
+    }
 
     let entries: fs.Dirent[];
     try {
       entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return; // Skip inaccessible directories
+    } catch (error) {
+      skipped.push({
+        path: dir,
+        reason: error instanceof Error ? error.message : "directory is inaccessible",
+      });
+      return;
     }
 
     for (const entry of entries) {
-      if (results.length >= maxResults) break;
+      if (signal?.aborted) throw signal.reason ?? new Error("Glob cancelled");
+      if (results.length >= maxResults) {
+        reachedLimit = true;
+        break;
+      }
 
       const fullPath = path.join(dir, entry.name);
       const relPath = path.relative(root, fullPath);
 
-      // Skip hidden files/dirs by default (unless pattern explicitly starts with .)
-      if (entry.name.startsWith(".") && !pattern.startsWith(".")) continue;
+      if (entry.name === "node_modules" || entry.name === ".git") {
+        policyExclusions.push({
+          path: fullPath,
+          reason: entry.name === ".git"
+            ? "Git metadata is excluded by policy."
+            : "Dependency directories are excluded by policy.",
+        });
+        continue;
+      }
+      if (entry.name.startsWith(".") && !includeHidden) continue;
 
-      // Skip node_modules
-      if (entry.name === "node_modules") continue;
-
-      // Skip .git
-      if (entry.name === ".git") continue;
+      if (entry.isSymbolicLink()) {
+        let target: fs.Stats;
+        try {
+          target = fs.statSync(fullPath);
+        } catch (error) {
+          skipped.push({
+            path: fullPath,
+            reason: error instanceof Error ? error.message : "symbolic link target is inaccessible",
+          });
+          continue;
+        }
+        if (target.isDirectory()) {
+          skipped.push({
+            path: fullPath,
+            reason: "symbolic-link directories are not traversed",
+          });
+          continue;
+        }
+      }
 
       // Match against pattern
       if (regex.test(relPath) || regex.test(entry.name)) {
@@ -129,19 +203,26 @@ async function globWalk(
     return a.localeCompare(b);
   });
 
-  return results.slice(0, maxResults);
+  return {
+    results: results.slice(0, maxResults),
+    skipped,
+    policyExclusions,
+    reachedLimit,
+  };
 }
 
 function globToRegex(glob: string): RegExp {
   // Simple glob to regex conversion
   let pattern = glob
     .replace(/\./g, "\\.")
+    .replace(/\*\*\//g, "<<GLOBSTAR_DIR>>")
     .replace(/\*\*/g, "<<GLOBSTAR>>")
     .replace(/\*/g, "[^/]*")
-    .replace(/<<GLOBSTAR>>/g, ".*")
     .replace(/\?/g, "[^/]")
     .replace(/\[([^\]]+)\]/g, "[$1]")
-    .replace(/\{([^}]+)\}/g, (_, p1) => `(${p1.split(",").join("|")})`);
+    .replace(/\{([^}]+)\}/g, (_, p1) => `(${p1.split(",").join("|")})`)
+    .replace(/<<GLOBSTAR_DIR>>/g, "(?:.*/)?")
+    .replace(/<<GLOBSTAR>>/g, ".*");
 
   return new RegExp(`^${pattern}$|/${pattern}$`);
 }

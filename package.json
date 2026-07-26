@@ -5,8 +5,14 @@
   "type": "module",
   "main": "dist/cli/entry.js",
   "bin": {
-    "rubato": "dist/cli/entry.js"
+    "rubato": "bin/rubato"
   },
+  "files": [
+    "dist",
+    "bin",
+    "README.md",
+    ".env.example"
+  ],
   "scripts": {
     "build": "tsc",
     "dev": "tsx src/cli/entry.ts",

@@ -356,7 +356,10 @@ export async function compactViaSubagent(
       config,
     );
 
-    if (result.status !== "completed" || !result.output) {
+    if (
+      (result.status !== "completed" && result.status !== "partial") ||
+      !result.output
+    ) {
       // Fallback to string-based microCompact
       return microCompact(messages, keepRecent);
     }

@@ -4,6 +4,7 @@ import { spawn } from "child_process";
 import path from "path";
 import type { ToolDefinition } from "../shared/core-types.js";
 import { EnvSandbox } from "../security/sandbox/env-sandbox.js";
+import { stripAnsi } from "../shared/text.js";
 
 const DEFAULT_TIMEOUT_MS = 120_000; // 2 minutes
 const MAX_TIMEOUT_MS = 600_000; // 10 minutes
@@ -98,7 +99,7 @@ export const bashTool: ToolDefinition = {
         }
 
         resolve({
-          content,
+          content: stripAnsi(content),
           isError: killed || (code !== 0 && code !== null),
         });
       });

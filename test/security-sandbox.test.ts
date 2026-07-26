@@ -214,9 +214,15 @@ describe("FsSandbox path traversal", () => {
     expect(r.allowed).toBe(true);
   });
 
-  it("allows reading Rubato subagent artifacts", () => {
-    expect(check("/tmp/rubato-subagent-session-sub-1234.md").allowed).toBe(true);
-    expect(check("/tmp/rubato-subagent-session-sub-1234.transcript.md").allowed).toBe(true);
+  it("allows reading managed Rubato artifacts but not writing them", () => {
+    const previous = process.env.RUBATO_HOME;
+    process.env.RUBATO_HOME = "/tmp/test-rubato-home";
+    const report = "/tmp/test-rubato-home/projects/abc/runs/session/tasks/task-1/report.md";
+    expect(check(report).allowed).toBe(true);
+    expect(check("/tmp/test-rubato-home/projects/abc/runs/session/trace.jsonl").allowed).toBe(true);
+    expect(sandbox.validate("Write", { file_path: report }, WS).allowed).toBe(false);
+    if (previous === undefined) delete process.env.RUBATO_HOME;
+    else process.env.RUBATO_HOME = previous;
   });
 
   it("allows reading offloaded Rubato tool results", () => {
@@ -227,6 +233,12 @@ describe("FsSandbox path traversal", () => {
     expect(check("/tmp/unrelated.txt").allowed).toBe(false);
     expect(check("/tmp/rubato-tool-results/../secret.txt").allowed).toBe(false);
     expect(sandbox.validate("Write", { file_path: "/tmp/rubato-tool-results/fake.txt" }, WS).allowed).toBe(false);
+  });
+
+  it("enforces workspace boundaries for Grep and Glob paths", () => {
+    expect(sandbox.validate("Grep", { pattern: "x", path: "/etc" }, WS).allowed).toBe(false);
+    expect(sandbox.validate("Glob", { pattern: "**/*", path: "/tmp" }, WS).allowed).toBe(false);
+    expect(sandbox.validate("Grep", { pattern: "x", path: `${WS}/src` }, WS).allowed).toBe(true);
   });
 });
 

@@ -16,8 +16,11 @@ import type { ReadGuardState } from "../shared/core-types.js";
 // ---- Configuration ----
 
 const AUTOCOMPACT_BUFFER = 20_000;
-const COMPACT_KEEP_RECENT = 120;
+const ROOT_COMPACT_KEEP_RECENT = 60;
+const SUBAGENT_COMPACT_KEEP_RECENT = 24;
 const MAX_COMPACTION_FAILURES = 3;
+const ROOT_COMPACTION_CEILING = 240_000;
+const SUBAGENT_COMPACTION_CEILING = 120_000;
 
 // ---- Public API ----
 
@@ -61,7 +64,10 @@ export async function checkAndCompact(
   }
 
   const approxTokens = estimateMessageTokens(messages) + systemTokens;
-  const threshold = getAutoCompactThreshold(model);
+  const threshold = getAutoCompactThreshold(model, Boolean(ctx.taskRuntime));
+  const keepRecent = ctx.taskRuntime
+    ? SUBAGENT_COMPACT_KEEP_RECENT
+    : ROOT_COMPACT_KEEP_RECENT;
 
   if (!forceCompact && approxTokens <= threshold) {
     return { compacted: false, messages, disableAutoCompact: false };
@@ -72,7 +78,7 @@ export async function checkAndCompact(
     : `~${Math.round(approxTokens / 1000)}K / ${Math.round(threshold / 1000)}K tokens (${model})`;
 
   try {
-    const compacted = await compactViaSubagent(messages, ctx, config, COMPACT_KEEP_RECENT);
+    const compacted = await compactViaSubagent(messages, ctx, config, keepRecent);
 
     // Post-compact restoration: inject recently accessed files
     const snapshot = readGuard.serialize();
@@ -100,7 +106,7 @@ export async function checkAndCompact(
       return {
         compacted: true,
         reason: `Compaction failed ${newFailures} times — disabling auto-compaction.`,
-        messages: microCompact(messages, COMPACT_KEEP_RECENT),
+        messages: microCompact(messages, keepRecent),
         disableAutoCompact: true,
       };
     }
@@ -108,7 +114,7 @@ export async function checkAndCompact(
     return {
       compacted: true,
       reason: `Compaction failed (${newFailures}/${MAX_COMPACTION_FAILURES}) — falling back to string-based.`,
-      messages: microCompact(messages, COMPACT_KEEP_RECENT),
+      messages: microCompact(messages, keepRecent),
       disableAutoCompact: false,
     };
   }
@@ -196,6 +202,10 @@ function getEffectiveContextWindow(model: string): number {
   return CONTEXT_WINDOWS[model] ?? 128_000;
 }
 
-function getAutoCompactThreshold(model: string): number {
-  return getEffectiveContextWindow(model) - AUTOCOMPACT_BUFFER;
+export function getAutoCompactThreshold(model: string, isSubagent = false): number {
+  const providerLimit = getEffectiveContextWindow(model) - AUTOCOMPACT_BUFFER;
+  const operatingCeiling = isSubagent
+    ? SUBAGENT_COMPACTION_CEILING
+    : ROOT_COMPACTION_CEILING;
+  return Math.min(providerLimit, operatingCeiling);
 }

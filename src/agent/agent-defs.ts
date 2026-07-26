@@ -31,16 +31,38 @@ function parseAgentFile(filePath: string): SubagentDefinition | null {
   if (!fName || !fDesc) return null;
 
   const systemPrompt = content.slice(endIdx + 3).trim() || `You are the "${fName}" agent. ${fDesc}`;
+  const declaredTools = Array.isArray(fm.tools)
+    ? fm.tools.filter((tool): tool is string => typeof tool === "string")
+    : ["Read", "Grep", "Glob"];
+  const safeTools = sanitizeCustomTools(declaredTools);
+  const stripped = declaredTools.includes("*")
+    ? ["* (restricted to readonly defaults)"]
+    : declaredTools.filter((tool) => !safeTools.includes(tool));
+  if (stripped.length > 0 || fm.readonly === false || fm.canSpawn === true) {
+    console.warn(
+      `Custom agent "${fName}" was restricted to read-only, non-recursive tools. ` +
+      `Removed: ${stripped.join(", ") || "write/recursion flags"}.`,
+    );
+  }
 
   return {
     name: fName,
     description: fDesc,
     systemPrompt,
-    tools: (fm.tools as string[]) ?? ["*"],
+    // Custom agents are always read-only and non-recursive. Unsafe legacy
+    // declarations are stripped again by resolveSubagentTools at runtime.
+    tools: safeTools,
     model: (fm.model as string) ?? "inherit",
-    readonly: (fm.readonly as boolean) ?? false,
-    maxTurns: (fm.maxTurns as number) ?? 15,
+    readonly: true,
+    canSpawn: false,
+    maxTurns: (fm.maxTurns as number) || undefined,
   };
+}
+
+function sanitizeCustomTools(tools: string[]): string[] {
+  const allowed = new Set(["Read", "Grep", "Glob", "WebFetch", "WebSearch"]);
+  if (tools.includes("*")) return ["Read", "Grep", "Glob"];
+  return tools.filter((tool) => allowed.has(tool));
 }
 
 export function parseSimpleYaml(yaml: string): Record<string, unknown> {
@@ -74,7 +96,9 @@ export function initCustomDefinitions(projectDir: string): void {
 
 export async function getAllDefinitions(): Promise<SubagentDefinition[]> {
   const { getBuiltinDefinition } = await import("./subagent.js");
-  return ["explore", "general", "verify"].map((n) => getBuiltinDefinition(n)).concat(customDefs);
+  return ["explore", "research", "general", "verify"]
+    .map((n) => getBuiltinDefinition(n))
+    .concat(customDefs);
 }
 
 export async function findDefinition(name: string): Promise<SubagentDefinition | null> {

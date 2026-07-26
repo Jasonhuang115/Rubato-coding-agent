@@ -49,7 +49,7 @@ export const webFetchTool: ToolDefinition = {
   type: "read",
   requiresApproval: true,
   isConcurrencySafe: true,
-  async handler(input) {
+  async handler(input, ctx) {
     const url = (input.url as string).trim();
     const prompt = input.prompt as string;
 
@@ -62,6 +62,9 @@ export const webFetchTool: ToolDefinition = {
     }
 
     const controller = new AbortController();
+    const onParentAbort = () => controller.abort(ctx.abortSignal?.reason);
+    ctx.abortSignal?.addEventListener("abort", onParentAbort, { once: true });
+    if (ctx.abortSignal?.aborted) controller.abort(ctx.abortSignal.reason);
     const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
     try {
@@ -132,7 +135,9 @@ export const webFetchTool: ToolDefinition = {
       const message = err instanceof Error ? err.message : String(err);
       if (err instanceof Error && err.name === "AbortError") {
         return {
-          content: `Request timed out after ${FETCH_TIMEOUT_MS / 1000}s: ${fetchUrl}`,
+          content: ctx.abortSignal?.aborted
+            ? `Request cancelled: ${fetchUrl}`
+            : `Request timed out after ${FETCH_TIMEOUT_MS / 1000}s: ${fetchUrl}`,
           isError: true,
         };
       }
@@ -140,6 +145,9 @@ export const webFetchTool: ToolDefinition = {
         content: `Fetch failed for ${fetchUrl}: ${message}`,
         isError: true,
       };
+    } finally {
+      clearTimeout(timer);
+      ctx.abortSignal?.removeEventListener("abort", onParentAbort);
     }
   },
 };
@@ -186,7 +194,7 @@ export const webSearchTool: ToolDefinition = {
   type: "read",
   requiresApproval: true,
   isConcurrencySafe: true,
-  async handler(input) {
+  async handler(input, ctx) {
     const query = input.query as string;
     const maxResults = Math.min((input.max_results as number) ?? 5, 10);
     const searchDepth =
@@ -207,6 +215,9 @@ export const webSearchTool: ToolDefinition = {
     }
 
     const controller = new AbortController();
+    const onParentAbort = () => controller.abort(ctx.abortSignal?.reason);
+    ctx.abortSignal?.addEventListener("abort", onParentAbort, { once: true });
+    if (ctx.abortSignal?.aborted) controller.abort(ctx.abortSignal.reason);
     const timer = setTimeout(() => controller.abort(), 20_000);
 
     try {
@@ -272,7 +283,9 @@ export const webSearchTool: ToolDefinition = {
       const message = err instanceof Error ? err.message : String(err);
       if (err instanceof Error && err.name === "AbortError") {
         return {
-          content: `Search timed out for query: "${query}"`,
+          content: ctx.abortSignal?.aborted
+            ? `Search cancelled for query: "${query}"`
+            : `Search timed out for query: "${query}"`,
           isError: true,
         };
       }
@@ -280,6 +293,9 @@ export const webSearchTool: ToolDefinition = {
         content: `Search failed for "${query}": ${message}`,
         isError: true,
       };
+    } finally {
+      clearTimeout(timer);
+      ctx.abortSignal?.removeEventListener("abort", onParentAbort);
     }
   },
 };

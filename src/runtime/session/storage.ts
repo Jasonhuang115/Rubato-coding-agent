@@ -6,6 +6,7 @@ import fs from "fs";
 import path from "path";
 import { warnRecoverable } from "../../shared/diagnostics.js";
 import type { SessionMeta, SessionRecord } from "../../shared/core-types.js";
+import { redactValue } from "../../agent/subagents/redaction.js";
 
 function getSessionDir(projectHash?: string): string {
   if (projectHash) {
@@ -32,9 +33,10 @@ export class SessionStore {
   }
 
   append(record: SessionRecord): void {
-    this.records.push(record);
+    const safeRecord = redactValue(record) as SessionRecord;
+    this.records.push(safeRecord);
     if (this.initialized) {
-      fs.appendFileSync(this.filePath, JSON.stringify(record) + "\n", "utf-8");
+      fs.appendFileSync(this.filePath, JSON.stringify(safeRecord) + "\n", "utf-8");
     }
   }
 
@@ -98,7 +100,7 @@ export function loadSession(sessionId: string, baseDir?: string): SessionRecord[
     const trimmed = line.trim();
     if (!trimmed) continue;
     try {
-      records.push(JSON.parse(trimmed));
+      records.push(redactValue(JSON.parse(trimmed)) as SessionRecord);
     } catch (error) {
       warnRecoverable(`session:${sessionId}:malformed-record`, error);
     }

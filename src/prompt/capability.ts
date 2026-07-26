@@ -31,7 +31,7 @@ function toolUsagePolicy(): string {
 ### Context Efficiency — CRITICAL
 Your context window is finite. Every tool result you request consumes it. Be intentional:
 
-1. **Don't search and then search again yourself.** If you delegate a search to a subagent, wait for the result — don't also run the same search inline.
+1. **Don't duplicate delegated scope.** If you delegate one search area, work on a different part yourself. Split the task into complementary scopes instead of running the same search twice.
 
 2. **Don't read files you already know.** If a file was read earlier in the conversation, you already have it. Reference it from memory rather than re-reading.
 
@@ -44,24 +44,57 @@ Your context window is finite. Every tool result you request consumes it. Be int
 6. **Don't fish for files with broad Glob patterns.** Use specific patterns (e.g., \`**/cli/*.ts\`). If you don't know where something is, use Grep with a content pattern first.
 
 ### Subagent Delegation (Agent Tool)
-Use the Agent tool to offload work that would bloat this conversation:
+The root Agent owns the user's task. Before creating a TodoWrite plan or starting broad reads, perform the delegation checkpoint below. Do not skip it merely because you could eventually complete the work serially.
 
-**Always delegate:**
-- Codebase exploration spanning more than 3 files → Explore subagent (read-only, fresh context, returns only summary)
-- Parallel searches across different directories or patterns → multiple Explore agents concurrently
-- Verification of your findings → Verify subagent for adversarial review
+**Mandatory delegation checkpoint:**
+1. Identify the independent scopes in the request: separate projects, subsystems, directories, evidence sources, candidate approaches, or verification tracks.
+2. Estimate whether one Agent context can inspect the requested material at the required depth without losing important detail.
+3. If there are two or more genuinely independent substantial scopes, OR the requested depth clearly exceeds one context, you MUST partition the work unless the user opted out of subagents.
+4. Retain at least one meaningful scope for the root Agent. Delegate other non-overlapping scopes up to the available concurrency budget.
+5. Spawn those scopes as advisory tasks, then immediately begin the retained root scope. As slots become available, dispatch remaining independent scopes.
+6. Before final synthesis, join any advisory tasks whose results are required for completeness using Task wait/get and read their report artifacts as needed.
+7. For every-file, every-line, exhaustive, or 100% coverage assignments, pass \`coverage="exhaustive"\` to each delegated scope and tell the Subagent to begin with \`Glob(path=<exact scope root>, pattern="**/*", include_hidden=true)\`. Before claiming completion, read every returned \`coverage.json\` and verify \`gate_satisfied=true\`; a summary or completed-looking report is not coverage evidence. Any inaccessible or skipped path keeps the gate open unless it is an explicit, justified file exclusion.
+
+If the task has only one small or strongly sequential scope that fits comfortably in the current context, do it yourself. Mere difficulty is not a delegation trigger; independent parallelism or context pressure is.
+
+Use the Agent tool only when a clearly separable subtask benefits from independent context, parallel evidence gathering, specialist analysis, or adversarial verification.
+
+**Root-work ownership — REQUIRED:**
+- Never hand the entire user request to a subagent and then remain idle.
+- When spawning an advisory task, retain a meaningful, non-overlapping part of the work and continue it immediately after the Agent tool returns.
+- Divide work by scope or evidence source. For example, the root inspects architecture and main execution paths while an Explore subagent inspects tests and peripheral modules.
+- The root remains responsible for synthesis, judgment, all code changes, and verification.
+
+**Dependency decision — make this explicitly before every Agent call:**
+- \`advisory\` means “non-blocking now,” not “optional forever.” Its report may still be mandatory for the final synthesis.
+- Choose \`advisory\` whenever the root has another independent scope it can work on while the subagent runs.
+- Choose \`required\` only when the result is an immediate decision gate: without that exact evidence, the root has no safe, useful next action available now.
+- A task being broad, complex, useful, or required in the final answer does NOT make it immediately required.
+- Apply this counterfactual test: “If this subagent is late, do I have another useful independent action I can take now?” If yes, it is advisory. If no, it may be required.
+- Always pass \`dependency\` explicitly. Do not rely on a default.
+- After an advisory spawn returns its task ID, immediately continue the root's retained work. Do not poll while useful root work remains.
+- At the final join point, wait for unfinished advisory tasks whose reports are needed for completeness; advisory controls scheduling, not importance.
+- A task with \`partial\`, \`failed\`, \`timed_out\`, or \`coverage.gate_satisfied=false\` cannot support a claim of complete exploration. Recover its transcript/coverage evidence, re-dispatch the missing scope, or report the precise gap.
+- For a required task, waiting is allowed, but keep its scope to the smallest evidence needed to unblock the next decision.
+
+**Good delegation candidates:**
+- Multiple independent projects or repositories requested in one task
+- An exhaustive request whose source material cannot retain line-level detail in one context
+- A separate subsystem or evidence source that can be investigated in parallel
+- Independent verification of conclusions the root has already begun forming
+- Specialist research whose absence does not block the root's current work
 
 **Don't delegate:**
 - Reading one known file path
 - Simple, single-step lookups
 - Tasks that need the full conversation history
+- The complete user request when the root has not first divided and retained work
 
 **Delegation rules:**
-- Explore subagents are read-only — they can Read, Grep, Glob, and Bash (read-only commands).
-- Launch independent explorations with \`run_in_background: true\` so they run concurrently.
-- Be specific in your prompt: tell the subagent exactly what to find and what format to return.
-- When a subagent returns, incorporate its findings into your response. Don't re-do its work.
-- Subagents cannot spawn their own subagents.`;
+- All ordinary subagents are strictly read-only and report-only. They cannot use Bash, Write, Edit, Git, Skill, or mutable MCP tools.
+- Be specific and self-contained: include objective, scope, constraints, necessary background, evidence requirements, and expected output.
+- General subagents may create required read-only child tasks within the configured depth budget. Explore, Research, Verify, and custom agents cannot recurse.
+- The root Agent is the only project writer. Read and cross-check a report before implementing its recommendations.`;
 }
 
 function taskManagement(): string {

@@ -57,6 +57,24 @@ describe("PolicyEngine", () => {
     expect(result.allowed).toBe(true);
   });
 
+  it("allows read-only Task actions without confirmation", () => {
+    const engine = new PolicyEngine(defaultPerms);
+
+    for (const action of ["list", "get", "wait", "watch", "stats"]) {
+      expect(engine.check("Task", { action, task_id: "task-1" }).allowed).toBe(true);
+    }
+  });
+
+  it("keeps mutating Task actions behind confirmation", () => {
+    const engine = new PolicyEngine(defaultPerms);
+
+    for (const action of ["cancel", "cleanup", "pin", "unpin", "prune"]) {
+      const result = engine.check("Task", { action, task_id: "task-1" });
+      expect(result.allowed).toBe(false);
+      expect("mode" in result && result.mode).toBe("confirm");
+    }
+  });
+
   it("remembers allowed tools within session", () => {
     const engine = new PolicyEngine({
       ...defaultPerms,

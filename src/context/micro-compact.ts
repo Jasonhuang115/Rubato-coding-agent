@@ -27,11 +27,19 @@ const COMPACTABLE_TOOLS = new Set([
 const CLEARED_MESSAGE = "[Old tool result content cleared]";
 
 /** If the last assistant message is more than this many messages ago,
- *  stale tool result clearing is triggered. */
+ * stale tool result clearing is triggered even for a short history. */
 const DEFAULT_GAP_MESSAGES = 20;
 
 /** Number of most recent compactable tool results to keep. */
 const DEFAULT_KEEP_RECENT = 5;
+
+/**
+ * Bound live heavyweight tool results across turns. The old implementation
+ * only looked at messages after the latest assistant message, so a common
+ * one-read-per-turn exploration never compacted and resent every prior file
+ * on every model request.
+ */
+const DEFAULT_MAX_LIVE_RESULTS = 12;
 
 // ---- Public API ----
 
@@ -57,24 +65,30 @@ export function microCompactBeforeRequest(
   messages: Message[],
   gapMessages: number = DEFAULT_GAP_MESSAGES,
   keepRecent: number = DEFAULT_KEEP_RECENT,
+  maxLiveResults: number = DEFAULT_MAX_LIVE_RESULTS,
 ): MicroCompactResult {
   // 1. Find the last assistant message position
   const lastAssistantIdx = findLastAssistantIndex(messages);
   if (lastAssistantIdx < 0) return { messages, cleared: 0 };
 
-  // 2. Check position-based gap: how many messages since last assistant?
+  // 2. Collect compactable results which have not already been cleared.
+  // Looking at live results rather than all tool_use blocks makes this
+  // operation idempotent and lets it bound cross-turn accumulation.
+  const liveCompactableIds = collectLiveCompactableToolIds(messages);
+  if (liveCompactableIds.length === 0) return { messages, cleared: 0 };
+
+  // 3. Trigger either for a burst of tool results in one turn or when the
+  // cross-turn live-result budget is exceeded.
   const messagesSinceAssistant = messages.length - 1 - lastAssistantIdx;
-  if (messagesSinceAssistant < gapMessages) {
+  const hasLongCurrentGap = messagesSinceAssistant >= gapMessages;
+  const exceedsLiveBudget = liveCompactableIds.length > Math.max(keepRecent, maxLiveResults);
+  if (!hasLongCurrentGap && !exceedsLiveBudget) {
     return { messages, cleared: 0 };
   }
 
-  // 3. Collect compactable tool_use IDs in encounter order
-  const compactableIds = collectCompactableToolIds(messages);
-  if (compactableIds.length === 0) return { messages, cleared: 0 };
-
-  // 4. Keep the most recent N, clear the rest
-  const keepSet = new Set(compactableIds.slice(-Math.max(1, keepRecent)));
-  const clearSet = new Set(compactableIds.filter((id) => !keepSet.has(id)));
+  // 4. Keep the most recent N live results and clear the rest.
+  const keepSet = new Set(liveCompactableIds.slice(-Math.max(1, keepRecent)));
+  const clearSet = new Set(liveCompactableIds.filter((id) => !keepSet.has(id)));
 
   if (clearSet.size === 0) return { messages, cleared: 0 };
 
@@ -134,4 +148,26 @@ function collectCompactableToolIds(messages: Message[]): string[] {
     }
   }
   return ids;
+}
+
+function collectLiveCompactableToolIds(messages: Message[]): string[] {
+  const compactableIds = collectCompactableToolIds(messages);
+  if (compactableIds.length === 0) return [];
+  const compactableSet = new Set(compactableIds);
+  const liveIds = new Set<string>();
+
+  for (const msg of messages) {
+    if (msg.role !== "user" || typeof msg.content === "string") continue;
+    for (const block of msg.content) {
+      if (
+        block.type === "tool_result" &&
+        compactableSet.has(block.tool_use_id) &&
+        block.content !== CLEARED_MESSAGE
+      ) {
+        liveIds.add(block.tool_use_id);
+      }
+    }
+  }
+
+  return compactableIds.filter((id) => liveIds.has(id));
 }

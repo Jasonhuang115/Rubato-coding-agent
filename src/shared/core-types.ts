@@ -51,14 +51,11 @@ export interface ToolDefinition {
 export interface ToolResult {
   content: string;
   isError?: boolean;
+  /** Runtime-only control signal. It is never serialized as a normal tool result. */
+  control?: TaskCompletionControl;
 }
 
 // ---- Agent context (passed to every tool) ----
-
-export interface BudgetManager {
-  tryAllocate(depth: number): { allowed: boolean; reason?: string };
-  releaseAgent(): void;
-}
 
 export interface AgentContext {
   workingDir: string;
@@ -69,8 +66,10 @@ export interface AgentContext {
   planManager?: PlanManager;
   /** Recursion depth. 0 = root agent. */
   depth: number;
-  /** Global resource budget shared across the agent tree. */
-  budgetManager?: BudgetManager;
+  /** Present only while a managed subagent task is running. */
+  taskRuntime?: SubagentRuntimeContext;
+  /** Per-agent cancellation signal. */
+  abortSignal?: AbortSignal;
 }
 
 export interface PlanManager {
@@ -127,6 +126,7 @@ export interface AgentConfig {
   session: {
     cleanupPeriodDays: number;
   };
+  subagents?: Partial<SubagentLimits>;
 }
 
 export type PermissionMode = "auto" | "confirm" | "manual";
@@ -259,17 +259,206 @@ export interface SubagentDefinition {
   canSpawn?: boolean;
 }
 
-export interface SubagentResult {
-  status: "completed" | "failed" | "timeout" | "budget_exceeded";
+export type SubagentDependency = "advisory" | "required";
+
+export type SubagentTaskStatus =
+  | "queued"
+  | "running"
+  | "waiting_child"
+  | "completed"
+  | "partial"
+  | "blocked"
+  | "failed"
+  | "timed_out"
+  | "cancelled"
+  | "orphaned";
+
+export interface SubagentLimits {
+  maxConcurrent: number;
+  maxTasksPerSession: number;
+  maxDepth: number;
+  stallTimeoutMs: number;
+  hardTimeoutMs: number;
+  maxTurns?: number;
+  artifactTtlDays: number;
+  artifactSoftLimitBytes: number;
+}
+
+export interface AgentTaskInput {
+  description: string;
+  prompt: string;
+  subagent_type?: string;
+  dependency?: SubagentDependency;
+  model?: string;
+  timeout_ms?: number;
+  /**
+   * `exhaustive` enables a runtime-enforced file/line coverage gate.
+   * `auto` (the default) also enables it when the task wording promises
+   * exhaustive or every-line inspection.
+   */
+  coverage?: "auto" | "exhaustive";
+}
+
+export interface CompleteTaskInput {
+  status: "completed" | "partial" | "blocked";
+  summary: string;
+  report_markdown: string;
+  key_files?: string[];
+  artifacts?: Array<{
+    path: string;
+    description: string;
+  }>;
+  /**
+   * Optional declaration used when the assignment promises exhaustive
+   * coverage. The runtime, not the model, computes the actual coverage from
+   * observable Glob/Read/Grep tool activity.
+   */
+  coverage?: CompleteTaskCoverageDeclaration;
+}
+
+export interface CompleteTaskCoverageDeclaration {
+  exhaustive?: boolean;
+  scope_roots?: string[];
+  exclusions?: Array<{
+    path: string;
+    reason: string;
+  }>;
+}
+
+export type CoverageFileStatus = "discovered" | "inspected" | "excluded" | "failed";
+
+export interface CoverageFileEntry {
+  path: string;
+  status: CoverageFileStatus;
+  line_count?: number;
+  content_hash?: string;
+  inspected_ranges?: Array<{ start: number; end: number }>;
+  reason?: string;
+}
+
+export interface CoverageManifest {
+  version: 1;
+  required: boolean;
+  scope_roots: string[];
+  discovery_complete: boolean;
+  complete: boolean;
+  gate_satisfied: boolean;
+  discovered: number;
+  inspected: number;
+  excluded: number;
+  failed: number;
+  line_count: number;
+  files: CoverageFileEntry[];
+  notes: string[];
+}
+
+export type CoverageSummary = Omit<CoverageManifest, "files" | "notes">;
+
+export interface SubagentCoverageTracker {
+  readonly required: boolean;
+  applyDeclaration(declaration?: CompleteTaskCoverageDeclaration): string[];
+  snapshot(): CoverageManifest;
+}
+
+export interface TaskCompletionControl {
+  type: "task_completion";
+  completion: CompleteTaskInput;
+}
+
+export interface SubagentRuntimeContext {
+  rootSessionId: string;
+  taskId: string;
   agentId: string;
+  parentTaskId?: string;
+  depth: number;
+  completionSubmitted: boolean;
+  onActivity?: (activity: string, toolName?: string) => void;
+  coverage?: SubagentCoverageTracker;
+}
+
+export interface TaskArtifactPaths {
+  task: string;
+  result: string;
+  report: string;
+  transcript: string;
+  coverage: string;
+  taskDir: string;
+}
+
+export interface TaskSummary {
+  taskId: string;
+  agentId: string;
+  rootSessionId: string;
+  parentTaskId?: string;
+  description: string;
+  subagentType: string;
+  dependency: SubagentDependency;
+  status: SubagentTaskStatus;
+  depth: number;
+  createdAt: number;
+  startedAt?: number;
+  endedAt?: number;
+  lastActivityAt: number;
+  currentActivity?: string;
+  currentTool?: string;
+  childCount: number;
+  pinned?: boolean;
+  artifacts: TaskArtifactPaths;
+}
+
+export interface TaskResult {
+  taskId: string;
+  agentId: string;
+  status: SubagentTaskStatus;
+  summary: string;
+  reportPath: string;
+  resultPath: string;
+  transcriptPath: string;
+  coveragePath: string;
+  usage: { inputTokens: number; outputTokens: number; toolCalls: number };
+  error?: string;
+  keyFiles?: string[];
+  artifacts?: Array<{ path: string; description: string }>;
+  coverage?: CoverageSummary;
+  startedAt?: number;
+  endedAt: number;
+}
+
+export interface TaskDetail extends TaskSummary {
+  prompt: string;
+  result?: TaskResult;
+}
+
+export interface TaskFilter {
+  status?: SubagentTaskStatus;
+}
+
+export interface TaskService {
+  list(filter?: TaskFilter): TaskSummary[];
+  get(taskId: string): TaskDetail | undefined;
+  wait(taskId: string, timeoutMs?: number): Promise<TaskResult>;
+  cancel(taskId: string, cascade?: boolean): Promise<void>;
+  cleanup(taskId: string): Promise<void>;
+}
+
+export interface SubagentResult {
+  status: SubagentTaskStatus | "timeout" | "budget_exceeded";
+  agentId: string;
+  taskId?: string;
   output: string;
   usage: { inputTokens: number; outputTokens: number; toolCalls: number };
   /** Stable path containing the complete final report. */
   resultPath?: string;
   /** Stable path containing the multi-turn execution transcript. */
   transcriptPath?: string;
+  /** Runtime-observed exhaustive coverage manifest. */
+  coveragePath?: string;
   /** Machine-extractable summary (for parent agent to merge). */
   summary?: string;
   /** Files modified by this subagent. */
   filesChanged?: string[];
+  reportPath?: string;
+  resultJsonPath?: string;
+  workspace?: null;
+  patch?: null;
 }

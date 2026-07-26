@@ -16,7 +16,13 @@
 import { SecurityRuntime } from "../security/runtime.js";
 import type { SecurityDecision } from "../security/sandbox/sandbox.js";
 import { dispatch } from "../tools/registry.js";
-import type { AgentContext, ConfirmDecision } from "../shared/core-types.js";
+import type {
+  AgentContext,
+  ConfirmDecision,
+  TaskCompletionControl,
+  ToolDefinition,
+  ToolResult,
+} from "../shared/core-types.js";
 
 // ---- Types ----
 
@@ -25,6 +31,7 @@ export interface ToolRuntimeResult {
   isError: boolean;
   /** True when the user explicitly denied a "confirm" tool. */
   denied: boolean;
+  control?: TaskCompletionControl;
   /** Security metadata attached to every execution (for audit / logging). */
   security?: {
     verdict: SecurityDecision["verdict"];
@@ -36,6 +43,8 @@ export interface ToolRuntimeResult {
 export interface ToolRuntimeOptions {
   securityRuntime: SecurityRuntime;
   workingDir: string;
+  /** The exact per-agent tool set. Prevents dispatching tools outside it. */
+  tools?: ToolDefinition[];
   /**
    * Interactive confirmation callback. Called when the security verdict is
    * "confirm". If not provided, confirm-mode tools are denied in non-interactive
@@ -56,11 +65,15 @@ export class ToolRuntime {
     toolName: string,
     input: Record<string, unknown>,
   ) => Promise<ConfirmDecision>;
+  private tools?: Map<string, ToolDefinition>;
 
   constructor(options: ToolRuntimeOptions) {
     this.securityRuntime = options.securityRuntime;
     this.workingDir = options.workingDir;
     this.onConfirmTool = options.onConfirmTool;
+    this.tools = options.tools
+      ? new Map(options.tools.map((tool) => [tool.name, tool]))
+      : undefined;
   }
 
   /**
@@ -78,6 +91,21 @@ export class ToolRuntime {
     input: Record<string, unknown>,
     ctx: AgentContext,
   ): Promise<ToolRuntimeResult> {
+    const scopedTool = this.tools?.get(toolName);
+    if (this.tools && !scopedTool) {
+      return {
+        content: `Tool "${toolName}" is not available in this agent's scoped tool set.`,
+        isError: true,
+        denied: false,
+      };
+    }
+
+    // CompleteTask is a runtime control protocol, not a project action. It
+    // bypasses ordinary permission policy but remains scoped to subagents.
+    if (toolName === "CompleteTask" && scopedTool) {
+      return this.fromToolResult(await scopedTool.handler(input, ctx));
+    }
+
     // 1. Security evaluation (PolicyEngine + CompositeSandbox)
     const decision = this.securityRuntime.evaluate(toolName, input, this.workingDir);
     const executableInput = decision.sanitizedInput ?? input;
@@ -100,12 +128,10 @@ export class ToolRuntime {
     }
 
     // 3. Dispatch to tool handler
-    const result = await dispatch(toolName, executableInput, ctx);
+    const result = await this.dispatchScoped(toolName, executableInput, ctx);
 
     return {
-      content: result.content,
-      isError: result.isError ?? false,
-      denied: false,
+      ...this.fromToolResult(result),
       security: {
         verdict: decision.verdict,
         risk: decision.risk,
@@ -189,17 +215,43 @@ export class ToolRuntime {
     }
 
     // allow_once, allow_always, or auto-approve: proceed to dispatch
-    const result = await dispatch(toolName, input, ctx);
+    const result = await this.dispatchScoped(toolName, input, ctx);
 
     return {
-      content: result.content,
-      isError: result.isError ?? false,
-      denied: false,
+      ...this.fromToolResult(result),
       security: {
         verdict: decision.verdict,
         risk: decision.risk,
         reason: decision.reason,
       },
+    };
+  }
+
+  private async dispatchScoped(
+    toolName: string,
+    input: Record<string, unknown>,
+    ctx: AgentContext,
+  ): Promise<ToolResult> {
+    const scopedTool = this.tools?.get(toolName);
+    if (scopedTool) {
+      try {
+        return await scopedTool.handler(input, ctx);
+      } catch (error) {
+        return {
+          content: `Tool error (${toolName}): ${error instanceof Error ? error.message : String(error)}`,
+          isError: true,
+        };
+      }
+    }
+    return dispatch(toolName, input, ctx);
+  }
+
+  private fromToolResult(result: ToolResult): ToolRuntimeResult {
+    return {
+      content: result.content,
+      isError: result.isError ?? false,
+      denied: false,
+      control: result.control,
     };
   }
 }

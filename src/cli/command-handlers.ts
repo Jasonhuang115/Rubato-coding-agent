@@ -10,6 +10,8 @@ import { spawnSubagent } from "../agent/subagent.js";
 import { PolicyEngine } from "../permissions/policy.js";
 import { PlanManager } from "../agent/planner/manager.js";
 import { SessionManager } from "../runtime/session/manager.js";
+import { processSubagentRegistry } from "../agent/subagents/registry.js";
+import { scrubPersistedData } from "../security/scrub.js";
 
 export async function handleGitCommand(input: string, workdir: string): Promise<void> {
   const args = input.split(/\s+/).slice(1);
@@ -230,6 +232,149 @@ export function handleSessionsCommand(input: string, sessionManager: SessionMana
     console.log(`\n  No session found matching "${target}".`);
   }
   return { restartLoop: false };
+}
+
+export async function handleTasksCommand(input: string, rootSessionId: string): Promise<void> {
+  const runtime = processSubagentRegistry.get(rootSessionId);
+  if (!runtime) {
+    console.log("\n  No subagent tasks in this session.");
+    return;
+  }
+  const args = input.trim().split(/\s+/).slice(1);
+  if (args.length === 0 || args[0] === "list") {
+    const tasks = runtime.list();
+    if (tasks.length === 0) {
+      console.log("\n  No subagent tasks in this session.");
+      return;
+    }
+    console.log("\n  Task ID                                Status       Type       Elapsed  Activity");
+    for (const task of tasks) {
+      const elapsed = (task.endedAt ?? Date.now()) - (task.startedAt ?? task.createdAt);
+      console.log(
+        `  ${task.taskId.padEnd(38)} ${task.status.padEnd(12)} ` +
+        `${task.subagentType.padEnd(10)} ${formatTaskDuration(elapsed).padEnd(8)} ` +
+        `${task.currentActivity ?? ""}`,
+      );
+    }
+    return;
+  }
+
+  if (args[0] === "stats") {
+    console.log(JSON.stringify(runtime.artifactStats(), null, 2));
+    return;
+  }
+  if (args[0] === "prune") {
+    console.log(JSON.stringify(runtime.pruneArtifacts(), null, 2));
+    return;
+  }
+  if (args[0] === "watch") {
+    const taskId = args[1];
+    const targets = taskId
+      ? [runtime.get(taskId)].filter((task): task is NonNullable<typeof task> => Boolean(task))
+      : runtime.list().filter((task) =>
+          task.status === "queued" || task.status === "running" || task.status === "waiting_child",
+        );
+    if (targets.length === 0) {
+      console.log(taskId ? `\n  Unknown or terminal task: ${taskId}` : "\n  No running tasks.");
+      return;
+    }
+    const targetIds = new Set(targets.map((task) => task.taskId));
+    const unsubscribe = runtime.subscribe((task) => {
+      if (targetIds.has(task.taskId)) {
+        console.log(
+          `  ${task.taskId} ${task.status} ${task.currentActivity ?? ""} ` +
+          `${task.currentTool ?? ""}`,
+        );
+      }
+    });
+    try {
+      await Promise.all(targets.map((task) => runtime.wait(task.taskId)));
+    } finally {
+      unsubscribe();
+    }
+    return;
+  }
+  const action = ["wait", "cancel", "cleanup", "pin", "unpin"].includes(args[0])
+    ? args[0]
+    : "get";
+  const taskId = action === "get" ? args[0] : args[1];
+  if (!taskId) {
+    console.log("\n  Usage: /tasks [<id> | wait/watch/cancel/cleanup/pin/unpin <id> | stats | prune]");
+    return;
+  }
+  try {
+    if (action === "wait") {
+      console.log(JSON.stringify(await runtime.wait(taskId), null, 2));
+    } else if (action === "cancel") {
+      await runtime.cancel(taskId, true);
+      console.log(`\n  Cancellation requested for ${taskId}.`);
+    } else if (action === "cleanup") {
+      await runtime.cleanup(taskId);
+      console.log(`\n  Cleaned ${taskId}.`);
+    } else if (action === "pin" || action === "unpin") {
+      runtime.pin(taskId, action === "pin");
+      console.log(`\n  ${action === "pin" ? "Pinned" : "Unpinned"} ${taskId}.`);
+    } else {
+      const task = runtime.get(taskId);
+      console.log(task ? JSON.stringify(task, null, 2) : `\n  Unknown task: ${taskId}`);
+    }
+  } catch (error) {
+    console.log(`\n  ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+export function handleTraceCommand(input: string, rootSessionId: string): void {
+  const runtime = processSubagentRegistry.get(rootSessionId);
+  if (!runtime) {
+    console.log("\n  No trace exists for this session.");
+    return;
+  }
+  const taskId = input.trim().split(/\s+/)[1];
+  if (!taskId) {
+    console.log(`\n  Trace: ${runtime.artifacts.tracePath}`);
+    return;
+  }
+  const task = runtime.get(taskId);
+  console.log(task
+    ? `\n  Task transcript: ${task.artifacts.transcript}\n  Root trace: ${runtime.artifacts.tracePath}`
+    : `\n  Unknown task: ${taskId}`);
+}
+
+export function handleScrubCommand(input: string): void {
+  let remainder = input.replace(/^\/scrub\b/, "").trim();
+  const dryRun = /(?:^|\s)--dry-run(?:\s|$)/.test(remainder);
+  remainder = remainder.replace(/(?:^|\s)--dry-run(?=\s|$)/g, " ").trim();
+  let target = remainder || undefined;
+  if (
+    target &&
+    ((target.startsWith("\"") && target.endsWith("\"")) ||
+      (target.startsWith("'") && target.endsWith("'")))
+  ) {
+    target = target.slice(1, -1);
+  }
+  if (target) target = target.replace(/\\ /g, " ");
+
+  try {
+    const report = scrubPersistedData({ target, dryRun });
+    const action = dryRun ? "would redact" : "redacted";
+    console.log(
+      `\n  Security scrub ${action} ${report.filesChanged} of ` +
+      `${report.filesScanned} eligible files (${report.bytesScanned} bytes scanned).`,
+    );
+    if (report.skippedSymlinks > 0) {
+      console.log(`  Skipped ${report.skippedSymlinks} symbolic link(s).`);
+    }
+    if (report.errors.length > 0) {
+      console.log(`  ${report.errors.length} file(s) could not be scrubbed; no secret values were printed.`);
+    }
+  } catch (error) {
+    console.log(`\n  Security scrub failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function formatTaskDuration(ms: number): string {
+  const seconds = Math.max(0, Math.floor(ms / 1_000));
+  return `${Math.floor(seconds / 60)}m${String(seconds % 60).padStart(2, "0")}s`;
 }
 
 export async function handleSkillCommand(input: string, workdir: string, config: AgentConfig): Promise<string | null> {

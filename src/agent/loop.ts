@@ -15,7 +15,8 @@ import type {
   StreamRenderer,
   ToolDefinition,
   ConfirmDecision,
-  BudgetManager,
+  CompleteTaskInput,
+  SubagentRuntimeContext,
 } from "../shared/core-types.js";
 import { createProvider } from "../model/router.js";
 import { getAllTools } from "../tools/registry.js";
@@ -32,8 +33,15 @@ import { hasAssistantResponse, recordAttributedMemoryReferences } from "../memor
 import { sessionEndHook } from "../tools/git/hooks.js";
 import { assembleContext } from "../runtime/context-assembler.js";
 import { checkAndCompact, runMicroCompact } from "../runtime/compaction-controller.js";
-import { executeTurn, UserInterruptError, CircuitBreakerError, MaxRetriesError } from "../runtime/step-executor.js";
-import { getRequiredDelegation } from "./delegation-policy.js";
+import {
+  executeTurn,
+  UserInterruptError,
+  CircuitBreakerError,
+  MaxRetriesError,
+  StreamFailedError,
+} from "../runtime/step-executor.js";
+import { processSubagentRegistry } from "./subagents/registry.js";
+import type { TaskInboxEvent } from "./subagents/conversation-inbox.js";
 
 // ---- Configuration ----
 
@@ -45,14 +53,23 @@ export type AgentEvent =
   | { type: "thinking"; text: string }
   | { type: "text"; text: string }
   | { type: "tool_call"; id: string; name: string; input: Record<string, unknown> }
-  | { type: "tool_result"; id: string; name: string; result: string; isError: boolean }
+  | {
+      type: "tool_result";
+      id: string;
+      name: string;
+      result: string;
+      isError: boolean;
+      security?: { verdict: string; risk: string; reason: string };
+    }
   | { type: "error"; message: string; retryable: boolean }
   | { type: "warning"; message: string }
   | { type: "turn_start"; turn: number }
   | { type: "turn_end"; turn: number; usage?: { input: number; output: number } }
   | { type: "done"; reason: string }
   | { type: "compacting"; reason: string }
-  | { type: "waiting_for_input" };
+  | { type: "waiting_for_input" }
+  | { type: "completion_retry"; attempt: number }
+  | { type: "task_completion"; completion: CompleteTaskInput };
 
 // ---- Abort mechanism (delegates to StepExecutor) ----
 
@@ -75,15 +92,20 @@ export interface AgentLoopOptions {
   renderer: StreamRenderer;
   sessionId?: string;
   tools?: ToolDefinition[];
-  getNextUserMessage?: () => Promise<string | null>;
+  getNextUserMessage?: (signal?: AbortSignal) => Promise<string | null>;
   forceCompaction?: boolean;
   skipCompaction?: boolean;
   onConfirmTool?: (toolName: string, input: Record<string, unknown>) => Promise<ConfirmDecision>;
   sessionManager?: SessionManager;
   resumeSummary?: string;
   depth?: number;
-  budgetManager?: BudgetManager;
   maxTurns?: number;
+  roleSystemPrompt?: string;
+  contextProfile?: "root" | "subagent" | "compact";
+  abortSignal?: AbortSignal;
+  taskRuntime?: SubagentRuntimeContext;
+  /** Extra model turns reserved solely for submitting CompleteTask. */
+  completionRetryTurns?: number;
 }
 
 // ---- Main loop ----
@@ -97,6 +119,16 @@ export async function* agentLoop(
   const sessionId = options.sessionId ?? randomUUID();
   let provider = createProvider(config.model);
   const tools = options.tools ?? getAllTools();
+  const isRootProfile = (options.contextProfile ?? "root") === "root";
+  const rootRuntime = isRootProfile
+    ? processSubagentRegistry.getOrCreate(sessionId, workingDir, config)
+    : undefined;
+  rootRuntime?.trace.append({
+    type: "root_session_started",
+    sessionId,
+    agentId: sessionId,
+    prompt,
+  });
 
   // Security + Tool runtime
   const securityRuntime = new SecurityRuntime(config.permissions);
@@ -105,6 +137,7 @@ export async function* agentLoop(
     securityRuntime,
     workingDir,
     onConfirmTool: options.onConfirmTool,
+    tools,
   });
 
   const readGuard = new ReadGuard();
@@ -112,7 +145,11 @@ export async function* agentLoop(
   // Session storage
   const projectHash = options.sessionManager?.getProjectHash();
   const sessionStore = new SessionStore(sessionId, projectHash);
-  sessionStore.init();
+  const persistConversation = (options.contextProfile ?? "root") === "root";
+  if (persistConversation) {
+    sessionStore.init();
+    sessionStore.writeMessage({ role: "user", content: prompt });
+  }
 
   let sessionMeta = createSessionMeta(
     sessionId,
@@ -133,7 +170,8 @@ export async function* agentLoop(
     config,
     planManager,
     depth: options.depth ?? 0,
-    budgetManager: options.budgetManager,
+    taskRuntime: options.taskRuntime,
+    abortSignal: options.abortSignal,
   };
 
   // ---- Build system prompt via ContextAssembler ----
@@ -144,6 +182,8 @@ export async function* agentLoop(
     tools,
     providerName: config.model.provider,
     resumeSummary: options.resumeSummary,
+    roleSystemPrompt: options.roleSystemPrompt,
+    contextProfile: options.contextProfile,
   });
 
   // ---- Initialize messages ----
@@ -151,52 +191,30 @@ export async function* agentLoop(
     { role: "user", content: prompt },
   ];
 
-  // Broad project exploration is a deterministic delegation boundary. Relying
-  // on model tool choice made identical requests delegate inconsistently.
-  const requiredDelegation = getRequiredDelegation(prompt, options.depth ?? 0, tools);
-  if (requiredDelegation) {
-    const toolUseId = `auto-delegate-${randomUUID()}`;
-    const toolInput = {
-      description: requiredDelegation.description,
-      prompt: requiredDelegation.prompt,
-      subagent_type: requiredDelegation.subagentType,
-    };
-
-    renderer.renderToolUse("Agent", toolInput);
-    yield { type: "tool_call", id: toolUseId, name: "Agent", input: toolInput };
-
-    const delegated = await toolRuntime.execute("Agent", toolInput, ctx);
-    yield {
-      type: "tool_result",
-      id: toolUseId,
-      name: "Agent",
-      result: delegated.content,
-      isError: delegated.isError,
-    };
-
-    messages[0] = {
-      role: "user",
-      content: [
-        prompt,
-        "",
-        "[Runtime-provided Explore subagent result]",
-        delegated.content,
-        "",
-        "Use this delegated report to answer the original request. Read its full-report path only if the preview is insufficient. Do not repeat the exploration yourself.",
-      ].join("\n"),
-    };
-  }
-
   // ---- Compaction tracking ----
   let consecutiveCompactionFailures = 0;
   let skipAutoCompact = options.skipCompaction ?? false;
 
   // ---- Main turn loop ----
-  const maxTurns = options.maxTurns ?? DEFAULT_MAX_TURNS;
+  const configuredMaxTurns = options.maxTurns ??
+    (options.contextProfile === "subagent" ? Number.POSITIVE_INFINITY : DEFAULT_MAX_TURNS);
+  const completionRetryTurns = options.taskRuntime
+    ? Math.max(0, options.completionRetryTurns ?? 1)
+    : 0;
+  const maxTurns = Number.isFinite(configuredMaxTurns)
+    ? configuredMaxTurns + completionRetryTurns
+    : configuredMaxTurns;
   let doneReason: string | null = null;
   let hadAssistantResponse = false;
+  let forcingCompletion = false;
+  let completionRetryCount = 0;
 
   for (let turn = 0; turn < maxTurns && !doneReason; turn++) {
+    if (options.abortSignal?.aborted) {
+      doneReason = "cancelled";
+      break;
+    }
+    options.taskRuntime?.onActivity?.(`model turn ${turn + 1}`);
     // Dynamic provider switching
     if (provider.name !== config.model.provider) {
       provider = createProvider(config.model);
@@ -204,6 +222,12 @@ export async function* agentLoop(
     }
 
     yield { type: "turn_start", turn: turn + 1 };
+    rootRuntime?.trace.append({
+      type: "root_turn_started",
+      sessionId,
+      agentId: sessionId,
+      turn: turn + 1,
+    });
 
     // ---- Compaction ----
     const compactResult = await checkAndCompact({
@@ -224,7 +248,9 @@ export async function* agentLoop(
       yield { type: "compacting", reason: compactResult.reason ?? "Auto-compaction" };
       messages.length = 0;
       messages.push(...compactResult.messages);
-      sessionStore.writeCompaction({ turn, messageCount: messages.length });
+      if (persistConversation) {
+        sessionStore.writeCompaction({ turn, messageCount: messages.length });
+      }
     }
 
     if (compactResult.disableAutoCompact) {
@@ -249,13 +275,17 @@ export async function* agentLoop(
 
     // ---- Execute turn via StepExecutor ----
     let turnResult;
+    const preTurnMessageCount = messages.length;
     try {
+      const turnTools = forcingCompletion
+        ? tools.filter((tool) => tool.name === "CompleteTask")
+        : tools;
       turnResult = yield* executeTurn({
         provider,
         model: config.model.model,
         systemPrompt,
         messages,
-        tools,
+        tools: turnTools,
         renderer,
         workingDir,
         ctx,
@@ -263,28 +293,113 @@ export async function* agentLoop(
         planManager,
         onConfirmTool: options.onConfirmTool,
         maxRetries: config.model.maxRetries,
+        abortSignal: options.abortSignal,
+        onToolTrace: rootRuntime
+          ? (event) => {
+              rootRuntime.trace.append({
+                type: event.phase === "started" ? "tool_started" : "tool_completed",
+                sessionId,
+                agentId: sessionId,
+                scope: "root",
+                toolId: event.id,
+                tool: event.name,
+                input: event.input,
+                output: event.output,
+                isError: event.isError,
+                security: event.security,
+                error: event.error,
+                startedAt: event.startedAt,
+                durationMs: event.durationMs,
+              });
+            }
+          : undefined,
       });
     } catch (err) {
       if (err instanceof UserInterruptError) {
+        rootRuntime?.trace.append({
+          type: "root_turn_failed",
+          sessionId,
+          agentId: sessionId,
+          turn: turn + 1,
+          reason: "user_interrupt",
+        });
         yield { type: "warning", message: "Interrupted (Ctrl+C)" };
         doneReason = "user_interrupt";
         break;
       }
       if (err instanceof CircuitBreakerError) {
+        rootRuntime?.trace.append({
+          type: "root_turn_failed",
+          sessionId,
+          agentId: sessionId,
+          turn: turn + 1,
+          reason: "circuit_breaker",
+        });
         doneReason = "circuit_breaker";
         break;
       }
       if (err instanceof MaxRetriesError) {
+        rootRuntime?.trace.append({
+          type: "root_turn_failed",
+          sessionId,
+          agentId: sessionId,
+          turn: turn + 1,
+          reason: "max_retries",
+        });
         doneReason = "max_retries";
+        break;
+      }
+      if (err instanceof StreamFailedError) {
+        rootRuntime?.trace.append({
+          type: "root_turn_failed",
+          sessionId,
+          agentId: sessionId,
+          turn: turn + 1,
+          reason: "stream_failed",
+          error: err.message,
+        });
+        doneReason = "stream_failed";
         break;
       }
       // Unknown error
       yield { type: "error", message: String(err), retryable: false };
+      rootRuntime?.trace.append({
+        type: "root_turn_failed",
+        sessionId,
+        agentId: sessionId,
+        turn: turn + 1,
+        reason: "stream_failed",
+        error: String(err),
+      });
       doneReason = "stream_failed";
       break;
     }
 
-    const { toolUses, usage, stopReason, toolDenied } = turnResult;
+    const {
+      toolUses,
+      usage,
+      stopReason,
+      toolDenied,
+      taskCompletion,
+      toolExecutions,
+    } = turnResult;
+    rootRuntime?.trace.append({
+      type: "root_turn_completed",
+      sessionId,
+      agentId: sessionId,
+      turn: turn + 1,
+      modelOutput: turnResult.assistantBlocks.map((block) => block.text).join(""),
+      stopReason,
+      usage,
+      toolExecutions: toolExecutions.map((execution) => ({
+        id: execution.id,
+        name: execution.name,
+        isError: execution.isError,
+      })),
+    });
+    if (persistConversation) {
+      persistTurnMessages(sessionStore, messages.slice(preTurnMessageCount));
+    }
 
     if (hasAssistantResponse(messages)) {
       hadAssistantResponse = true;
@@ -304,11 +419,107 @@ export async function* agentLoop(
       usage: usage ? { input: usage.input, output: usage.output } : undefined,
     };
 
+    if (taskCompletion) {
+      yield { type: "task_completion", completion: taskCompletion.completion };
+      doneReason = "task_completion";
+      break;
+    }
+
+    if (
+      options.taskRuntime &&
+      !options.taskRuntime.completionSubmitted &&
+      !forcingCompletion &&
+      Number.isFinite(configuredMaxTurns) &&
+      turn + 1 >= configuredMaxTurns &&
+      completionRetryCount < completionRetryTurns
+    ) {
+      completionRetryCount++;
+      forcingCompletion = true;
+      messages.push({
+        role: "user",
+        content: buildForcedCompletionMessage(options.taskRuntime),
+      });
+      yield { type: "completion_retry", attempt: completionRetryCount };
+      continue;
+    }
+
+    if (forcingCompletion) {
+      // A forced turn is deliberately bounded. If it did not successfully
+      // submit CompleteTask, TaskRunner will recover a readable partial from
+      // all observable text and tool activity.
+      doneReason = "missing_task_completion";
+      break;
+    }
+
     // ---- End turn? ----
     if (stopReason === "end_turn" || toolUses.length === 0) {
+      if (
+        options.taskRuntime &&
+        !options.taskRuntime.completionSubmitted &&
+        completionRetryCount < completionRetryTurns
+      ) {
+        completionRetryCount++;
+        forcingCompletion = true;
+        messages.push({
+          role: "user",
+          content: buildForcedCompletionMessage(options.taskRuntime),
+        });
+        yield { type: "completion_retry", attempt: completionRetryCount };
+        continue;
+      }
+      const runtime = options.contextProfile === "subagent"
+        ? undefined
+        : processSubagentRegistry.get(sessionId);
+      const completedTasks = runtime?.inbox.drain() ?? [];
+      if (completedTasks.length > 0) {
+        runtime?.trace.append({
+          type: "parent_wake",
+          sessionId,
+          taskIds: completedTasks.flatMap((event) => event.taskIds),
+        });
+        if (persistConversation) {
+          sessionStore.writeToolEvent({
+            type: "task_notification",
+            taskIds: completedTasks.flatMap((event) => event.taskIds),
+          });
+        }
+        messages.push({
+          role: "user",
+          content: formatInboxEvents(completedTasks),
+        });
+        continue;
+      }
       if (options.getNextUserMessage) {
         yield { type: "waiting_for_input" };
-        const nextMessage = await options.getNextUserMessage();
+        let nextMessage: string | null;
+        if (runtime?.hasPendingAdvisory()) {
+          const waitController = new AbortController();
+          const next = await Promise.race([
+            options.getNextUserMessage(waitController.signal)
+              .then((message) => ({ kind: "user" as const, message })),
+            runtime.inbox.wait(waitController.signal)
+              .then((event) => ({ kind: "inbox" as const, event })),
+          ]);
+          waitController.abort();
+          if (next.kind === "inbox") {
+            runtime.trace.append({
+              type: "parent_wake",
+              sessionId,
+              taskIds: next.event.taskIds,
+            });
+            if (persistConversation) {
+              sessionStore.writeToolEvent({
+                type: "task_notification",
+                taskIds: next.event.taskIds,
+              });
+            }
+            messages.push({ role: "user", content: formatInboxEvents([next.event]) });
+            continue;
+          }
+          nextMessage = next.message;
+        } else {
+          nextMessage = await options.getNextUserMessage();
+        }
         if (!nextMessage || !nextMessage.trim()) {
           doneReason = "user_exit";
           break;
@@ -317,8 +528,25 @@ export async function* agentLoop(
         if (deviationWarning) {
           yield { type: "warning", message: deviationWarning };
         }
+        const notifications = runtime?.inbox.drain() ?? [];
+        if (notifications.length > 0) {
+          runtime?.trace.append({
+            type: "task_notification_before_user_message",
+            sessionId,
+            taskIds: notifications.flatMap((event) => event.taskIds),
+          });
+          if (persistConversation) {
+            sessionStore.writeToolEvent({
+              type: "task_notification",
+              taskIds: notifications.flatMap((event) => event.taskIds),
+            });
+          }
+          messages.push({ role: "user", content: formatInboxEvents(notifications) });
+        }
         messages.push({ role: "user", content: nextMessage.trim() });
-        sessionStore.writeMessage({ role: "user", content: nextMessage.trim() });
+        if (persistConversation) {
+          sessionStore.writeMessage({ role: "user", content: nextMessage.trim() });
+        }
         sessionMeta.messageCount = (sessionMeta.messageCount ?? 0) + 1;
         continue;
       }
@@ -341,17 +569,44 @@ export async function* agentLoop(
           yield { type: "warning", message: deviationWarning };
         }
         messages.push({ role: "user", content: nextMessage.trim() });
-        sessionStore.writeMessage({ role: "user", content: nextMessage.trim() });
+        if (persistConversation) {
+          sessionStore.writeMessage({ role: "user", content: nextMessage.trim() });
+        }
         sessionMeta.messageCount = (sessionMeta.messageCount ?? 0) + 1;
         continue;
       }
       doneReason = "tool_denied";
       break;
     }
+
+    // Preserve maxTurns as the research-turn budget. A finite limit gets one
+    // reserved completion-only turn rather than losing all accumulated work.
+    if (
+      options.taskRuntime &&
+      !options.taskRuntime.completionSubmitted &&
+      Number.isFinite(configuredMaxTurns) &&
+      turn + 1 >= configuredMaxTurns &&
+      completionRetryCount < completionRetryTurns
+    ) {
+      completionRetryCount++;
+      forcingCompletion = true;
+      messages.push({
+        role: "user",
+        content: buildForcedCompletionMessage(options.taskRuntime),
+      });
+      yield { type: "completion_retry", attempt: completionRetryCount };
+    }
   }
 
   if (!doneReason) {
     doneReason = "max_turns";
+  }
+
+  // Managed subagents have their own trace/artifact lifecycle. They must not
+  // write root conversation state, project memory, or run root Git hooks.
+  if ((options.contextProfile ?? "root") !== "root") {
+    yield { type: "done", reason: doneReason };
+    return;
   }
 
   // ---- Finalize ----
@@ -446,5 +701,64 @@ export async function* agentLoop(
     sessionStore.close();
   }
 
+  rootRuntime?.trace.append({
+    type: "root_session_ended",
+    sessionId,
+    agentId: sessionId,
+    reason: doneReason,
+    usage: { totalTokens: sessionMeta.totalTokens },
+  });
   yield { type: "done", reason: doneReason };
+}
+
+function formatInboxEvents(events: TaskInboxEvent[]): string {
+  return [
+    "[Runtime notification: advisory subagent results are now available.]",
+    ...events.flatMap((event) => event.results.map((result) => [
+      `Task completed: ${result.summary}`,
+      `Task ID: ${result.taskId}`,
+      `Status: ${result.status}`,
+      `Report: ${result.reportPath}`,
+      `Result: ${result.resultPath}`,
+      `Coverage: ${result.coveragePath}`,
+      "Read the report if needed, then supplement or revise the earlier response.",
+    ].join("\n"))),
+  ].join("\n\n");
+}
+
+function buildForcedCompletionMessage(runtime: SubagentRuntimeContext): string {
+  const coverage = runtime.coverage?.snapshot();
+  const coverageLine = coverage
+    ? [
+        `Observable coverage: discovered=${coverage.discovered}`,
+        `inspected=${coverage.inspected}`,
+        `excluded=${coverage.excluded}`,
+        `failed=${coverage.failed}`,
+        `discovery_complete=${coverage.discovery_complete}`,
+      ].join(", ")
+    : "Observable coverage is unavailable.";
+  return [
+    "[Runtime completion required]",
+    "You ended without successfully submitting CompleteTask.",
+    "Do not perform more investigation. Use the evidence already present in this conversation.",
+    "Now call CompleteTask exactly once with a self-contained, readable Markdown report.",
+    "If evidence or exhaustive coverage is incomplete, use status=partial and state the precise gaps; never claim full coverage.",
+    coverageLine,
+  ].join("\n");
+}
+
+function persistTurnMessages(store: SessionStore, messages: Message[]): void {
+  for (const message of messages) {
+    if (message.role === "assistant") {
+      store.writeMessage(message);
+      continue;
+    }
+    if (Array.isArray(message.content)) {
+      for (const block of message.content) {
+        if (block.type === "tool_result") {
+          store.writeToolEvent(block);
+        }
+      }
+    }
+  }
 }

@@ -15,6 +15,7 @@ import type {
   StreamRenderer,
   ConfirmDecision,
   ToolDefinition,
+  TaskCompletionControl,
 } from "../shared/core-types.js";
 import type { AgentEvent } from "../agent/loop.js";
 import { dispatch } from "../tools/registry.js";
@@ -53,6 +54,28 @@ export interface TurnResult {
   stopReason: "end_turn" | "tool_use" | "max_tokens";
   /** Whether any tool was denied by the user. */
   toolDenied: boolean;
+  taskCompletion?: TaskCompletionControl;
+  toolExecutions: Array<{
+    id: string;
+    name: string;
+    input: Record<string, unknown>;
+    result: string;
+    isError: boolean;
+    security?: ToolRuntimeResult["security"];
+  }>;
+}
+
+export interface ToolTraceEvent {
+  phase: "started" | "completed";
+  id: string;
+  name: string;
+  input: Record<string, unknown>;
+  output?: string;
+  isError?: boolean;
+  security?: ToolRuntimeResult["security"];
+  startedAt: number;
+  durationMs?: number;
+  error?: string;
 }
 
 export interface TurnOptions {
@@ -69,6 +92,8 @@ export interface TurnOptions {
   onConfirmTool?: (toolName: string, input: Record<string, unknown>) => Promise<ConfirmDecision>;
   /** Number of stream retries after the initial attempt. */
   maxRetries?: number;
+  abortSignal?: AbortSignal;
+  onToolTrace?: (event: ToolTraceEvent) => void;
 }
 
 // ---- Error tracking (module-level for circuit breaker) ----
@@ -96,6 +121,7 @@ export async function processStream(
     signal: AbortSignal;
   },
   renderer: StreamRenderer,
+  onActivity?: (activity: string, toolName?: string) => void,
 ): Promise<StreamResult> {
   let text = "";
   const toolUses: ToolUseBlock[] = [];
@@ -105,6 +131,7 @@ export async function processStream(
   const toolNames = new Map<string, string>();
 
   for await (const event of provider.chat(params)) {
+    onActivity?.("model streaming");
     switch (event.type) {
       case "text_delta":
         text += event.text;
@@ -144,7 +171,7 @@ export async function processStream(
         break;
 
       case "error":
-        throw new Error(event.message);
+        throw new ProviderStreamError(event.message, event.retryable);
     }
   }
 
@@ -184,7 +211,11 @@ export async function* executeTurn(
     }
 
     const abortController = new AbortController();
-    currentAbortController = abortController;
+    const onParentAbort = () => abortController.abort(options.abortSignal?.reason);
+    options.abortSignal?.addEventListener("abort", onParentAbort, { once: true });
+    if (options.abortSignal?.aborted) abortController.abort(options.abortSignal.reason);
+    const exposeAsCurrentRequest = !options.abortSignal;
+    if (exposeAsCurrentRequest) currentAbortController = abortController;
     const timeout = setTimeout(() => abortController.abort(), 120_000);
 
     try {
@@ -192,16 +223,19 @@ export async function* executeTurn(
         provider,
         { model, system: systemPrompt, messages, tools, maxTokens: DEFAULT_MAX_TOKENS, signal: abortController.signal },
         renderer,
+        ctx.taskRuntime?.onActivity,
       );
 
       clearTimeout(timeout);
-      currentAbortController = null;
+      options.abortSignal?.removeEventListener("abort", onParentAbort);
+      if (exposeAsCurrentRequest) currentAbortController = null;
       consecutiveErrors = 0;
       break;
     } catch (err: unknown) {
       clearTimeout(timeout);
-      const wasUserAbort = currentAbortController === null;
-      currentAbortController = null;
+      options.abortSignal?.removeEventListener("abort", onParentAbort);
+      const wasUserAbort = exposeAsCurrentRequest && currentAbortController === null;
+      if (exposeAsCurrentRequest) currentAbortController = null;
 
       if (wasUserAbort || (err instanceof Error && err.name === "AbortError" && retryCount === 0)) {
         throw new UserInterruptError("Interrupted (Ctrl+C)");
@@ -209,14 +243,18 @@ export async function* executeTurn(
 
       retryCount++;
       const message = err instanceof Error ? err.message : String(err);
-      const retryable = retryCount <= maxRetries;
+      const providerAllowsRetry =
+        !(err instanceof ProviderStreamError) || err.retryable;
+      const retryable = providerAllowsRetry && retryCount <= maxRetries;
 
       consecutiveErrors++;
       errorTimestamps.push(Date.now());
 
       yield {
         type: "error",
-        message: `Stream error (retry ${retryCount}/${maxRetries}): ${message}`,
+        message: providerAllowsRetry
+          ? `Stream error (retry ${retryCount}/${maxRetries}): ${message}`
+          : `Stream error (not retryable): ${message}`,
         retryable,
       };
 
@@ -224,8 +262,10 @@ export async function* executeTurn(
         const delay = RETRY_BASE_DELAY_MS * Math.pow(2, retryCount - 1);
         yield { type: "warning", message: `Retrying in ${delay}ms...` };
         await sleep(delay);
-      } else {
+      } else if (providerAllowsRetry) {
         throw new MaxRetriesError(`Max retries exceeded. ${message}`);
+      } else {
+        throw new StreamFailedError(message);
       }
     }
   }
@@ -256,8 +296,15 @@ export async function* executeTurn(
   const readCalls: ToolUseBlock[] = [];
   const writeCalls: ToolUseBlock[] = [];
   let toolDenied = false;
+  let taskCompletion: TaskCompletionControl | undefined;
+  const toolExecutions: TurnResult["toolExecutions"] = [];
+  const completionIndex = toolUses.findIndex((toolUse) => toolUse.name === "CompleteTask");
+  const executableToolUses = completionIndex >= 0
+    ? toolUses.slice(0, completionIndex + 1)
+    : toolUses;
 
-  for (const tu of toolUses) {
+  for (const tu of executableToolUses) {
+    yield { type: "tool_call", id: tu.id, name: tu.name, input: tu.input };
     const tool = tools.find((t) => t.name === tu.name);
     if (tool?.type === "read" && tool.isConcurrencySafe) {
       // Check if confirm-mode — serialize confirm tools
@@ -276,19 +323,36 @@ export async function* executeTurn(
   if (readCalls.length > 0) {
     const readResults = await Promise.all(
       readCalls.map(async (tu) => {
-        const result = await executeToolCall(tu, ctx, renderer, onConfirmTool, toolRuntime);
+        const result = await executeToolCall(
+          tu,
+          ctx,
+          renderer,
+          onConfirmTool,
+          toolRuntime,
+          options.onToolTrace,
+        );
         return { toolUse: tu, result };
       }),
     );
 
     for (const { toolUse, result } of readResults) {
       if (result.denied) toolDenied = true;
+      if (result.control) taskCompletion = result.control;
+      toolExecutions.push({
+        id: toolUse.id,
+        name: toolUse.name,
+        input: toolUse.input,
+        result: result.content,
+        isError: result.isError,
+        security: result.security,
+      });
       yield {
         type: "tool_result",
         id: toolUse.id,
         name: toolUse.name,
         result: result.content,
         isError: result.isError ?? false,
+        security: result.security,
       };
     }
 
@@ -298,7 +362,7 @@ export async function* executeTurn(
         content: [{
           type: "tool_result",
           tool_use_id: toolUse.id,
-          content: offloadIfLarge(result.content, toolUse.name),
+          content: offloadIfLarge(result.content, toolUse.name, toolUse.input),
           is_error: result.isError,
         }],
       });
@@ -338,14 +402,32 @@ export async function* executeTurn(
       }
     }
 
-    const result = await executeToolCall(tu, ctx, renderer, onConfirmTool, toolRuntime);
+    const result = await executeToolCall(
+      tu,
+      ctx,
+      renderer,
+      onConfirmTool,
+      toolRuntime,
+      options.onToolTrace,
+    );
     if (result.denied) toolDenied = true;
+    if (result.control) taskCompletion = result.control;
+    if (result.control) break;
+    toolExecutions.push({
+      id: tu.id,
+      name: tu.name,
+      input: tu.input,
+      result: result.content,
+      isError: result.isError,
+      security: result.security,
+    });
     yield {
       type: "tool_result",
       id: tu.id,
       name: tu.name,
       result: result.content,
       isError: result.isError ?? false,
+      security: result.security,
     };
 
     messages.push({
@@ -353,7 +435,7 @@ export async function* executeTurn(
       content: [{
         type: "tool_result",
         tool_use_id: tu.id,
-        content: offloadIfLarge(result.content, tu.name),
+        content: offloadIfLarge(result.content, tu.name, tu.input),
         is_error: result.isError,
       }],
     });
@@ -365,6 +447,8 @@ export async function* executeTurn(
     usage,
     stopReason,
     toolDenied,
+    taskCompletion,
+    toolExecutions,
   };
 }
 
@@ -376,18 +460,67 @@ async function executeToolCall(
   renderer: StreamRenderer,
   _onConfirmTool?: (toolName: string, input: Record<string, unknown>) => Promise<ConfirmDecision>,
   toolRuntime?: ToolRuntime,
-): Promise<{ content: string; isError: boolean; denied: boolean }> {
-  const result: ToolRuntimeResult = toolRuntime
-    ? await toolRuntime.execute(toolUse.name, toolUse.input, ctx)
-    : await dispatch(toolUse.name, toolUse.input, ctx).then(r => ({
-      content: r.content, isError: r.isError ?? false, denied: false,
-    }));
+  onToolTrace?: (event: ToolTraceEvent) => void,
+): Promise<{
+  content: string;
+  isError: boolean;
+  denied: boolean;
+  control?: TaskCompletionControl;
+  security?: ToolRuntimeResult["security"];
+}> {
+  const startedAt = Date.now();
+  onToolTrace?.({
+    phase: "started",
+    id: toolUse.id,
+    name: toolUse.name,
+    input: toolUse.input,
+    startedAt,
+  });
+  ctx.taskRuntime?.onActivity?.("tool running", toolUse.name);
+  let result: ToolRuntimeResult;
+  try {
+    result = toolRuntime
+      ? await toolRuntime.execute(toolUse.name, toolUse.input, ctx)
+      : await dispatch(toolUse.name, toolUse.input, ctx).then(r => ({
+        content: r.content, isError: r.isError ?? false, denied: false,
+      }));
+  } catch (error) {
+    onToolTrace?.({
+      phase: "completed",
+      id: toolUse.id,
+      name: toolUse.name,
+      input: toolUse.input,
+      isError: true,
+      error: error instanceof Error ? error.message : String(error),
+      startedAt,
+      durationMs: Date.now() - startedAt,
+    });
+    throw error;
+  }
 
   if (result.security?.verdict === "warn") {
     renderer.renderWarning(`⚠️ ${result.security.reason} (risk: ${result.security.risk})`);
   }
 
-  return { content: result.content, isError: result.isError, denied: result.denied };
+  ctx.taskRuntime?.onActivity?.("tool completed", toolUse.name);
+  onToolTrace?.({
+    phase: "completed",
+    id: toolUse.id,
+    name: toolUse.name,
+    input: toolUse.input,
+    output: result.content,
+    isError: result.isError,
+    security: result.security,
+    startedAt,
+    durationMs: Date.now() - startedAt,
+  });
+  return {
+    content: result.content,
+    isError: result.isError,
+    denied: result.denied,
+    control: result.control,
+    security: result.security,
+  };
 }
 
 // ---- Circuit breaker ----
@@ -407,24 +540,44 @@ function isCircuitBreakerOpen(ts: number[]): boolean {
 
 import fs from "fs";
 import path from "path";
-import { randomUUID } from "crypto";
+import { createHash } from "crypto";
 
-function offloadIfLarge(content: string, toolName: string): string {
+export function offloadIfLarge(
+  content: string,
+  toolName: string,
+  toolInput?: Record<string, unknown>,
+): string {
   if (content.length <= OFFLOAD_THRESHOLD) return content;
 
   const dir = "/tmp/rubato-tool-results";
   fs.mkdirSync(dir, { recursive: true });
-  const filePath = path.join(dir, `${toolName}-${randomUUID().slice(0, 8)}.txt`);
-  fs.writeFileSync(filePath, content, "utf-8");
+  const requestedPath = toolName === "Read" && typeof toolInput?.file_path === "string"
+    ? path.resolve(toolInput.file_path)
+    : undefined;
+  const readingExistingOffload = requestedPath !== undefined &&
+    path.dirname(requestedPath) === dir;
+  const hash = createHash("sha256").update(content).digest("hex").slice(0, 16);
+  const filePath = readingExistingOffload
+    ? requestedPath
+    : path.join(dir, `${toolName}-${hash}.txt`);
+  if (!readingExistingOffload && !fs.existsSync(filePath)) {
+    fs.writeFileSync(filePath, content, "utf-8");
+  }
 
   const previewLen = 800;
   const preview = content.slice(0, previewLen);
   return [
-    `[Full output (${(content.length / 1024).toFixed(1)}KB) offloaded to ${filePath}]`,
+    readingExistingOffload
+      ? `[Large offloaded result remains at ${filePath}; no duplicate copy was created.]`
+      : `[Full output (${(content.length / 1024).toFixed(1)}KB) offloaded to ${filePath}]`,
     ``,
     `Preview:`,
     preview,
-    content.length > previewLen ? `\n... [use Read ${filePath} to see the full ${(content.length / 1024).toFixed(0)}KB output]` : ``,
+    content.length > previewLen
+      ? readingExistingOffload
+        ? `\n... [use Grep or Read with offset/limit on ${filePath}; do not read the whole file again]`
+        : `\n... [use Read with offset/limit or Grep on ${filePath} to inspect the full ${(content.length / 1024).toFixed(0)}KB output]`
+      : ``,
   ].join("\n");
 }
 
@@ -444,4 +597,13 @@ export class UserInterruptError extends Error {
 }
 export class MaxRetriesError extends Error {
   constructor(message: string) { super(message); this.name = "MaxRetriesError"; }
+}
+export class StreamFailedError extends Error {
+  constructor(message: string) { super(message); this.name = "StreamFailedError"; }
+}
+export class ProviderStreamError extends Error {
+  constructor(message: string, readonly retryable: boolean) {
+    super(message);
+    this.name = "ProviderStreamError";
+  }
 }
