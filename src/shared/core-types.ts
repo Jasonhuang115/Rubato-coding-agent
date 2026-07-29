@@ -70,6 +70,21 @@ export interface AgentContext {
   taskRuntime?: SubagentRuntimeContext;
   /** Per-agent cancellation signal. */
   abortSignal?: AbortSignal;
+  /** Root-session permission prompt used by foreground and background subagents. */
+  onConfirmTool?: (
+    toolName: string,
+    input: Record<string, unknown>,
+  ) => Promise<ConfirmDecision>;
+  /** Root-only runtime backstop for explicit parallel multi-scope requests. */
+  delegationGate?: {
+    prepareTurn(toolCalls: Array<{
+      name: string;
+      input: Record<string, unknown>;
+    }>): void;
+    check(toolName: string, input: Record<string, unknown>): string | null;
+    recordToolResult(toolName: string, succeeded: boolean): void;
+    observeUserMessage(message: string): void;
+  };
 }
 
 export interface PlanManager {
@@ -127,6 +142,9 @@ export interface AgentConfig {
     cleanupPeriodDays: number;
   };
   subagents?: Partial<SubagentLimits>;
+  worktree?: {
+    baseRef: "fresh" | "head";
+  };
 }
 
 export type PermissionMode = "auto" | "confirm" | "manual";
@@ -253,7 +271,9 @@ export interface SubagentDefinition {
   systemPrompt: string;
   model?: string;             // "inherit" | specific model ID
   tools: string[];            // allowlist, ["*"] = all except AgentTool
-  readonly: boolean;          // default true
+  /** Legacy compatibility hint. Tool access is enforced from tools + isolation. */
+  readonly: boolean;
+  isolation?: "worktree";
   maxTurns?: number;          // optional — subagents run until completion by default
   /** Whether subagents of this type can spawn further subagents. Default false. */
   canSpawn?: boolean;
@@ -275,6 +295,7 @@ export type SubagentTaskStatus =
 
 export interface SubagentLimits {
   maxConcurrent: number;
+  maxWriteConcurrent: number;
   maxTasksPerSession: number;
   maxDepth: number;
   stallTimeoutMs: number;
@@ -291,6 +312,8 @@ export interface AgentTaskInput {
   dependency?: SubagentDependency;
   model?: string;
   timeout_ms?: number;
+  isolation?: "worktree";
+  scope?: string[];
   /**
    * `exhaustive` enables a runtime-enforced file/line coverage gate.
    * `auto` (the default) also enables it when the task wording promises
@@ -382,7 +405,27 @@ export interface TaskArtifactPaths {
   report: string;
   transcript: string;
   coverage: string;
+  patch: string;
   taskDir: string;
+}
+
+export interface TaskWorkspace {
+  path: string;
+  branch: string;
+  baseCommit: string;
+  repoRoot: string;
+  locked: boolean;
+  createdAt: number;
+  sourceDirty: boolean;
+}
+
+export interface WorkspaceResult extends TaskWorkspace {
+  headCommit: string;
+  commits: string[];
+  filesChanged: string[];
+  dirty: boolean;
+  patchPath: string;
+  scopeDeviations: string[];
 }
 
 export interface TaskSummary {
@@ -403,6 +446,8 @@ export interface TaskSummary {
   currentTool?: string;
   childCount: number;
   pinned?: boolean;
+  scope?: string[];
+  workspace?: TaskWorkspace;
   artifacts: TaskArtifactPaths;
 }
 
@@ -420,6 +465,7 @@ export interface TaskResult {
   keyFiles?: string[];
   artifacts?: Array<{ path: string; description: string }>;
   coverage?: CoverageSummary;
+  workspace?: WorkspaceResult;
   startedAt?: number;
   endedAt: number;
 }
@@ -459,6 +505,6 @@ export interface SubagentResult {
   filesChanged?: string[];
   reportPath?: string;
   resultJsonPath?: string;
-  workspace?: null;
-  patch?: null;
+  workspace?: WorkspaceResult | null;
+  patch?: string | null;
 }

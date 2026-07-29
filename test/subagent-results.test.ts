@@ -168,7 +168,9 @@ describe("managed subagent result delivery", () => {
     expect(toolResult.content.length).toBeLessThan(5_000);
     expect(toolResult.content).toContain("Report:");
     expect(toolResult.content).toContain("Result:");
-    expect(toolResult.content).toContain("worktree was ignored");
+    expect(toolResult.content).toContain("Worktree:");
+    expect(toolResult.content).toContain("Branch: rubato/");
+    expect(toolResult.content).toContain("Commits: (none)");
     const reportPath = toolResult.content.match(/Report: (.+report\.md)/)?.[1];
     expect(reportPath).toBeTruthy();
     expect(fs.readFileSync(reportPath!, "utf8")).toBe(longReport);

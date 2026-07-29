@@ -229,6 +229,54 @@ describe("agentLoop lifecycle", () => {
     }
   });
 
+  it("runtime-blocks serial broad exploration when the user explicitly requires parallel multi-project work", async () => {
+    const globHandler = vi.fn(async () => ({ content: "serial exploration" }));
+    const globTool: ToolDefinition = {
+      name: "Glob",
+      description: "broad discovery",
+      inputSchema: { type: "object", properties: {} },
+      type: "read",
+      requiresApproval: false,
+      isConcurrencySafe: true,
+      handler: globHandler,
+    };
+    fakeProvider.chat.mockImplementation(async function* () {
+      yield { type: "tool_use_start" as const, id: "glob-serial", name: "Glob" };
+      yield {
+        type: "tool_use_end" as const,
+        id: "glob-serial",
+        input: { pattern: "**/*", path: homeDir },
+      };
+      yield {
+        type: "message_stop" as const,
+        stopReason: "tool_use" as const,
+        usage: { inputTokens: 1, outputTokens: 1 },
+      };
+    });
+
+    const { agentLoop } = await import("../src/agent/loop.js");
+    const events = [];
+    for await (const event of agentLoop({
+      config,
+      workingDir: homeDir,
+      prompt: "并行探索这个目录下所有项目",
+      renderer,
+      tools: [globTool],
+      sessionId: "parallel-gate-session",
+      maxTurns: 1,
+    })) {
+      events.push(event);
+    }
+
+    expect(globHandler).not.toHaveBeenCalled();
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "tool_result",
+      name: "Glob",
+      isError: true,
+      result: expect.stringContaining("delegation gate"),
+    }));
+  });
+
   it("stops immediately after CompleteTask control without another model turn", async () => {
     const trailingRead = vi.fn(async () => ({ content: "should not run" }));
     fakeProvider.chat.mockImplementation(async function* () {

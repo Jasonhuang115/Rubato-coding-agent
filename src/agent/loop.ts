@@ -42,6 +42,7 @@ import {
 } from "../runtime/step-executor.js";
 import { processSubagentRegistry } from "./subagents/registry.js";
 import type { TaskInboxEvent } from "./subagents/conversation-inbox.js";
+import { RootDelegationGate } from "./delegation-gate.js";
 
 // ---- Configuration ----
 
@@ -160,6 +161,9 @@ export async function* agentLoop(
 
   // Plan manager
   const planManager = new PlanManager(workingDir);
+  const delegationGate = isRootProfile
+    ? new RootDelegationGate(prompt)
+    : undefined;
 
   // Agent context
   const ctx: AgentContext = {
@@ -172,6 +176,8 @@ export async function* agentLoop(
     depth: options.depth ?? 0,
     taskRuntime: options.taskRuntime,
     abortSignal: options.abortSignal,
+    onConfirmTool: options.onConfirmTool,
+    delegationGate,
   };
 
   // ---- Build system prompt via ContextAssembler ----
@@ -525,6 +531,7 @@ export async function* agentLoop(
           break;
         }
         const deviationWarning = planManager.onUserMessage(nextMessage.trim());
+        delegationGate?.observeUserMessage(nextMessage.trim());
         if (deviationWarning) {
           yield { type: "warning", message: deviationWarning };
         }
@@ -565,6 +572,7 @@ export async function* agentLoop(
           break;
         }
         const deviationWarning = planManager.onUserMessage(nextMessage.trim());
+        delegationGate?.observeUserMessage(nextMessage.trim());
         if (deviationWarning) {
           yield { type: "warning", message: deviationWarning };
         }
@@ -721,6 +729,18 @@ function formatInboxEvents(events: TaskInboxEvent[]): string {
       `Report: ${result.reportPath}`,
       `Result: ${result.resultPath}`,
       `Coverage: ${result.coveragePath}`,
+      ...(result.workspace
+        ? [
+            `Worktree: ${result.workspace.path}`,
+            `Branch: ${result.workspace.branch}`,
+            `Base commit: ${result.workspace.baseCommit}`,
+            `Head commit: ${result.workspace.headCommit}`,
+            `Commits: ${result.workspace.commits.join(", ") || "(none)"}`,
+            `Changed files: ${result.workspace.filesChanged.join(", ") || "(none)"}`,
+            `Dirty: ${result.workspace.dirty}`,
+            `Patch: ${result.workspace.patchPath}`,
+          ]
+        : []),
       "Read the report if needed, then supplement or revise the earlier response.",
     ].join("\n"))),
   ].join("\n\n");

@@ -302,6 +302,10 @@ export async function* executeTurn(
   const executableToolUses = completionIndex >= 0
     ? toolUses.slice(0, completionIndex + 1)
     : toolUses;
+  ctx.delegationGate?.prepareTurn(executableToolUses.map((toolUse) => ({
+    name: toolUse.name,
+    input: toolUse.input,
+  })));
 
   for (const tu of executableToolUses) {
     yield { type: "tool_call", id: tu.id, name: tu.name, input: tu.input };

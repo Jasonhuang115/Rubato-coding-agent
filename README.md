@@ -133,7 +133,7 @@ LIKE搜索  cosine   1-hop邻居
 
 ### Subagent 递归系统
 
-根 Agent 是项目的唯一写者。Subagent 使用 fresh context，只做探索、研究、验证、审查和任务拆解，并通过 `CompleteTask` 返回 Markdown 报告。General 可以继续派发只读 required 子任务（最多 3 层）。
+根 Agent 是唯一的协调者和集成者。Explore / Research / General / Verify 使用 fresh context 做只读工作；Worker 在独立 Git worktree 中实现、测试并提交。所有 Subagent 都通过 `CompleteTask` 返回 Markdown 报告，General 可以继续派发只读 required 子任务（最多 3 层），Worker 不能递归派发。
 
 根 Agent 在创建 TodoWrite 或开始大范围读取前先检查独立范围；存在两个以上可并行的重大范围，或材料明显无法装进单个上下文时，必须拆分任务。根 Agent 保留至少一个不重叠的主体范围并立即执行，其余范围通过 advisory 后台运行。advisory 表示“当前不阻塞”，其结果仍可能是最终汇总必需的；只有缺少结果就没有任何安全、有用的下一步时才使用 required。
 
@@ -144,16 +144,20 @@ Parent (depth=0, AgentTool ✅)
   │   │   └─ Verify (depth=3, canSpawn=false — 硬限制)
   │   └─ Explore (canSpawn=false, 只读)
   ├─ Research (canSpawn=false, 只读网络研究)
-  └─ Verify (canSpawn=false, 对抗性审查)
+  ├─ Verify (canSpawn=false, 对抗性审查)
+  └─ Worker (canSpawn=false, 独立 worktree 写入并 commit)
 ```
 
-**内置 Subagent 类型**：Explore / Research / General / Verify，也可在 `.rubato/agents/*.md` 中定义只读角色。
+**内置 Subagent 类型**：Explore / Research / General / Verify / Worker，也可在 `.rubato/agents/*.md` 中定义角色。
 
 - `required`：结果是下一步的必要决策门；父 Agent 等待，CLI 用单行状态指示器显示存活状态，Ctrl+C 可取消任务树。
 - `advisory`：当前非阻塞的后台任务；结果可以是最终汇总必需的，根 Agent在 join 点通过 Task wait/get 汇合，完成事件也会唤醒空闲会话。
-- 所有 Subagent 的工具都经过不可绕过的 allowlist，不能获得 Write、Edit、Bash、Git、Skill 或可变 MCP 工具。
+- 只读 Subagent 的 allowlist 不包含 Write、Edit、Bash、Skill 或可变 MCP 工具。只有声明 `isolation: worktree` 的 Worker 才能获得 Write、Edit、Bash；其写入目录被固定为任务 worktree。
 - 报告、机器结果和 trace 位于 `~/.rubato/projects/<projectHash>/runs/<sessionId>/`；父 Agent 默认只收到摘要和路径。
-- 普通 Subagent 不创建 worktree、不产生 patch、不并行修改代码。并行写代码保留为未来显式启用的 Batch/Worker 能力。
+- 根 Agent 先把写任务拆成不重叠 scope，再为每个 Worker 创建 `.rubato/worktrees/<taskId>` 和 `rubato/<session>/<task>` 分支。Worker 必须自行测试并 commit，结果包含 worktree、branch、base/head commit、commits、changed files 和二进制安全 patch。
+- 用户明确要求并行处理所有/多个项目、仓库、目录、模块或子系统时，运行时 delegation gate 会要求根 Agent 至少先创建一个具体的 advisory 子任务；不能只靠模型自觉串行完成。
+- 根 Agent 检查结果后使用普通 `git merge --no-ff` 或 `git cherry-pick` 逐个集成。发生冲突时，由根 Agent 在正常 agent loop 中读取三方内容、编辑、暂存、测试并完成或中止 Git 操作，不由隐藏的合并器自动处理。
+- `Task cleanup` 只会删除干净且已经集成的 worktree；脏或未合并 worktree、branch 和 artifact 都会保留。启动时只清扫超过 TTL、干净且已合并的 Rubato worktree。
 
 ### Plan 模式 + Grill Me 意图追踪
 
@@ -245,7 +249,7 @@ rubato -n "帮我写一个 hello world"
 src/
 ├── agent/                   # Agent 核心
 │   ├── loop.ts              # Async generator 核心循环
-│   ├── subagent.ts          # 只读角色定义、权限解析和兼容入口
+│   ├── subagent.ts          # 只读/Worker 角色定义、权限解析和兼容入口
 │   ├── subagents/           # Runtime/Scheduler/Runner/Artifact/Trace/Inbox
 │   ├── agent-defs.ts        # 自定义 agent 加载器
 │   ├── read-guard.ts        # 读写守卫
@@ -338,6 +342,13 @@ mnemosyne:
 
 session:
   cleanupPeriodDays: 30
+
+worktree:
+  baseRef: fresh   # fresh=origin/HEAD（不存在时退回 HEAD）；head=当前 HEAD
+
+subagents:
+  maxConcurrent: 4
+  maxWriteConcurrent: 2
 ```
 
 ### 自定义 Subagent
@@ -346,20 +357,22 @@ session:
 
 ```markdown
 ---
-name: code-reviewer
-description: Expert code reviewer
+name: api-worker
+description: API implementation worker
 tools: [Read, Grep, Glob, Bash]
 model: inherit
-readonly: true
+readonly: false
+isolation: worktree
+canSpawn: false
 maxTurns: 10
 ---
 
-You are an expert code reviewer. When reviewing:
-1. Check for correctness first
-2. Then performance
-3. Then style
-Report issues with file paths and line numbers.
+Implement the assigned non-overlapping scope, run its tests, and commit it.
 ```
+
+自定义角色只要声明 Write、Edit、Bash 或 `tools: ["*"]`，就必须同时声明
+`isolation: worktree`；写角色的 `canSpawn` 会被强制关闭。纯审查角色应只列
+`[Read, Grep, Glob]`，无需 isolation。
 
 ### MCP 服务器
 

@@ -1,4 +1,4 @@
-// Read-only subagent definitions and compatibility helpers.
+// Managed subagent definitions and capability helpers.
 
 import fs from "fs";
 import type {
@@ -13,6 +13,7 @@ import { completeTaskTool } from "../tools/complete-task.js";
 import { processSubagentRegistry } from "./subagents/registry.js";
 
 const BASIC_READ_TOOLS = ["Read", "Grep", "Glob"];
+const WORKER_TOOLS = [...BASIC_READ_TOOLS, "Write", "Edit", "Bash"];
 
 const COMPLETION_RULES = [
   "",
@@ -81,11 +82,34 @@ export const GENERAL_DEF: SubagentDefinition = {
   canSpawn: true,
 };
 
+export const WORKER_DEF: SubagentDefinition = {
+  name: "worker",
+  description: "Implements a self-contained code change in an isolated Git worktree.",
+  systemPrompt: [
+    "You are an implementation worker in an isolated Git worktree.",
+    "Work only in the current working directory. Do not switch to another checkout or worktree.",
+    "Inspect the assigned scope, implement the requested change, and run the required tests.",
+    "Before CompleteTask, stage and commit every deliverable with a descriptive commit message.",
+    "CompleteTask must report tests, the commit hash, changed files, and any scope deviation.",
+    "Do not push or open a pull request unless the task explicitly asks for it.",
+    "",
+    "## Completion protocol",
+    "- Run git status --porcelain before finishing; it must be empty.",
+    "- Finish by calling CompleteTask exactly once with a self-contained Markdown report.",
+    "- Use partial when changes remain uncommitted or verification is incomplete.",
+  ].join("\n"),
+  tools: WORKER_TOOLS,
+  readonly: false,
+  isolation: "worktree",
+  canSpawn: false,
+};
+
 const BUILTIN_DEFS: Record<string, SubagentDefinition> = {
   explore: EXPLORE_DEF,
   research: RESEARCH_DEF,
   general: GENERAL_DEF,
   verify: VERIFY_DEF,
+  worker: WORKER_DEF,
 };
 
 export function getBuiltinDefinition(name: string): SubagentDefinition {
@@ -99,23 +123,28 @@ export function getBuiltinDefinition(name: string): SubagentDefinition {
 }
 
 /**
- * Enforce the immutable read-only capability boundary. Configuration can
- * remove safe tools, but can never add mutation tools.
+ * Resolve the exact per-agent capability set. Mutation tools are available
+ * only for a worktree-isolated definition; provisioning still happens before
+ * the runner is started.
  */
 export function resolveSubagentTools(
   definition: SubagentDefinition,
   depth: number,
   maxDepth = 3,
+  worktreeReady = definition.isolation === "worktree",
 ): ToolDefinition[] {
   if (definition.name === "compact") return [];
   const requested = definition.tools.includes("*")
-    ? BASIC_READ_TOOLS
+    ? definition.isolation === "worktree" ? WORKER_TOOLS : BASIC_READ_TOOLS
     : definition.tools;
   const isCustom = !Object.hasOwn(BUILTIN_DEFS, definition.name.toLowerCase());
   const safeNames = new Set([
     ...BASIC_READ_TOOLS,
     ...(definition.name === "research" || isCustom ? ["WebFetch", "WebSearch"] : []),
     ...(definition.name === "general" && definition.canSpawn && depth < maxDepth ? ["Agent"] : []),
+    ...(definition.isolation === "worktree" && worktreeReady
+      ? ["Write", "Edit", "Bash"]
+      : []),
   ]);
   const tools = requested
     .filter((name) => safeNames.has(name))
@@ -158,22 +187,19 @@ export async function spawnSubagent(
     coveragePath: result.coveragePath,
     reportPath: result.reportPath,
     resultJsonPath: result.resultPath,
-    filesChanged: [],
-    workspace: null,
-    patch: null,
+    filesChanged: result.workspace?.filesChanged ?? [],
+    workspace: result.workspace ?? null,
+    patch: result.workspace?.patchPath ?? null,
   };
 }
 
-/** @deprecated Worktree isolation is ignored; normal subagents are read-only. */
 export async function spawnSubagentInWorktree(
   definition: SubagentDefinition,
   task: string,
   parentCtx: AgentContext,
   parentConfig: AgentConfig,
 ): Promise<SubagentResult> {
-  const result = await spawnSubagent(definition, task, parentCtx, parentConfig);
-  result.summary = `${result.summary ?? ""}\nDeprecated isolation=worktree was ignored; no worktree was created.`.trim();
-  return result;
+  return spawnSubagent({ ...definition, isolation: "worktree" }, task, parentCtx, parentConfig);
 }
 
 export interface BackgroundSubagentHandle {
@@ -215,9 +241,9 @@ export function spawnSubagentInBackground(
       coveragePath: result.coveragePath,
       reportPath: result.reportPath,
       resultJsonPath: result.resultPath,
-      filesChanged: [],
-      workspace: null,
-      patch: null,
+      filesChanged: result.workspace?.filesChanged ?? [],
+      workspace: result.workspace ?? null,
+      patch: result.workspace?.patchPath ?? null,
     };
   });
   return {

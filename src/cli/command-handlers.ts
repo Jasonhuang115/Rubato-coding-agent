@@ -253,7 +253,8 @@ export async function handleTasksCommand(input: string, rootSessionId: string): 
       console.log(
         `  ${task.taskId.padEnd(38)} ${task.status.padEnd(12)} ` +
         `${task.subagentType.padEnd(10)} ${formatTaskDuration(elapsed).padEnd(8)} ` +
-        `${task.currentActivity ?? ""}`,
+        `${task.currentActivity ?? ""}` +
+        `${task.workspace ? ` [${task.workspace.branch}]` : ""}`,
       );
     }
     return;

@@ -18,8 +18,8 @@ const RESULT_PREVIEW_LENGTH = 3_500;
 export const agentTool: ToolDefinition = {
   name: "Agent",
   description:
-    "Create a fresh-context, read-only subagent task. Subagents investigate, research, " +
-    "verify, decompose, and return Markdown reports; they cannot edit files, run Bash, or use Git. " +
+    "Create a fresh-context subagent task. Read-only agents investigate and report; the worker " +
+    "implements, tests, and commits in an isolated Git worktree. " +
     "Use dependency='advisory' when the root has other independent work it can do now; the result may " +
     "still be required at final synthesis. Use dependency='required' only when no safe useful next action " +
     "is possible until this result arrives.",
@@ -54,7 +54,13 @@ export const agentTool: ToolDefinition = {
       },
       isolation: {
         type: "string",
-        description: "Deprecated compatibility input. Accepted but ignored; no worktree is created.",
+        enum: ["worktree"],
+        description: "Run this task in an isolated Git worktree.",
+      },
+      scope: {
+        type: "array",
+        items: { type: "string" },
+        description: "Expected non-overlapping repository-relative files or directories.",
       },
     },
     required: ["description", "prompt", "dependency"],
@@ -92,6 +98,39 @@ export const agentTool: ToolDefinition = {
         ? "advisory"
         : "required";
     const dependency = ctx.taskRuntime ? "required" : requestedDependency;
+    const requestedIsolation = rawInput.isolation === "worktree"
+      ? "worktree"
+      : undefined;
+    const isolation = requestedIsolation ?? definition.isolation;
+    const requestsMutation = definition.tools.includes("*") ||
+      definition.tools.some((name) => ["Write", "Edit", "Bash"].includes(name));
+    if (requestsMutation && isolation !== "worktree") {
+      return {
+        content:
+          `Subagent "${definition.name}" requests mutation tools but is not worktree-isolated. ` +
+          "Set isolation=\"worktree\" on the definition or Agent call.",
+        isError: true,
+      };
+    }
+    if (requestsMutation && ctx.taskRuntime) {
+      return {
+        content: "Worktree writers cannot be spawned recursively; delegate this writer from the root Agent.",
+        isError: true,
+      };
+    }
+    const scope = Array.isArray(rawInput.scope)
+      ? rawInput.scope.filter((item): item is string =>
+          typeof item === "string" && item.trim().length > 0)
+        .map((item) => item.trim())
+      : undefined;
+    if (requestsMutation && !scope?.length) {
+      return {
+        content:
+          `Subagent "${definition.name}" is a writer and requires a non-empty scope of ` +
+          "repository-relative files or directories.",
+        isError: true,
+      };
+    }
     const input: AgentTaskInput = {
       description,
       prompt,
@@ -100,15 +139,22 @@ export const agentTool: ToolDefinition = {
       model: typeof rawInput.model === "string" ? rawInput.model : undefined,
       timeout_ms: typeof rawInput.timeout_ms === "number" ? rawInput.timeout_ms : undefined,
       coverage: rawInput.coverage === "exhaustive" ? "exhaustive" : "auto",
+      isolation,
+      scope,
     };
     const rootSessionId = ctx.taskRuntime?.rootSessionId ?? ctx.sessionId;
     const runtime = processSubagentRegistry.getOrCreate(rootSessionId, ctx.workingDir, ctx.config);
     const depth = (ctx.taskRuntime?.depth ?? ctx.depth ?? 0) + 1;
-    const tools = resolveSubagentTools(definition, depth, runtime.limits.maxDepth);
-    const submitted = runtime.submit(input, ctx, definition, tools);
-    const deprecation = rawInput.isolation === "worktree"
-      ? "\nDeprecated: isolation=worktree was ignored; this read-only task did not create a worktree."
-      : "";
+    const effectiveDefinition = isolation === definition.isolation
+      ? definition
+      : { ...definition, isolation };
+    const tools = resolveSubagentTools(
+      effectiveDefinition,
+      depth,
+      runtime.limits.maxDepth,
+      isolation === "worktree",
+    );
+    const submitted = runtime.submit(input, ctx, effectiveDefinition, tools);
 
     if (dependency === "advisory") {
       return {
@@ -119,7 +165,6 @@ export const agentTool: ToolDefinition = {
           `Result: ${submitted.task.artifacts.result}`,
           `Coverage: ${submitted.task.artifacts.coverage}`,
           "The parent may continue and provide an initial answer. Completion will be delivered through the session inbox.",
-          deprecation,
         ].filter(Boolean).join("\n"),
       };
     }
@@ -138,14 +183,14 @@ export const agentTool: ToolDefinition = {
       stopProgress();
     }
     return {
-      content: formatRequiredResult(result, deprecation),
+      content: formatRequiredResult(result),
       isError: result.status === "failed" || result.status === "timed_out" ||
         result.status === "cancelled" || result.status === "orphaned",
     };
   },
 };
 
-function formatRequiredResult(result: TaskResult, deprecation: string): string {
+function formatRequiredResult(result: TaskResult): string {
   let preview = "";
   try {
     preview = fs.readFileSync(result.reportPath, "utf8").slice(0, RESULT_PREVIEW_LENGTH);
@@ -160,7 +205,14 @@ function formatRequiredResult(result: TaskResult, deprecation: string): string {
     `Result: ${result.resultPath}`,
     `Transcript: ${result.transcriptPath}`,
     `Coverage: ${result.coveragePath}`,
-    deprecation,
+    result.workspace ? `Worktree: ${result.workspace.path}` : "",
+    result.workspace ? `Branch: ${result.workspace.branch}` : "",
+    result.workspace ? `Base commit: ${result.workspace.baseCommit}` : "",
+    result.workspace ? `Head commit: ${result.workspace.headCommit}` : "",
+    result.workspace ? `Commits: ${result.workspace.commits.join(", ") || "(none)"}` : "",
+    result.workspace ? `Changed files: ${result.workspace.filesChanged.join(", ") || "(none)"}` : "",
+    result.workspace ? `Dirty: ${result.workspace.dirty}` : "",
+    result.workspace ? `Patch: ${result.workspace.patchPath}` : "",
     "",
     "Report preview:",
     preview,

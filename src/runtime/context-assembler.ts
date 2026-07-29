@@ -65,7 +65,10 @@ export async function assembleContext(
   // 1. Build prompt layers via PromptAssembler
   const layeredSystem = contextProfile === "subagent"
     ? [
-        buildSubagentStaticPrompt(roleSystemPrompt || "You are a read-only analysis subagent."),
+        buildSubagentStaticPrompt(
+          roleSystemPrompt || "You are a read-only analysis subagent.",
+          tools.some((tool) => tool.type === "write"),
+        ),
         buildCapabilityPrompt(tools),
       ].join("\n\n")
     : getPromptAssembler(providerName).assembleFlat(ctx, tools);

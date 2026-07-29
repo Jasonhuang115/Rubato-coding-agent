@@ -13,14 +13,20 @@ export function buildStaticPrompt(): string {
 }
 
 /** Static layer for a fresh-context subagent. The role replaces root identity. */
-export function buildSubagentStaticPrompt(roleSystemPrompt: string): string {
+export function buildSubagentStaticPrompt(
+  roleSystemPrompt: string,
+  writable = false,
+): string {
   return [
     roleSystemPrompt.trim(),
     security(),
     confidentiality(),
     `## Subagent Boundary
 
-- You are a read-only analysis worker. You must not modify project files, run shell commands, or perform Git operations.
+- You are a ${writable ? "worktree-isolated implementation worker" : "read-only analysis worker"}.
+${writable
+  ? "- Modify files only inside the current worktree. Test and commit the complete deliverable before finishing."
+  : "- You must not modify project files, run shell commands, or perform Git operations."}
 - Work only on the task in the current user message; no parent conversation history is available.
 - Ground conclusions in evidence paths and explicitly state uncertainty.
 - When finished, you MUST call CompleteTask exactly once with a self-contained Markdown report. Do not merely end with ordinary text.`,

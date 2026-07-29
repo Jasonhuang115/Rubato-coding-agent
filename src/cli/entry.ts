@@ -465,6 +465,15 @@ async function main(): Promise<void> {
       `Recovered ${recoveredOrphans.length} interrupted subagent task(s) as orphaned. ` +
       "Use /trace or inspect their result.json files for details.",
     );
+    for (const result of recoveredOrphans) {
+      console.warn(
+        result.workspace
+          ? `  ${result.taskId}: branch=${result.workspace.branch} ` +
+            `worktree=${result.workspace.path} dirty=${result.workspace.dirty} ` +
+            `result=${result.resultPath}`
+          : `  ${result.taskId}: result=${result.resultPath}`,
+      );
+    }
   }
 
   // CLI overrides

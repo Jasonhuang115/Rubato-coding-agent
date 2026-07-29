@@ -157,8 +157,12 @@ export function loadConfig(workingDir: string): AgentConfig {
     session: {
       cleanupPeriodDays: fileConfig.session?.cleanupPeriodDays ?? 30,
     },
+    worktree: {
+      baseRef: fileConfig.worktree?.baseRef === "head" ? "head" : "fresh",
+    },
     subagents: {
       maxConcurrent: fileConfig.subagents?.maxConcurrent ?? 4,
+      maxWriteConcurrent: fileConfig.subagents?.maxWriteConcurrent ?? 2,
       maxTasksPerSession: fileConfig.subagents?.maxTasksPerSession ?? 32,
       maxDepth: fileConfig.subagents?.maxDepth ?? 3,
       stallTimeoutMs: fileConfig.subagents?.stallTimeoutMs ?? 15 * 60_000,

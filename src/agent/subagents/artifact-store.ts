@@ -10,6 +10,7 @@ import type {
 } from "../../shared/core-types.js";
 import { redactText, redactValue } from "./redaction.js";
 import { coverageSummary, emptyCoverageManifest } from "./coverage.js";
+import { WorktreeManager } from "../worktrees/worktree-manager.js";
 
 export class ArtifactStore {
   readonly projectDir: string;
@@ -56,6 +57,7 @@ export class ArtifactStore {
       report: path.join(taskDir, "report.md"),
       transcript: path.join(taskDir, "transcript.jsonl"),
       coverage: path.join(taskDir, "coverage.json"),
+      patch: path.join(taskDir, "changes.patch"),
     };
   }
 
@@ -70,6 +72,25 @@ export class ArtifactStore {
       prompt: task.prompt,
       subagentType: task.subagentType,
       dependency: task.dependency,
+      scope: task.scope,
+      workspace: task.workspace,
+      depth: task.depth,
+      createdAt: task.createdAt,
+    }));
+  }
+
+  updateTask(task: TaskDetail): void {
+    writeJsonAtomic(task.artifacts.task, redactValue({
+      taskId: task.taskId,
+      agentId: task.agentId,
+      rootSessionId: task.rootSessionId,
+      parentTaskId: task.parentTaskId,
+      description: task.description,
+      prompt: task.prompt,
+      subagentType: task.subagentType,
+      dependency: task.dependency,
+      scope: task.scope,
+      workspace: task.workspace,
       depth: task.depth,
       createdAt: task.createdAt,
     }));
@@ -156,7 +177,11 @@ export class ArtifactStore {
     const removed: string[] = [];
     const now = Date.now();
     const candidates = entries
-      .filter((entry) => entry.terminal && !entry.pinned && !protectedIds.has(entry.taskId))
+      .filter((entry) =>
+        entry.terminal &&
+        !entry.pinned &&
+        !entry.hasLiveWorkspace &&
+        !protectedIds.has(entry.taskId))
       .sort((left, right) => left.mtimeMs - right.mtimeMs);
 
     for (const entry of candidates) {
@@ -184,8 +209,33 @@ export class ArtifactStore {
         const task = JSON.parse(fs.readFileSync(paths.task, "utf8")) as {
           agentId: string;
           createdAt?: number;
+          workspace?: import("../../shared/core-types.js").TaskWorkspace;
+          scope?: string[];
         };
         const endedAt = Date.now();
+        let workspaceResult;
+        if (task.workspace && fs.existsSync(task.workspace.path)) {
+          try {
+            workspaceResult = new WorktreeManager(task.workspace.repoRoot, {}).finalize(
+              task.workspace,
+              paths.patch,
+              task.scope,
+            );
+          } catch {
+            // Preserve a conservative recovery record when Git inspection fails.
+          }
+        }
+        workspaceResult ??= task.workspace
+          ? {
+              ...task.workspace,
+              headCommit: task.workspace.baseCommit,
+              commits: [],
+              filesChanged: [],
+              dirty: fs.existsSync(task.workspace.path),
+              patchPath: paths.patch,
+              scopeDeviations: [],
+            }
+          : undefined;
         const result: TaskResult = {
           taskId,
           agentId: task.agentId,
@@ -200,6 +250,7 @@ export class ArtifactStore {
           error: "Recovered without a live task process.",
           startedAt: task.createdAt,
           endedAt,
+          workspace: workspaceResult,
         };
         this.finalizeTask(
           {
@@ -216,6 +267,7 @@ export class ArtifactStore {
             endedAt,
             lastActivityAt: endedAt,
             childCount: 0,
+            workspace: task.workspace,
             artifacts: paths,
           },
           result,
@@ -258,6 +310,7 @@ export class ArtifactStore {
     mtimeMs: number;
     pinned: boolean;
     terminal: boolean;
+    hasLiveWorkspace: boolean;
   }> {
     const runsDir = path.join(this.projectDir, "runs");
     if (!fs.existsSync(runsDir)) return [];
@@ -268,6 +321,7 @@ export class ArtifactStore {
       mtimeMs: number;
       pinned: boolean;
       terminal: boolean;
+      hasLiveWorkspace: boolean;
     }> = [];
     for (const run of fs.readdirSync(runsDir, { withFileTypes: true })) {
       if (!run.isDirectory()) continue;
@@ -277,13 +331,30 @@ export class ArtifactStore {
         if (!task.isDirectory()) continue;
         const taskDir = path.join(tasksDir, task.name);
         const stat = fs.statSync(taskDir);
+        const resultPath = path.join(taskDir, "result.json");
+        let hasLiveWorkspace = false;
+        if (fs.existsSync(resultPath)) {
+          try {
+            const result = JSON.parse(fs.readFileSync(resultPath, "utf8")) as TaskResult;
+            if (result.workspace) {
+              const manager = WorktreeManager.tryCreate(result.workspace.repoRoot, {});
+              hasLiveWorkspace = !manager ||
+                !manager.isCleanupSafe(result.workspace, result.workspace);
+              if (fs.existsSync(result.workspace.path)) hasLiveWorkspace = true;
+            }
+          } catch {
+            // Preserve corrupt terminal metadata for manual recovery.
+            hasLiveWorkspace = true;
+          }
+        }
         entries.push({
           taskId: task.name,
           taskDir,
           bytes: directorySize(taskDir),
           mtimeMs: stat.mtimeMs,
           pinned: fs.existsSync(path.join(taskDir, ".pinned")),
-          terminal: fs.existsSync(path.join(taskDir, "result.json")),
+          terminal: fs.existsSync(resultPath),
+          hasLiveWorkspace,
         });
       }
     }

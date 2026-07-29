@@ -99,6 +99,14 @@ export class ToolRuntime {
         denied: false,
       };
     }
+    const delegationBlock = ctx.delegationGate?.check(toolName, input);
+    if (delegationBlock) {
+      return {
+        content: delegationBlock,
+        isError: true,
+        denied: false,
+      };
+    }
 
     // CompleteTask is a runtime control protocol, not a project action. It
     // bypasses ordinary permission policy but remains scoped to subagents.
@@ -116,6 +124,11 @@ export class ToolRuntime {
         return this.denyResult(decision);
 
       case "confirm":
+        // A scoped runtime may explicitly mark a control/orchestration tool as
+        // non-interactive. It still passed the hard blacklist and sandbox
+        // checks above; only the generic "unknown tool = confirm" policy is
+        // bypassed here. Project mutation tools never use this path.
+        if (scopedTool?.requiresApproval === false) break;
         return this.handleConfirm(toolName, executableInput, decision, ctx);
 
       case "warn":
@@ -129,9 +142,11 @@ export class ToolRuntime {
 
     // 3. Dispatch to tool handler
     const result = await this.dispatchScoped(toolName, executableInput, ctx);
+    const normalized = this.fromToolResult(result);
+    ctx.delegationGate?.recordToolResult(toolName, !normalized.isError);
 
     return {
-      ...this.fromToolResult(result),
+      ...normalized,
       security: {
         verdict: decision.verdict,
         risk: decision.risk,
@@ -174,8 +189,16 @@ export class ToolRuntime {
     ctx: AgentContext,
   ): Promise<ToolRuntimeResult> {
     if (!this.onConfirmTool) {
-      // Non-interactive session (subagent, one-shot): auto-approve confirm tools.
-      // Policy check + sandbox validation already passed; no user available to ask.
+      return {
+        content: `Permission required for ${toolName}, but no interactive approval channel is available.`,
+        isError: true,
+        denied: true,
+        security: {
+          verdict: "confirm",
+          risk: decision.risk,
+          reason: "No interactive approval channel",
+        },
+      };
     } else {
       const userDecision = await this.onConfirmTool(toolName, input);
 
@@ -214,7 +237,7 @@ export class ToolRuntime {
       }
     }
 
-    // allow_once, allow_always, or auto-approve: proceed to dispatch
+    // allow_once or allow_always: proceed to dispatch
     const result = await this.dispatchScoped(toolName, input, ctx);
 
     return {

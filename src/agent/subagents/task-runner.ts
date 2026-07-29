@@ -29,6 +29,10 @@ export interface TaskRunnerInput {
   tools: ToolDefinition[];
   coverageRequired: boolean;
   abortSignal: AbortSignal;
+  onConfirmTool?: (
+    toolName: string,
+    input: Record<string, unknown>,
+  ) => Promise<import("../../shared/core-types.js").ConfirmDecision>;
   trace: TraceSink;
   onActivity: (activity: string, toolName?: string) => void;
 }
@@ -103,6 +107,7 @@ export class TaskRunner {
         contextProfile: input.definition.name === "compact" ? "compact" : "subagent",
         completionRetryTurns: input.definition.name === "compact" ? 0 : 1,
         abortSignal: input.abortSignal,
+        onConfirmTool: input.onConfirmTool,
         taskRuntime: runtimeContext,
       })) {
         switch (event.type) {

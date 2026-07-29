@@ -13,7 +13,14 @@ export function loadCustomDefinitions(projectDir: string): SubagentDefinition[] 
   const definitions: SubagentDefinition[] = [];
   try {
     for (const file of fs.readdirSync(agentsDir).filter((f) => f.endsWith(".md"))) {
-      try { const def = parseAgentFile(path.join(agentsDir, file)); if (def) definitions.push(def); } catch { /* skip */ }
+      try {
+        const def = parseAgentFile(path.join(agentsDir, file));
+        if (def) definitions.push(def);
+      } catch (error) {
+        console.warn(
+          `Custom agent "${file}" was not loaded: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
     }
   } catch { /* skip */ }
   return definitions;
@@ -34,34 +41,40 @@ function parseAgentFile(filePath: string): SubagentDefinition | null {
   const declaredTools = Array.isArray(fm.tools)
     ? fm.tools.filter((tool): tool is string => typeof tool === "string")
     : ["Read", "Grep", "Glob"];
-  const safeTools = sanitizeCustomTools(declaredTools);
-  const stripped = declaredTools.includes("*")
-    ? ["* (restricted to readonly defaults)"]
-    : declaredTools.filter((tool) => !safeTools.includes(tool));
-  if (stripped.length > 0 || fm.readonly === false || fm.canSpawn === true) {
-    console.warn(
-      `Custom agent "${fName}" was restricted to read-only, non-recursive tools. ` +
-      `Removed: ${stripped.join(", ") || "write/recursion flags"}.`,
-    );
+  const isolation = fm.isolation === "worktree" ? "worktree" : undefined;
+  const safeTools = sanitizeCustomTools(declaredTools, isolation);
+  const requestsWrite = declaredTools.includes("*") ||
+    declaredTools.some((tool) => ["Write", "Edit", "Bash"].includes(tool));
+  if (requestsWrite && isolation !== "worktree") {
+    throw new Error("Write, Edit, and Bash require `isolation: worktree`.");
+  }
+  if (requestsWrite && fm.canSpawn === true) {
+    console.warn(`Custom writer "${fName}" cannot spawn subagents; canSpawn was disabled.`);
   }
 
   return {
     name: fName,
     description: fDesc,
     systemPrompt,
-    // Custom agents are always read-only and non-recursive. Unsafe legacy
-    // declarations are stripped again by resolveSubagentTools at runtime.
     tools: safeTools,
     model: (fm.model as string) ?? "inherit",
-    readonly: true,
-    canSpawn: false,
+    readonly: !requestsWrite,
+    isolation,
+    canSpawn: requestsWrite ? false : fm.canSpawn === true,
     maxTurns: (fm.maxTurns as number) || undefined,
   };
 }
 
-function sanitizeCustomTools(tools: string[]): string[] {
-  const allowed = new Set(["Read", "Grep", "Glob", "WebFetch", "WebSearch"]);
-  if (tools.includes("*")) return ["Read", "Grep", "Glob"];
+function sanitizeCustomTools(tools: string[], isolation?: "worktree"): string[] {
+  const allowed = new Set([
+    "Read", "Grep", "Glob", "WebFetch", "WebSearch",
+    ...(isolation === "worktree" ? ["Write", "Edit", "Bash"] : []),
+  ]);
+  if (tools.includes("*")) {
+    return isolation === "worktree"
+      ? ["Read", "Grep", "Glob", "Write", "Edit", "Bash"]
+      : ["Read", "Grep", "Glob"];
+  }
   return tools.filter((tool) => allowed.has(tool));
 }
 
@@ -96,7 +109,7 @@ export function initCustomDefinitions(projectDir: string): void {
 
 export async function getAllDefinitions(): Promise<SubagentDefinition[]> {
   const { getBuiltinDefinition } = await import("./subagent.js");
-  return ["explore", "research", "general", "verify"]
+  return ["explore", "research", "general", "verify", "worker"]
     .map((n) => getBuiltinDefinition(n))
     .concat(customDefs);
 }

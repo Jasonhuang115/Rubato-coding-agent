@@ -84,6 +84,13 @@ export const globTool: ToolDefinition = {
       ? `No files matching "${pattern}" in ${searchPath}`
       : `${results.length} file${results.length === 1 ? "" : "s"} matching "${pattern}" in ${searchPath}${truncated ? ` (limited to ${maxResults})` : ""}:\n\n${output}`;
     const diagnostics = [
+      ...(truncated
+        ? [
+            `INCOMPLETE DISCOVERY: the result limit (${maxResults}) was reached. ` +
+            "These entries are only a partial sample; narrow or partition the search " +
+            "before claiming all files/projects were inspected.",
+          ]
+        : []),
       ...policyExclusions.map((entry) =>
         `Glob policy exclusion: ${entry.path} (${entry.reason})`),
       ...skipped.map((entry) =>

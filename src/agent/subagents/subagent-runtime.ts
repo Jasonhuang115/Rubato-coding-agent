@@ -18,9 +18,11 @@ import { TaskRunner, type TaskRunnerOutput } from "./task-runner.js";
 import { TaskScheduler } from "./task-scheduler.js";
 import { TraceSink } from "./trace-sink.js";
 import { coverageSummary, emptyCoverageManifest } from "./coverage.js";
+import { WorktreeManager } from "../worktrees/worktree-manager.js";
 
 export const DEFAULT_SUBAGENT_LIMITS: SubagentLimits = {
   maxConcurrent: 4,
+  maxWriteConcurrent: 2,
   maxTasksPerSession: 32,
   maxDepth: 3,
   stallTimeoutMs: 15 * 60_000,
@@ -37,6 +39,8 @@ interface TaskRecord {
   promise: Promise<TaskResult>;
   forcedStatus?: "timed_out" | "cancelled";
   children: Set<string>;
+  onConfirmTool?: AgentContext["onConfirmTool"];
+  writer: boolean;
 }
 
 export interface SubmittedTask {
@@ -56,6 +60,13 @@ export class SubagentRuntime implements TaskService {
   private readonly runner: Pick<TaskRunner, "run">;
   private readonly tasks = new Map<string, TaskRecord>();
   private readonly listeners = new Set<TaskStatusListener>();
+  private confirmationTail: Promise<void> = Promise.resolve();
+  private writeActive = 0;
+  private readonly writeWaiters: Array<{
+    resolve: () => void;
+    signal: AbortSignal;
+    onAbort: () => void;
+  }> = [];
   private createdTaskCount = 0;
 
   constructor(
@@ -71,6 +82,19 @@ export class SubagentRuntime implements TaskService {
     this.inbox = new ConversationInbox(rootSessionId);
     this.scheduler = new TaskScheduler(this.limits.maxConcurrent);
     this.trace.append({ type: "subagent_runtime_created", sessionId: rootSessionId });
+    const worktrees = WorktreeManager.tryCreate(workingDir, config);
+    if (worktrees) {
+      const cutoff = Date.now() -
+        config.session.cleanupPeriodDays * 24 * 60 * 60_000;
+      for (const removedPath of worktrees.sweepMergedWorktrees(cutoff)) {
+        this.trace.append({
+          type: "worktree_removed",
+          sessionId: rootSessionId,
+          path: removedPath,
+          reason: "startup sweep of old integrated worktree",
+        });
+      }
+    }
     for (const result of this.artifacts.recoverOrphaned()) {
       this.trace.append({
         type: "task_recovered_orphaned",
@@ -102,9 +126,35 @@ export class SubagentRuntime implements TaskService {
     const parentTaskId = parentCtx.taskRuntime?.taskId;
     const depth = (parentCtx.taskRuntime?.depth ?? parentCtx.depth ?? 0) + 1;
     const dependency = parentTaskId ? "required" : (input.dependency ?? "required");
+    const writer = definition.isolation === "worktree" &&
+      definition.tools.some((name) => ["Write", "Edit", "Bash", "*"].includes(name));
 
     if (depth > this.limits.maxDepth) {
       return this.rejectedTask(input, definition, parentTaskId, depth, "Maximum subagent recursion depth exceeded.");
+    }
+    if (writer && !input.scope?.length) {
+      return this.rejectedTask(
+        input,
+        definition,
+        parentTaskId,
+        depth,
+        "Worktree writers require an explicit non-overlapping scope.",
+      );
+    }
+    if (writer) {
+      const overlap = [...this.tasks.values()].find((candidate) =>
+        candidate.writer &&
+        !isTerminal(candidate.detail.status) &&
+        scopesOverlap(input.scope!, candidate.detail.scope ?? []));
+      if (overlap) {
+        return this.rejectedTask(
+          input,
+          definition,
+          parentTaskId,
+          depth,
+          `Writer scope overlaps active task ${overlap.detail.taskId}.`,
+        );
+      }
     }
     if (this.createdTaskCount >= this.limits.maxTasksPerSession) {
       return this.rejectedTask(input, definition, parentTaskId, depth, "Root session subagent task budget exceeded.");
@@ -130,6 +180,7 @@ export class SubagentRuntime implements TaskService {
       lastActivityAt: createdAt,
       currentActivity: "queued",
       childCount: 0,
+      scope: input.scope,
       artifacts,
     };
 
@@ -143,6 +194,11 @@ export class SubagentRuntime implements TaskService {
       resolve: resolveResult,
       promise,
       children: new Set(),
+      onConfirmTool: parentCtx.onConfirmTool
+        ? (toolName, toolInput) =>
+            this.requestConfirmation(parentCtx.onConfirmTool!, toolName, toolInput)
+        : undefined,
+      writer,
     };
     this.tasks.set(taskId, record);
     this.artifacts.initializeTask(detail);
@@ -299,6 +355,22 @@ export class SubagentRuntime implements TaskService {
     if (!isTerminal(record.detail.status)) {
       throw new Error(`Cannot cleanup non-terminal task ${taskId}`);
     }
+    if (record.detail.workspace) {
+      const manager = new WorktreeManager(record.detail.workspace.repoRoot, this.config);
+      if (!manager.cleanupIfSafe(record.detail.workspace, record.detail.result?.workspace)) {
+        throw new Error(
+          `Worktree ${record.detail.workspace.path} contains uncommitted or unmerged work; ` +
+          "merge/cherry-pick the branch before cleanup.",
+        );
+      }
+      this.trace.append({
+        type: "worktree_removed",
+        sessionId: this.rootSessionId,
+        taskId,
+        agentId: record.detail.agentId,
+        reason: "task cleanup after integration",
+      });
+    }
     this.artifacts.removeTask(taskId);
     this.tasks.delete(taskId);
     this.trace.append({
@@ -381,6 +453,34 @@ export class SubagentRuntime implements TaskService {
     definition: SubagentDefinition,
     tools: ToolDefinition[],
   ): Promise<void> {
+    const isWriter = definition.isolation === "worktree" &&
+      definition.tools.some((name) => ["Write", "Edit", "Bash", "*"].includes(name));
+    let releaseWriteSlot = () => {};
+    try {
+      if (isWriter) {
+        try {
+          releaseWriteSlot = await this.acquireWriteSlot(record.controller.signal);
+        } catch {
+          this.finalizeWithoutRun(
+            record,
+            "cancelled",
+            "Task was cancelled while waiting for an isolated writer slot.",
+          );
+          return;
+        }
+      }
+      await this.executeRecord(record, input, definition, tools);
+    } finally {
+      releaseWriteSlot();
+    }
+  }
+
+  private async executeRecord(
+    record: TaskRecord,
+    input: AgentTaskInput,
+    definition: SubagentDefinition,
+    tools: ToolDefinition[],
+  ): Promise<void> {
     const detail = record.detail;
     detail.status = "running";
     detail.startedAt = Date.now();
@@ -429,9 +529,38 @@ export class SubagentRuntime implements TaskService {
       this.emit(record);
     };
 
-    let output: TaskRunnerOutput;
+    let output: TaskRunnerOutput | undefined;
+    let worktreeManager: WorktreeManager | undefined;
+    let taskWorkingDir = this.workingDir;
+    if (input.isolation === "worktree" || definition.isolation === "worktree") {
+      try {
+        worktreeManager = new WorktreeManager(this.workingDir, this.config);
+        detail.currentActivity = "creating worktree";
+        detail.workspace = worktreeManager.create(detail.taskId, this.rootSessionId);
+        taskWorkingDir = detail.workspace.path;
+        this.artifacts.updateTask(detail);
+        this.trace.append({
+          type: "worktree_created",
+          sessionId: this.rootSessionId,
+          taskId: detail.taskId,
+          agentId: detail.agentId,
+          path: detail.workspace.path,
+          branch: detail.workspace.branch,
+          baseCommit: detail.workspace.baseCommit,
+          sourceDirty: detail.workspace.sourceDirty,
+        });
+      } catch (error) {
+        output = {
+          status: "failed",
+          summary: "The isolated Git worktree could not be created.",
+          report: `# Worktree creation failed\n\n${error instanceof Error ? error.message : String(error)}`,
+          usage: { inputTokens: 0, outputTokens: 0, toolCalls: 0 },
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
+    }
     try {
-      output = await this.raceAbort(this.runner.run({
+      output ??= await this.raceAbort(this.runner.run({
         rootSessionId: this.rootSessionId,
         parentSessionId: this.rootSessionId,
         parentTaskId: detail.parentTaskId,
@@ -442,8 +571,24 @@ export class SubagentRuntime implements TaskService {
           `Task: ${detail.description}`,
           "",
           input.prompt,
+          ...(detail.scope?.length
+            ? ["", `Expected scope: ${detail.scope.join(", ")}`]
+            : []),
+          ...(detail.workspace
+            ? [
+                "",
+                `Isolated worktree: ${detail.workspace.path}`,
+                `Branch: ${detail.workspace.branch}`,
+                `Base commit: ${detail.workspace.baseCommit}`,
+                detail.workspace.sourceDirty
+                  ? "Warning: the source checkout is dirty; its uncommitted changes are not present here."
+                  : "",
+              ].filter(Boolean)
+            : []),
           "",
-          "Return evidence, conclusions, uncertainty, and recommended next steps.",
+          definition.isolation === "worktree"
+            ? "Implement, test, commit the deliverable, and report branch/commit evidence."
+            : "Return evidence, conclusions, uncertainty, and recommended next steps.",
           "You must finish by calling CompleteTask with a self-contained Markdown report.",
         ].join("\n"),
         definition,
@@ -453,10 +598,11 @@ export class SubagentRuntime implements TaskService {
             ? { ...this.config.model, model: input.model }
             : { ...this.config.model },
         },
-        workingDir: this.workingDir,
+        workingDir: taskWorkingDir,
         tools,
         coverageRequired: input.coverage === "exhaustive",
         abortSignal: record.controller.signal,
+        onConfirmTool: record.onConfirmTool,
         trace: this.trace,
         onActivity,
       }), record.controller.signal);
@@ -477,7 +623,66 @@ export class SubagentRuntime implements TaskService {
       clearTimeout(stallTimer);
     }
 
-    const status = record.forcedStatus ?? output.status;
+    output ??= {
+      status: "failed",
+      summary: "Task ended without a runner result.",
+      report: "# Incomplete task\n\nNo runner result was produced.",
+      usage: { inputTokens: 0, outputTokens: 0, toolCalls: 0 },
+      error: "No runner result was produced.",
+    };
+    let status = record.forcedStatus ?? output.status;
+    let workspaceResult;
+    if (detail.workspace && worktreeManager) {
+      try {
+        workspaceResult = worktreeManager.finalize(
+          detail.workspace,
+          detail.artifacts.patch,
+          detail.scope,
+        );
+        if (workspaceResult.dirty && status === "completed") {
+          status = "partial";
+          output.summary =
+            `${output.summary} Worktree has uncommitted changes; resume the worker and commit before integration.`;
+        }
+        const noTaskCommits = workspaceResult.commits.length === 0;
+        const isWriter = definition.tools.some((name) =>
+          ["Write", "Edit", "Bash", "*"].includes(name));
+        if (isWriter && noTaskCommits && status === "completed") {
+          status = "partial";
+          output.summary =
+            `${output.summary} Worker produced no commit, so there is nothing to integrate.`;
+        }
+        if (!workspaceResult.dirty && noTaskCommits) {
+          const cleaned = worktreeManager.cleanupIfSafe(detail.workspace, workspaceResult);
+          if (cleaned) {
+            this.trace.append({
+              type: "worktree_removed",
+              sessionId: this.rootSessionId,
+              taskId: detail.taskId,
+              agentId: detail.agentId,
+              reason: "clean task with no commits",
+            });
+          }
+        }
+        this.trace.append({
+          type: "worktree_finalized",
+          sessionId: this.rootSessionId,
+          taskId: detail.taskId,
+          agentId: detail.agentId,
+          branch: workspaceResult.branch,
+          headCommit: workspaceResult.headCommit,
+          commits: workspaceResult.commits,
+          filesChanged: workspaceResult.filesChanged,
+          dirty: workspaceResult.dirty,
+          patchPath: workspaceResult.patchPath,
+          scopeDeviations: workspaceResult.scopeDeviations,
+        });
+      } catch (error) {
+        status = "failed";
+        output.error = error instanceof Error ? error.message : String(error);
+        output.summary = `${output.summary} Worktree finalization failed: ${output.error}`;
+      }
+    }
     const finalCoverage = output.coverage ??
       emptyCoverageManifest(input.coverage === "exhaustive");
     detail.status = status;
@@ -499,6 +704,7 @@ export class SubagentRuntime implements TaskService {
       keyFiles: output.completion?.key_files,
       artifacts: output.completion?.artifacts,
       coverage: coverageSummary(finalCoverage),
+      workspace: workspaceResult,
       startedAt: detail.startedAt,
       endedAt: detail.endedAt,
     };
@@ -527,6 +733,48 @@ export class SubagentRuntime implements TaskService {
         });
       }
     }
+  }
+
+  private async requestConfirmation(
+    handler: NonNullable<AgentContext["onConfirmTool"]>,
+    toolName: string,
+    input: Record<string, unknown>,
+  ): Promise<Awaited<ReturnType<NonNullable<AgentContext["onConfirmTool"]>>>> {
+    const request = this.confirmationTail.then(() => handler(toolName, input));
+    this.confirmationTail = request.then(() => undefined, () => undefined);
+    return request;
+  }
+
+  private async acquireWriteSlot(signal: AbortSignal): Promise<() => void> {
+    const limit = Math.max(1, this.limits.maxWriteConcurrent);
+    if (this.writeActive >= limit) {
+      await new Promise<void>((resolve, reject) => {
+        const waiter = {
+          resolve,
+          signal,
+          onAbort: () => {
+            const index = this.writeWaiters.indexOf(waiter);
+            if (index >= 0) this.writeWaiters.splice(index, 1);
+            reject(signal.reason ?? new Error("Task cancelled"));
+          },
+        };
+        this.writeWaiters.push(waiter);
+        signal.addEventListener("abort", waiter.onAbort, { once: true });
+      });
+    }
+    if (signal.aborted) throw signal.reason ?? new Error("Task cancelled");
+    this.writeActive++;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.writeActive = Math.max(0, this.writeActive - 1);
+      const next = this.writeWaiters.shift();
+      if (next) {
+        next.signal.removeEventListener("abort", next.onAbort);
+        next.resolve();
+      }
+    };
   }
 
   private finalizeWithoutRun(
@@ -617,6 +865,7 @@ export class SubagentRuntime implements TaskService {
       resolve,
       promise,
       children: new Set(),
+      writer: false,
     };
     this.tasks.set(taskId, record);
     this.artifacts.initializeTask(detail);
@@ -703,6 +952,18 @@ export function isTerminal(status: SubagentTaskStatus): boolean {
   return status === "completed" || status === "partial" || status === "blocked" ||
     status === "failed" || status === "timed_out" || status === "cancelled" ||
     status === "orphaned";
+}
+
+function scopesOverlap(left: string[], right: string[]): boolean {
+  return left.some((leftEntry) => right.some((rightEntry) => {
+    const a = normalizeScope(leftEntry);
+    const b = normalizeScope(rightEntry);
+    return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
+  }));
+}
+
+function normalizeScope(value: string): string {
+  return value.trim().replace(/\\/g, "/").replace(/^\.?\//, "").replace(/\/$/, "");
 }
 
 function formatElapsed(ms: number): string {

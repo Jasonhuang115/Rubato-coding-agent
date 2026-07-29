@@ -126,7 +126,7 @@ describe("subagent capability boundary", () => {
     expect(second.content).toContain("already");
   });
 
-  it("strips unsafe custom-agent declarations at load time and warns", async () => {
+  it("rejects custom writers without worktree isolation", async () => {
     const project = fs.mkdtempSync(path.join(os.tmpdir(), "rubato-custom-agent-"));
     const agentsDir = path.join(project, ".rubato", "agents");
     fs.mkdirSync(agentsDir, { recursive: true });
@@ -143,11 +143,43 @@ describe("subagent capability boundary", () => {
     const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
       const { loadCustomDefinitions } = await import("../src/agent/agent-defs.js");
+      const loaded = loadCustomDefinitions(project);
+      expect(loaded).toEqual([]);
+      expect(warning).toHaveBeenCalledWith(
+        expect.stringContaining("require `isolation: worktree`"),
+      );
+    } finally {
+      warning.mockRestore();
+      fs.rmSync(project, { recursive: true, force: true });
+    }
+  });
+
+  it("loads a custom writer only with worktree isolation and disables recursion", async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), "rubato-custom-writer-"));
+    const agentsDir = path.join(project, ".rubato", "agents");
+    fs.mkdirSync(agentsDir, { recursive: true });
+    fs.writeFileSync(path.join(agentsDir, "writer.md"), [
+      "---",
+      "name: writer",
+      "description: isolated writer",
+      "tools: [Read, Write, Edit, Bash, Agent]",
+      "readonly: false",
+      "isolation: worktree",
+      "canSpawn: true",
+      "---",
+      "Implement and commit the assigned scope.",
+    ].join("\n"));
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const { loadCustomDefinitions } = await import("../src/agent/agent-defs.js");
       const [loaded] = loadCustomDefinitions(project);
-      expect(loaded.tools).toEqual(["Read"]);
-      expect(loaded.readonly).toBe(true);
-      expect(loaded.canSpawn).toBe(false);
-      expect(warning).toHaveBeenCalledWith(expect.stringContaining("Removed: Write, Bash, Agent"));
+      expect(loaded).toMatchObject({
+        tools: ["Read", "Write", "Edit", "Bash"],
+        readonly: false,
+        isolation: "worktree",
+        canSpawn: false,
+      });
+      expect(warning).toHaveBeenCalledWith(expect.stringContaining("cannot spawn"));
     } finally {
       warning.mockRestore();
       fs.rmSync(project, { recursive: true, force: true });

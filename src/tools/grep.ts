@@ -240,5 +240,9 @@ function formatResults(
     })
     .join("\n");
 
-  return header + formatted;
+  const warning = truncated
+    ? `\n\nINCOMPLETE SEARCH: the match limit (${maxMatches}) was reached. ` +
+      "Do not treat this output as exhaustive; narrow or partition the search."
+    : "";
+  return header + formatted + warning;
 }
