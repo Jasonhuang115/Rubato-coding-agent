@@ -235,7 +235,7 @@ export class ShellSandbox implements ISandbox {
         ? path.resolve(filePath)
         : path.resolve(effectiveWorkdir, filePath);
       const result = this.fsSandbox.validate(
-        category === "safe" ? "Read" : "Write",
+        category === "safe" ? "BashRead" : "BashWrite",
         { file_path: concretePath },
         workspaceRoot,
       );

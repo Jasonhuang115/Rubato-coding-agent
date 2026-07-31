@@ -125,6 +125,11 @@ REPL Commands:
   /exit, /quit         Exit the chat
   /paste               Send the full clipboard as one prompt
   /clear               Start a fresh session (saves current)
+  /remember <text>     Record explicit user-authored memory evidence
+  /memory stats        Show verified file-memory status
+  /memory search <q>   Grep the verified catalog (no semantic retrieval)
+  /profile show        Show the bounded user profile
+  /profile why <key>   Explain a memory's evidence and revision
   /sessions            List project sessions
   /sessions resume <n> Resume a past session
   /scrub --dry-run     Audit persisted traces/sessions/artifacts for secrets

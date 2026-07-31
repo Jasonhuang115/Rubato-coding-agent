@@ -19,6 +19,16 @@ const CONFIG_FILE_NAMES = [
 const ENV_FILE_NAMES = [".env", ".env.local"];
 
 /**
+ * Old configuration files may still contain these keys. They are accepted
+ * only so the loader can emit a migration warning; neither key is part of the
+ * runtime AgentConfig or forwarded to the agent.
+ */
+type ConfigFileInput = Partial<AgentConfig> & {
+  embedding?: unknown;
+  mnemosyne?: unknown;
+};
+
+/**
  * Load .env files from working directory and home directory.
  * Does NOT override already-set environment variables (shell wins).
  */
@@ -88,14 +98,14 @@ function parseEnvFile(content: string): Record<string, string> {
 
 export function loadConfig(workingDir: string): AgentConfig {
   // Try to find config file
-  let fileConfig: Partial<AgentConfig> = {};
+  let fileConfig: ConfigFileInput = {};
 
   for (const name of CONFIG_FILE_NAMES) {
     const filePath = path.join(workingDir, name);
     if (fs.existsSync(filePath)) {
       try {
         const content = fs.readFileSync(filePath, "utf-8");
-        fileConfig = YAML.parse(content) ?? {};
+        fileConfig = (YAML.parse(content) ?? {}) as ConfigFileInput;
         break;
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
@@ -113,20 +123,20 @@ export function loadConfig(workingDir: string): AgentConfig {
   if (fs.existsSync(homeConfigPath)) {
     try {
       const content = fs.readFileSync(homeConfigPath, "utf-8");
-      const homeConfig = YAML.parse(content) ?? {};
+      const homeConfig = (YAML.parse(content) ?? {}) as ConfigFileInput;
       fileConfig = deepMerge(fileConfig, homeConfig);
     } catch (error) {
       warnRecoverable(`config:${homeConfigPath}:load`, error);
     }
   }
 
-  // Build final config with defaults
-  const rawEmbedding = fileConfig.embedding as { source?: unknown; model?: unknown } | undefined;
-  if (rawEmbedding?.source && rawEmbedding.source !== "local_hash") {
-    console.warn(`Warning: embedding.source="${String(rawEmbedding.source)}" is no longer supported; using "local_hash".`);
-  }
-  if (rawEmbedding?.model) {
-    console.warn("Warning: embedding.model is ignored because Rubato uses the built-in local_hash embedding.");
+  // Build final config with defaults. Legacy embedding/Mnemosyne settings are
+  // deliberately ignored: the normal runtime is file-backed and has no RAG.
+  if (fileConfig.embedding || fileConfig.mnemosyne) {
+    console.warn(
+      "Warning: embedding/mnemosyne settings are deprecated and ignored; " +
+      "Rubato now uses file-backed memory with grep/Read recall.",
+    );
   }
 
   const config: AgentConfig = {
@@ -147,12 +157,26 @@ export function loadConfig(workingDir: string): AgentConfig {
       ...DEFAULT_PERMISSIONS,
       ...fileConfig.permissions,
     },
-    embedding: {
-      source: "local_hash",
-    },
-    mnemosyne: {
-      bootstrap_on_first_open: fileConfig.mnemosyne?.bootstrap_on_first_open ?? true,
-      bootstrap_max_files: fileConfig.mnemosyne?.bootstrap_max_files ?? 500,
+    memory: {
+      enabled: fileConfig.memory?.enabled ?? true,
+      learningEnabled: fileConfig.memory?.learningEnabled ?? true,
+      profileMaxTokens: fileConfig.memory?.profileMaxTokens ?? 1_000,
+      dreamSessionThreshold: fileConfig.memory?.dreamSessionThreshold ?? 5,
+      dreamCandidateThreshold: fileConfig.memory?.dreamCandidateThreshold ?? 20,
+      dreamMaxAgeHours: fileConfig.memory?.dreamMaxAgeHours ?? 24,
+      autoPublishExplicitLowRisk:
+        fileConfig.memory?.autoPublishExplicitLowRisk ?? true,
+      // Left undefined on purpose when unset: POLICY.yml supplies the default
+      // so its utility knobs are not permanently shadowed by a config default.
+      ...(fileConfig.memory?.utilityLearningRate !== undefined
+        ? { utilityLearningRate: fileConfig.memory.utilityLearningRate }
+        : {}),
+      ...(fileConfig.memory?.utilityMinUses !== undefined
+        ? { utilityMinUses: fileConfig.memory.utilityMinUses }
+        : {}),
+      bootstrapEnabled: fileConfig.memory?.bootstrapEnabled ?? true,
+      dreamAutoRun: fileConfig.memory?.dreamAutoRun ?? true,
+      dreamMaxRunsPerStart: fileConfig.memory?.dreamMaxRunsPerStart ?? 2,
     },
     session: {
       cleanupPeriodDays: fileConfig.session?.cleanupPeriodDays ?? 30,

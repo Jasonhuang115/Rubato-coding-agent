@@ -19,18 +19,6 @@ vi.mock("../src/model/router.js", () => ({ createProvider: () => provider }));
 vi.mock("../src/runtime/context-assembler.js", () => ({
   assembleContext: vi.fn(async () => ({ systemPrompt: "test system", systemTokens: 1 })),
 }));
-vi.mock("../src/memory/journal/extractor.js", () => ({
-  persistKnowledge: vi.fn(() => ({ saved: 0 })),
-}));
-vi.mock("../src/memory/store.js", () => ({
-  getMnemosyneStore: vi.fn(() => ({
-    getInjectedMemoriesForSession: () => [],
-    markReferenced: () => {},
-    markIgnoredForSession: () => {},
-    autoTuneStrategyWeights: () => {},
-    getPendingConsolidations: () => [],
-  })),
-}));
 vi.mock("../src/tools/git/hooks.js", () => ({
   sessionStartHook: vi.fn(async () => null),
   conflictCheckHook: vi.fn(async () => null),

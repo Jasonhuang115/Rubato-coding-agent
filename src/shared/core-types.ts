@@ -130,13 +130,37 @@ export interface AgentConfig {
     web: PermissionMode;
     rules?: PermissionRule[];
   };
-  embedding: {
-    /** Built-in deterministic embedding used by Mnemosyne. */
-    source: "local_hash";
-  };
-  mnemosyne: {
-    bootstrap_on_first_open: boolean;
-    bootstrap_max_files: number;
+  memory?: {
+    /** Master switch for file-backed memory recall and learning. */
+    enabled: boolean;
+    /** Can be paused independently without hiding already-published memories. */
+    learningEnabled: boolean;
+    /** Hard budget for the always-on PROFILE.md compilation artifact. */
+    profileMaxTokens: number;
+    /** Queue Dreaming after this many newly closed root sessions. */
+    dreamSessionThreshold: number;
+    /** Queue Dreaming after this many pending candidates. */
+    dreamCandidateThreshold: number;
+    /** Queue Dreaming when observations have waited this many hours. */
+    dreamMaxAgeHours: number;
+    /** Explicit, low-risk user preferences are authorization to publish. */
+    autoPublishExplicitLowRisk: boolean;
+    /**
+     * Runtime utility update rate; this never changes belief confidence.
+     * Left unset, POLICY.yml's `utility.alpha` applies.
+     */
+    utilityLearningRate?: number;
+    /**
+     * Utility cannot affect prioritization before this many applications.
+     * Left unset, POLICY.yml's `utility.minimum_uses` applies.
+     */
+    utilityMinUses?: number;
+    /** Scan code structure, config, and Git history into repository facts. */
+    bootstrapEnabled: boolean;
+    /** Drain the durable Dream queue in the background on startup. */
+    dreamAutoRun: boolean;
+    /** Model-calling Dreams processed per CLI start. */
+    dreamMaxRunsPerStart: number;
   };
   session: {
     cleanupPeriodDays: number;

@@ -6,7 +6,12 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import { loadSession } from "./storage.js";
+import { writeSessionCatalog } from "./catalog.js";
 import { warnRecoverable } from "../../shared/diagnostics.js";
+import {
+  legacyTruncatedProjectMemoryId,
+  projectMemoryId,
+} from "../../memory-files/paths.js";
 
 // ---- Types ----
 
@@ -25,18 +30,23 @@ export interface SessionRecord {
 // ---- Helpers ----
 
 function hashProjectDir(workdir: string): string {
-  // Simple hash: absolute path → safe directory name
-  const abs = path.resolve(workdir);
-  // Replace non-alphanumeric chars with dashes, collapse runs, trim to 64 chars
-  return abs
+  return projectMemoryId(workdir);
+}
+
+function legacyProjectDirId(workdir: string): string {
+  return path.resolve(workdir)
     .replace(/[^a-zA-Z0-9]/g, "-")
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "")
     .slice(0, 64) || "root";
 }
 
+function getRubatoHome(): string {
+  return path.resolve(process.env.RUBATO_HOME ?? path.join(os.homedir(), ".rubato"));
+}
+
 function getProjectBaseDir(projectHash: string): string {
-  return path.join(os.homedir(), ".rubato", "projects", projectHash);
+  return path.join(getRubatoHome(), "projects", projectHash);
 }
 
 function getSessionsDir(projectHash: string): string {
@@ -60,10 +70,16 @@ function atomicWriteJson(filePath: string, data: unknown): void {
 
 export class SessionManager {
   readonly projectHash: string;
+  private readonly legacyProjectHashes: string[];
   private index: SessionRecord[] | null = null;
 
   constructor(projectDir: string) {
     this.projectHash = hashProjectDir(projectDir);
+    this.legacyProjectHashes = [
+      legacyTruncatedProjectMemoryId(projectDir),
+      legacyProjectDirId(projectDir),
+    ].filter((id, index, values) =>
+      id !== this.projectHash && values.indexOf(id) === index);
   }
 
   // ---- Index management ----
@@ -75,24 +91,36 @@ export class SessionManager {
   private loadIndex(): SessionRecord[] {
     if (this.index !== null) return this.index;
     this.ensureDir();
-    const indexPath = getIndexPath(this.projectHash);
-    try {
-      if (fs.existsSync(indexPath)) {
-        const raw = fs.readFileSync(indexPath, "utf-8");
-        this.index = JSON.parse(raw) as SessionRecord[];
-      } else {
-        this.index = [];
-      }
-    } catch (error) {
-      this.index = [];
-      warnRecoverable(`sessions:${this.projectHash}:load-index`, error);
-    }
+    const canonicalIndexExists = fs.existsSync(getIndexPath(this.projectHash));
+    const legacy = canonicalIndexExists
+      ? []
+      : this.legacyProjectHashes.flatMap((id) => this.readIndex(id));
+    const current = this.readIndex(this.projectHash);
+    const merged = new Map<string, SessionRecord>();
+    for (const record of legacy) merged.set(record.id, record);
+    for (const record of current) merged.set(record.id, record);
+    this.index = [...merged.values()];
     return this.index;
+  }
+
+  private readIndex(projectHash: string): SessionRecord[] {
+    const indexPath = getIndexPath(projectHash);
+    if (!fs.existsSync(indexPath)) return [];
+    try {
+      const raw = fs.readFileSync(indexPath, "utf-8");
+      const parsed = JSON.parse(raw) as unknown;
+      return Array.isArray(parsed) ? parsed as SessionRecord[] : [];
+    } catch (error) {
+      warnRecoverable(`sessions:${projectHash}:load-index`, error);
+      return [];
+    }
   }
 
   private saveIndex(): void {
     const indexPath = getIndexPath(this.projectHash);
-    atomicWriteJson(indexPath, this.index ?? []);
+    const records = this.index ?? [];
+    atomicWriteJson(indexPath, records);
+    writeSessionCatalog(getProjectBaseDir(this.projectHash), records);
   }
 
   // ---- CRUD ----
@@ -151,16 +179,25 @@ export class SessionManager {
     this.index = sessions.filter((s) => s.id !== id);
     this.saveIndex();
 
-    // Also remove transcript file
-    const sessionPath = this.getSessionPath(id);
-    try { fs.unlinkSync(sessionPath); } catch (error) { warnRecoverable(`sessions:${this.projectHash}:remove-transcript`, error); }
+    // Remove canonical and legacy transcripts when present.
+    for (const projectHash of new Set([
+      this.projectHash,
+      ...this.legacyProjectHashes,
+    ])) {
+      const sessionPath = path.join(getSessionsDir(projectHash), `${id}.jsonl`);
+      try {
+        if (fs.existsSync(sessionPath)) fs.unlinkSync(sessionPath);
+      } catch (error) {
+        warnRecoverable(`sessions:${projectHash}:remove-transcript`, error);
+      }
+    }
   }
 
   // ---- Resume ----
 
   /** Load a session's transcript and produce a compact summary */
   loadSessionHistory(sessionId: string): string {
-    const records = loadSession(sessionId, getSessionsDir(this.projectHash));
+    const records = loadSession(sessionId, path.dirname(this.getSessionPath(sessionId)));
     if (records.length === 0) return "(empty session)";
 
     const parts: string[] = [];
@@ -212,7 +249,13 @@ export class SessionManager {
   // ---- Paths ----
 
   getSessionPath(sessionId: string): string {
-    return path.join(getSessionsDir(this.projectHash), `${sessionId}.jsonl`);
+    const canonical = path.join(getSessionsDir(this.projectHash), `${sessionId}.jsonl`);
+    if (fs.existsSync(canonical)) return canonical;
+    for (const projectHash of this.legacyProjectHashes) {
+      const legacy = path.join(getSessionsDir(projectHash), `${sessionId}.jsonl`);
+      if (fs.existsSync(legacy)) return legacy;
+    }
+    return canonical;
   }
 
   getProjectHash(): string {
@@ -229,5 +272,13 @@ export class SessionManager {
 
   static resolveProjectHash(workdir: string): string {
     return hashProjectDir(workdir);
+  }
+
+  static resolveLegacyProjectHash(workdir: string): string {
+    return legacyProjectDirId(workdir);
+  }
+
+  static resolveTruncatedProjectHash(workdir: string): string {
+    return legacyTruncatedProjectMemoryId(workdir);
   }
 }

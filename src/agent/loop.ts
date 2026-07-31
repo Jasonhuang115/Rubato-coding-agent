@@ -27,9 +27,11 @@ import { SessionStore } from "../runtime/session/storage.js";
 import { createSessionMeta, finalizeSessionMeta } from "../runtime/session/meta.js";
 import type { SessionManager } from "../runtime/session/manager.js";
 import { PlanManager } from "../agent/planner/manager.js";
-import { persistKnowledge } from "../memory/journal/extractor.js";
-import { getMnemosyneStore } from "../memory/store.js";
-import { hasAssistantResponse, recordAttributedMemoryReferences } from "../memory/attribution.js";
+import {
+  learnFromStoredSessionRecords,
+  type FileMemoryLearningResult,
+} from "../memory-files/runtime.js";
+import { scheduleDreams } from "../memory-files/scheduler.js";
 import { sessionEndHook } from "../tools/git/hooks.js";
 import { assembleContext } from "../runtime/context-assembler.js";
 import { checkAndCompact, runMicroCompact } from "../runtime/compaction-controller.js";
@@ -151,6 +153,14 @@ export async function* agentLoop(
     sessionStore.init();
     sessionStore.writeMessage({ role: "user", content: prompt });
   }
+  const initialMemoryLearning = persistConversation
+    ? learnLatestUserMemory(
+        sessionStore,
+        workingDir,
+        config,
+        sessionId,
+      )
+    : null;
 
   let sessionMeta = createSessionMeta(
     sessionId,
@@ -196,6 +206,9 @@ export async function* agentLoop(
   const messages: Message[] = [
     { role: "user", content: prompt },
   ];
+  for (const warning of memoryLearningNotices(initialMemoryLearning)) {
+    yield { type: "warning", message: warning };
+  }
 
   // ---- Compaction tracking ----
   let consecutiveCompactionFailures = 0;
@@ -211,7 +224,6 @@ export async function* agentLoop(
     ? configuredMaxTurns + completionRetryTurns
     : configuredMaxTurns;
   let doneReason: string | null = null;
-  let hadAssistantResponse = false;
   let forcingCompletion = false;
   let completionRetryCount = 0;
 
@@ -407,13 +419,6 @@ export async function* agentLoop(
       persistTurnMessages(sessionStore, messages.slice(preTurnMessageCount));
     }
 
-    if (hasAssistantResponse(messages)) {
-      hadAssistantResponse = true;
-      try {
-        recordAttributedMemoryReferences(messages, sessionId, getMnemosyneStore());
-      } catch { /* best-effort */ }
-    }
-
     sessionMeta.messageCount = (sessionMeta.messageCount ?? 0) + 1;
     if (usage) {
       sessionMeta.totalTokens += usage.input + usage.output;
@@ -553,6 +558,15 @@ export async function* agentLoop(
         messages.push({ role: "user", content: nextMessage.trim() });
         if (persistConversation) {
           sessionStore.writeMessage({ role: "user", content: nextMessage.trim() });
+          const learned = learnLatestUserMemory(
+            sessionStore,
+            workingDir,
+            config,
+            sessionId,
+          );
+          for (const warning of memoryLearningNotices(learned)) {
+            yield { type: "warning", message: warning };
+          }
         }
         sessionMeta.messageCount = (sessionMeta.messageCount ?? 0) + 1;
         continue;
@@ -579,6 +593,15 @@ export async function* agentLoop(
         messages.push({ role: "user", content: nextMessage.trim() });
         if (persistConversation) {
           sessionStore.writeMessage({ role: "user", content: nextMessage.trim() });
+          const learned = learnLatestUserMemory(
+            sessionStore,
+            workingDir,
+            config,
+            sessionId,
+          );
+          for (const warning of memoryLearningNotices(learned)) {
+            yield { type: "warning", message: warning };
+          }
         }
         sessionMeta.messageCount = (sessionMeta.messageCount ?? 0) + 1;
         continue;
@@ -627,72 +650,6 @@ export async function* agentLoop(
     }
   } catch { /* best-effort */ }
 
-  // Knowledge extraction
-  try {
-    const extracted = persistKnowledge(messages, sessionId, workingDir);
-    if (extracted.saved > 0) {
-      yield { type: "warning", message: `🧠 从本次对话中提取了 ${extracted.saved} 条知识到 Mnemosyne 记忆图谱。` };
-    }
-  } catch { /* best-effort */ }
-
-  // Self-evolving RAG feedback
-  try {
-    const store = getMnemosyneStore();
-    if (hadAssistantResponse || hasAssistantResponse(messages)) {
-      recordAttributedMemoryReferences(messages, sessionId, store);
-      store.markIgnoredForSession(sessionId);
-    }
-    store.autoTuneStrategyWeights();
-  } catch { /* best-effort */ }
-
-  // Lazy consolidation
-  try {
-    const store = getMnemosyneStore();
-    const pendingConsolidations = store.getPendingConsolidations();
-    if (pendingConsolidations.length > 0) {
-      yield { type: "warning", message: `🧠 记忆系统检测到 ${pendingConsolidations.length} 组相似记忆等待合并，将在后台处理...` };
-      const { consolidateMemories, parseConsolidationJson } = await import("../memory/consolidator.js");
-      const result = await consolidateMemories({
-        summarizer: async (cluster) => {
-          const memories = cluster.entities.map((entity) => ({
-            id: entity.id,
-            name: entity.name,
-            type: entity.type,
-            confidence: entity.confidence,
-            status: entity.status,
-            content: entity.content.slice(0, 700),
-          }));
-          const prompt = [
-            "Consolidate these related long-term memories for a personal coding agent.",
-            "Return only one JSON object with these fields:",
-            `{"action":"create_principle|merge|keep_separate","name":"short stable key","type":"concept|config|error|api|deploy|dependency|test|note|file|function|class","summary":"stable reusable memory","scope":"when to use it","confidence":0.0,"validity":"when to review or invalidate","conflicts":["optional conflict notes"]}`,
-            "Prefer keep_separate when the memories are merely keyword-similar but do not support one reusable fact, preference, or project convention.",
-            "",
-            `Subject: ${cluster.subject}`,
-            `Cohesion: ${cluster.cohesion.toFixed(3)}`,
-            `Memories: ${JSON.stringify(memories)}`,
-          ].join("\n");
-
-          let raw = "";
-          for await (const event of provider.chat({
-            model: config.model.model,
-            system: "You are Mnemosyne's memory consolidator. Produce compact, conservative JSON. Do not call tools.",
-            messages: [{ role: "user", content: prompt }],
-            tools: [],
-            maxTokens: 700,
-          })) {
-            if (event.type === "text_delta") raw += event.text;
-            if (event.type === "error") return null;
-          }
-          return parseConsolidationJson(raw, cluster.entities[0]?.type ?? "concept");
-        },
-      });
-      if (result.merged > 0 || result.abstracted > 0) {
-        yield { type: "warning", message: `🧹 Mnemosyne 合并完成：合并 ${result.merged} | 抽象 ${result.abstracted} | 清理 ${result.deleted}` };
-      }
-    }
-  } catch { /* best-effort */ }
-
   sessionMeta = finalizeSessionMeta(sessionMeta);
 
   if (options.sessionManager) {
@@ -707,6 +664,43 @@ export async function* agentLoop(
   } else {
     sessionStore.writeMeta(sessionMeta);
     sessionStore.close();
+  }
+
+  // Root-session fast extraction is deterministic and idempotent. Processing
+  // the closed transcript catches any user evidence not handled immediately.
+  const finalLearning = learnAllSessionMemory(
+    sessionStore,
+    workingDir,
+    config,
+    sessionId,
+  );
+  for (const warning of memoryLearningNotices(finalLearning)) {
+    yield { type: "warning", message: warning };
+  }
+  try {
+    const scheduled = scheduleDreams({
+      workingDir,
+      enabled:
+        config.memory?.enabled !== false &&
+        config.memory?.learningEnabled !== false,
+      ...(config.memory ? {
+        policy: {
+          closed_sessions: config.memory.dreamSessionThreshold,
+          pending_candidates: config.memory.dreamCandidateThreshold,
+          observation_age_hours: config.memory.dreamMaxAgeHours,
+        },
+      } : {}),
+    });
+    if (scheduled.queued.length > 0) {
+      yield {
+        type: "warning",
+        message:
+          `🌙 已持久化排队 ${scheduled.queued.length} 个 Dream；` +
+          "它们只会生成结构化候选，不能自行删除或直接改写 verified memory。",
+      };
+    }
+  } catch {
+    // A scheduler failure cannot invalidate the closed session or final answer.
   }
 
   rootRuntime?.trace.append({
@@ -781,4 +775,67 @@ function persistTurnMessages(store: SessionStore, messages: Message[]): void {
       }
     }
   }
+}
+
+function learnLatestUserMemory(
+  store: SessionStore,
+  workingDir: string,
+  config: AgentConfig,
+  sessionId: string,
+): FileMemoryLearningResult | null {
+  const latest = store.getRecords().at(-1);
+  if (!latest || latest.type !== "message") return null;
+  try {
+    return learnFromStoredSessionRecords([latest], {
+      workingDir,
+      sessionId,
+      enabled:
+        config.memory?.enabled !== false &&
+        config.memory?.learningEnabled !== false,
+      autoPublishExplicitLowRisk:
+        config.memory?.autoPublishExplicitLowRisk !== false,
+    });
+  } catch {
+    return null;
+  }
+}
+
+function learnAllSessionMemory(
+  store: SessionStore,
+  workingDir: string,
+  config: AgentConfig,
+  sessionId: string,
+): FileMemoryLearningResult | null {
+  try {
+    return learnFromStoredSessionRecords(store.getRecords(), {
+      workingDir,
+      sessionId,
+      enabled:
+        config.memory?.enabled !== false &&
+        config.memory?.learningEnabled !== false,
+      autoPublishExplicitLowRisk:
+        config.memory?.autoPublishExplicitLowRisk !== false,
+    });
+  } catch {
+    return null;
+  }
+}
+
+function memoryLearningNotices(
+  result: FileMemoryLearningResult | null,
+): string[] {
+  if (!result) return [];
+  const notices: string[] = [];
+  if (result.publishedReleaseIds.length > 0) {
+    notices.push(
+      `🧠 已根据你的明确表达更新 ${result.publishedReleaseIds.length} 个文件记忆 release；` +
+      "可用 /profile why <key> 查看依据。",
+    );
+  }
+  if (result.needsReview > 0) {
+    notices.push(
+      `🧠 ${result.needsReview} 个记忆变化因冲突或风险进入 review，未自动生效。`,
+    );
+  }
+  return notices;
 }

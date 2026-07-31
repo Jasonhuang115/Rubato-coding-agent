@@ -2,7 +2,6 @@
 // CLI entry point — parses arguments, loads config, runs the agent
 
 import { randomUUID } from "crypto";
-import path from "path";
 import * as readline from "readline";
 import type { ConfirmDecision } from "../shared/core-types.js";
 import { loadConfig, loadEnvFiles } from "./config-loader.js";
@@ -10,7 +9,6 @@ import { parseArgs, loadMcpConfigs } from "./options.js";
 import {
   handleGitCommand,
   handleJournalCommand,
-  handleMemoryCommand,
   handleModelCommand,
   handleSessionsCommand,
   handleSkillCommand,
@@ -20,6 +18,10 @@ import {
   handleTraceCommand,
   handleScrubCommand,
 } from "./command-handlers.js";
+import {
+  handleFileMemoryCommand,
+  handleProfileCommand,
+} from "./file-memory-commands.js";
 import { AnsiStreamRenderer } from "./stream-renderer.js";
 import { agentLoop, abortCurrentRequest } from "../agent/loop.js";
 import {
@@ -39,8 +41,9 @@ import { planTool } from "../tools/plan.js";
 import { agentTool } from "../tools/agent.js";
 import { skillTool } from "../tools/skill.js";
 import { taskTool } from "../tools/task.js";
+import { memoryFeedbackTool } from "../tools/memory-feedback.js";
+import { memoryProposeTool } from "../tools/memory-propose.js";
 import { PlanManager } from "../agent/planner/manager.js";
-import { getMnemosyneStore } from "../memory/store.js";
 import { initCustomDefinitions } from "../agent/agent-defs.js";
 import { McpClient } from "../tools/mcp/client.js";
 import { readMultiLineInput } from "./multiline-input.js";
@@ -52,6 +55,7 @@ import type { AgentConfig } from "../shared/core-types.js";
 import { warnRecoverable } from "../shared/diagnostics.js";
 import { SessionManager } from "../runtime/session/manager.js";
 import { processSubagentRegistry } from "../agent/subagents/registry.js";
+import { startMemoryMaintenance } from "./memory-maintenance.js";
 
 // Register all tools
 register(readTool);
@@ -67,6 +71,8 @@ register(planTool);
 register(agentTool);
 register(taskTool);
 register(skillTool);
+register(memoryFeedbackTool);
+register(memoryProposeTool);
 
 // ---- Tab completion & / menu ----
 
@@ -78,7 +84,9 @@ function getSlashCompletions(): string[] {
     "/git", "/git health",
     "/journal", "/journal recent", "/journal search", "/journal stats",
     "/remember",
-    "/memory", "/memory stats", "/memory search",
+    "/memory", "/memory stats", "/memory search", "/memory list", "/memory dream",
+    "/profile", "/profile show", "/profile why", "/profile export",
+    "/profile pause-learning", "/profile resume-learning",
     "/model",
     "/sessions", "/sessions list", "/sessions resume",
     "/tasks", "/tasks wait", "/tasks watch", "/tasks cancel", "/tasks cleanup",
@@ -121,9 +129,10 @@ function showSlashMenu(): void {
   console.log("  /plan               Show plan | /plan new <desc> | /plan done");
   console.log("  /grillme            Toggle plan tracking | /grillme on/off/strict/normal/loose");
   console.log("  /git                Git status | /git health");
-  console.log("  /journal            Search journal | /journal search <q>");
-  console.log("  /remember <title>   Save to journal");
-  console.log("  /memory             Memory stats | /memory search <q>");
+  console.log("  /journal            Legacy alias for file-memory list/search");
+  console.log("  /remember <text>    Send a traceable explicit memory statement");
+  console.log("  /memory             File-memory stats/search/list/dream");
+  console.log("  /profile            Show/why/export/pause/resume user profile");
   console.log("  /model              Switch model | /model <name>");
   console.log("  /sessions           List sessions | /sessions resume <#>");
   console.log("  /tasks              List/inspect/wait/cancel/cleanup subagent tasks");
@@ -156,7 +165,7 @@ async function getFirstMessage(
   rl: readline.Interface,
   planManager: PlanManager,
   workdir: string,
-  config: { model: { provider: string; model: string } }
+  config: AgentConfig,
 ): Promise<string> {
   // eslint-disable-next-line no-constant-condition
   while (true) {
@@ -179,8 +188,14 @@ async function getFirstMessage(
     if (trimmed.startsWith("/plan")) { handlePlanCommand(trimmed, planManager); continue; }
     if (trimmed.startsWith("/grillme")) { handleGrillMeCommand(trimmed, planManager); continue; }
     if (trimmed.startsWith("/git")) { handleGitCommand(trimmed, workdir); continue; }
-    if (trimmed.startsWith("/journal") || trimmed.startsWith("/remember")) { handleJournalCommand(trimmed, workdir); continue; }
-    if (trimmed.startsWith("/memory")) { handleMemoryCommand(trimmed); continue; }
+    if (trimmed.startsWith("/remember")) {
+      const remembered = rememberCommandAsMessage(trimmed);
+      if (remembered) return remembered;
+      continue;
+    }
+    if (trimmed.startsWith("/journal")) { await handleJournalCommand(trimmed, workdir, config); continue; }
+    if (trimmed.startsWith("/memory")) { await handleFileMemoryCommand(trimmed, workdir, config); continue; }
+    if (trimmed.startsWith("/profile")) { await handleProfileCommand(trimmed, workdir, config); continue; }
     if (trimmed.startsWith("/model")) { handleModelCommand(trimmed, config); continue; }
 
     // Not a slash command — send to agent
@@ -195,14 +210,24 @@ function showHelp(): void {
   console.log("  /grillme strict|normal|loose — Set sensitivity");
   console.log("  /git                Show current git status");
   console.log("  /git health         Show branch health summary");
-  console.log("  /journal search <q> Search personal knowledge base");
-  console.log("  /remember <title>   Save current context");
-  console.log("  /memory             Memory stats | /memory search <q> | /memory list");
+  console.log("  /journal search <q> Legacy alias for file-memory search");
+  console.log("  /remember <text>    Record an explicit, traceable user memory");
+  console.log("  /memory             File-memory stats/search/list/dream");
+  console.log("  /profile            Show/why/export/pause/resume profile");
   console.log("  /model              List / switch models");
   console.log("  /help               Show this help");
   console.log("  /paste              Send the full clipboard as one prompt");
   console.log("  /exit, /quit        Exit");
   console.log("  Ctrl+C              Exit");
+}
+
+function rememberCommandAsMessage(input: string): string | null {
+  const content = input.replace(/^\/remember\b/u, "").trim();
+  if (!content) {
+    console.log("\n  Usage: /remember <what you want the agent to remember>");
+    return null;
+  }
+  return `请记住：${content}`;
 }
 
 // ---- Main ----
@@ -289,9 +314,10 @@ function createRepl(
           console.log("  /grillme strict|normal|loose — Set sensitivity");
           console.log("  /git              — Show current git status");
           console.log("  /git health       — Show branch health summary");
-          console.log("  /journal search <q> — Search personal knowledge base");
-          console.log("  /remember <title> — Save current context to journal");
-          console.log("  /memory stats     — Show Mnemosyne memory stats");
+          console.log("  /journal search <q> — Legacy file-memory search alias");
+          console.log("  /remember <text>  — Record an explicit user memory");
+          console.log("  /memory stats     — Show file-memory status (no RAG)");
+          console.log("  /profile show     — Show verified user profile");
           console.log("  /model            — List / switch models");
           console.log("  /sessions         — List project sessions | /sessions resume <#>");
           console.log("  /scrub --dry-run [path] — Audit persisted data without changing files");
@@ -317,11 +343,17 @@ function createRepl(
         } else if (trimmed.startsWith("/git")) {
           handleGitCommand(trimmed, workdir);
           return promptAgain();
-        } else if (trimmed.startsWith("/journal") || trimmed.startsWith("/remember")) {
-          handleJournalCommand(trimmed, workdir);
+        } else if (trimmed.startsWith("/remember")) {
+          const remembered = rememberCommandAsMessage(trimmed);
+          return remembered ?? promptAgain();
+        } else if (trimmed.startsWith("/journal")) {
+          await handleJournalCommand(trimmed, workdir, config);
           return promptAgain();
         } else if (trimmed.startsWith("/memory")) {
-          handleMemoryCommand(trimmed);
+          await handleFileMemoryCommand(trimmed, workdir, config);
+          return promptAgain();
+        } else if (trimmed.startsWith("/profile")) {
+          await handleProfileCommand(trimmed, workdir, config);
           return promptAgain();
         } else if (trimmed.startsWith("/model")) {
           handleModelCommand(trimmed, config);
@@ -490,51 +522,10 @@ async function main(): Promise<void> {
   // ---- Session manager ----
   const sessionManager = new SessionManager(workdir);
 
-  // Migrate old Journal entries into unified Mnemosyne (one-time, best-effort)
-  try {
-    const store = getMnemosyneStore();
-    const journalDbPath = path.join(process.env.HOME ?? "/tmp", ".rubato", "journal", "journal.db");
-    const migrated = store.migrateJournalEntries(journalDbPath);
-    if (migrated > 0) {
-      console.log(`📓 已将 ${migrated} 条旧知识迁移到统一记忆图谱。`);
-    }
-  } catch (error) { warnRecoverable(`memory:${workdir}:journal-migration`, error); }
-
   // Initialize custom agent definitions
   try { initCustomDefinitions(workdir); } catch (error) { warnRecoverable(`agents:${workdir}:load`, error); }
   // Load skills from .rubato/skills/
   try { loadAllSkills(workdir); } catch (error) { warnRecoverable(`skills:${workdir}:load`, error); }
-  // Backfill embeddings for any entities missing them
-  try {
-    const { embedAllEntities } = await import("../memory/vector-search.js");
-    const store = getMnemosyneStore();
-    const n = await embedAllEntities(store);
-    if (n > 0) console.log(`🔢 Generated embeddings for ${n} entities`);
-  } catch (error) { warnRecoverable(`memory:${workdir}:embedding-backfill`, error); }
-
-  // Memory health report
-  try {
-    const store = getMnemosyneStore();
-    const health = store.getHealthReport();
-    const pending = health.pendingConsolidation > 0 ? ` | 待合并 ${health.pendingConsolidation}` : "";
-    console.log(`🧠 记忆健康: 活跃 ${health.active} | 过期 ${health.superseded} | 休眠 ${health.dormant} | 弃用 ${health.deprecated}${pending} | 向量 ${health.vectorReady ? "✅" : "⏳"}`);
-  } catch (error) { warnRecoverable(`memory:${workdir}:health-report`, error); }
-
-  // Bootstrap memory seeder on first project open
-  if (config.mnemosyne.bootstrap_on_first_open) {
-    try {
-      const { bootstrapMemories } = await import("../memory/seeder.js");
-      const seedResult = await bootstrapMemories(workdir, config.mnemosyne.bootstrap_max_files);
-      if (seedResult.totalSeeded > 0) {
-        console.log(`🌱 Seeded ${seedResult.totalSeeded} initial memories from project scan.`);
-        // Backfill embeddings for vector search
-        const { embedAllEntities } = await import("../memory/vector-search.js");
-        const store = getMnemosyneStore();
-        const n = await embedAllEntities(store);
-        if (n > 0) console.log(`🔢 Generated embeddings for ${n} entities`);
-      }
-    } catch (error) { warnRecoverable(`memory:${workdir}:bootstrap`, error); }
-  }
 
   // Load and display active plan
   const planManager = new PlanManager(workdir);
@@ -542,6 +533,10 @@ async function main(): Promise<void> {
   if (planSummary) {
     console.log(`\n${planSummary}`);
   }
+
+  // Repository facts and queued Dreams are refreshed in the background so the
+  // first turn is never delayed by a project scan or a model-backed Dream.
+  const memoryMaintenance = startMemoryMaintenance({ workingDir: workdir, config });
 
   // ---- MCP Server Startup ----
   const mcpConfigs = loadMcpConfigs(workdir);
@@ -679,6 +674,7 @@ async function main(): Promise<void> {
       }
     } else {
       console.log("\n  Exiting...");
+      memoryMaintenance.cancel();
       for (const runtime of processSubagentRegistry.list()) {
         for (const task of runtime.list()) {
           if (task.status === "queued" || task.status === "running" || task.status === "waiting_child") {
@@ -817,6 +813,7 @@ async function main(): Promise<void> {
   } while (loopState.shouldRestart);
 
   process.off("SIGINT", onSigInt);
+  memoryMaintenance.cancel();
   for (const runtime of processSubagentRegistry.list()) {
     for (const task of runtime.list()) {
       if (task.status === "queued" || task.status === "running" || task.status === "waiting_child") {

@@ -2,6 +2,7 @@
 
 import fs from "fs";
 import type { ToolDefinition } from "../shared/core-types.js";
+import { recordMemoryFileAccess } from "../memory-files/access.js";
 import { resolveToolPath } from "./path-utils.js";
 
 const MAX_LINES = 2000;
@@ -99,6 +100,15 @@ export const readTool: ToolDefinition = {
 
       // Mark file as read (ReadGuard)
       ctx.readGuard.markAsRead(filePath, content);
+      try {
+        recordMemoryFileAccess({
+          sessionId: ctx.sessionId,
+          action: "read",
+          filePath,
+        });
+      } catch {
+        // Access telemetry must never break a successful read.
+      }
 
       // Add header with file info
       const header = `File: ${filePath} (${lines.length} lines, ${stat.size} bytes)\n`;

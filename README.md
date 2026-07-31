@@ -1,438 +1,275 @@
 # Rubato
 
-> 面向个人的编程助手。它记得你的项目、理解你的工作习惯，并在动手前和你把事情想清楚。
+Rubato 是一个本地运行的 coding agent。它支持多模型、工具调用、会话恢复、任务拆分，并使用一套可审计的文件式记忆。
 
-Rubato 不是一次性完成指令的代码生成器。它围绕一个人的长期编程工作而设计：跨会话积累项目决策与排障经验，按你的节奏澄清需求、制定计划、执行修改，并把每次有效的记忆反馈给下一次检索。
+记忆系统不使用 RAG、向量库、embedding、知识图谱或自动 top-k 召回。正常运行时不打开或创建 SQLite `memory.db`。长期记忆是普通 Markdown/TSV/JSONL 文件：启动时只注入经过校验且有明确预算的 `PROFILE.md`；需要细节时，Agent 用 Grep 搜索精确的 `catalog.tsv`，再用 Read 打开对应 card。
 
-名字来自古典音乐术语 *rubato*（弹性节奏）——新任务先慢下来理解，目标明确后稳步推进，简单问题则直接回答。
-
-## 为什么是个人助手
-
-长期写代码，真正稀缺的不是再调用一次模型，而是让助手逐渐知道：这个项目为什么这样组织、你偏好怎样取舍、哪些坑刚踩过、哪些改动不该轻易碰。Rubato 把这些上下文留在本地、可检索、可更新，也始终把执行权留给你。
-
-| 你需要的事 | Rubato 的做法 |
-|------------|---------------|
-| 接续上次工作 | 通过项目级会话、Mnemosyne 记忆图谱和个人知识库恢复上下文 |
-| 避免误解需求 | 先澄清关键决策，维护可恢复的意图树，并提醒偏离 |
-| 安心执行修改 | 读写与危险操作经过权限策略和五层 Sandbox，Git 操作提供风险说明 |
-| 越用越贴合 | 记忆的引用与忽略会回流到检索策略，让下一次更容易找到真正有用的经验 |
-
-## 核心能力
-
-### 长期项目记忆
-
-Rubato 会把对话、项目扫描和手动记录沉淀为本地 SQLite 知识图谱。它保存的不只是文件名，也包括配置、错误、设计决策、依赖关系和可复用的个人经验。
-
-- 同一事实出现新版本时保留历史并标记旧版为 `superseded`，而非直接删除
-- 支持 FTS5 全文、向量相似度与图遍历三路检索，RRF 融合后只注入活跃记忆
-- 支持 `/remember`、`/memory search` 和 `/journal search`，让重要结论可以显式沉淀
-
-### 先理解，再执行
-
-Plan 模式和 Grill Me 将模糊需求转成可执行计划。它会针对认证、数据库、API、前端、测试等关键决策追问，并在后续输入和工具调用偏离计划时提示你。计划可跨会话恢复，适合需要连续几天推进的个人项目。
-
-### 可控的动手能力
-
-Rubato 提供读写文件、代码搜索、Bash、Web、Git 顾问和可递归的子 Agent。所有工具调用经过统一的 Security Runtime；路径越界、危险 Shell、敏感环境变量、SSRF 和高风险 Git 操作都有独立防线。它会帮你做事，但不替你偷偷越权。
-
-### 贴合个人的 Git 顾问
-
-它不仅能执行 Git 命令，还会根据你的项目状态解释风险：改动是否偏离计划、是否可能和其他分支冲突、某段代码为什么会这样写，以及当前工作流是否符合已观察到的个人习惯和团队协作习惯。
-
----
-
-## 自进化记忆：让每次对话留下可用经验
-
-Mnemosyne 不是静态的 `MEMORY.md`。它是一个会维护时效、合并重复信息、根据实际回答效果调节检索的本地知识图谱。重点不在“存得更多”，而在于让下一次拿到更合适的上下文。
-
-**参考论文：**
-
-| 论文 | 借鉴了什么 |
-|------|-----------|
-| [MemStrata](https://arxiv.org/abs/2606.26511) (2026) | 事实时效管理——同 key 出现新值自动标记旧版过期，不靠向量相似度（AUROC 仅 0.59，接近瞎猜） |
-| RecMem (2026) | 懒惰合并——攒够 N 条相似记忆才触发一次 LLM 抽象，并把零散经历沉淀为可追溯的长期语义记忆 |
-| EvoRAG (2026) | 反馈反向传播——用户引用了某条记忆就回溯给三元组加分，忽略了就降权 |
-| SegMem-RAG (AAAI 2026) | 自适应路由——检索策略权重随反馈自动收敛 |
-
-**记忆生命周期策略：**
-
-Evaluator 不再把记忆压成一个“低分即遗忘”的总分。它把准确性、时效、相关度、冲突、使用频率和反馈信号拆开看，用这些信号分别判断四件事：是否默认注入、是否适合沉淀成原则、是否退出默认检索、是否属于可恢复的自动噪声。
-
-- `active`：正常检索并可注入上下文。
-- `superseded`：配置、API、部署等出现新版本时保留旧版历史，默认不注入。
-- `dormant`：长期未访问且没有正向反馈的非保护记忆退出默认检索，仍可通过显式搜索找回。
-- `protected`：手动记录和个人规则不会被自动降级或删除。
-- 物理删除只针对低置信、自动生成、内容明显无信息、从未被引用的噪声；“旧”本身永远不是删除理由。
-
-**从检索到学习的闭环：**
-
-```
-项目扫描 / 对话提取 / 手动记录 → entities
-                 ↓
-查询改写 → FTS5 + Vector + Graph → RRF 融合 → 注入记忆并记录来源
-                                                     ↓
-回答文本 → 高置信度引用归因（名称、内容片段、路径、API、技术词）
-                 ↓                         ↓
-             referenced                   ignored
-                 ↓                         ↓
-        记忆加分 + 来源信用          记忆降分 + 来源信用
-                         ↓
-           按 session + memory 聚合 → 检索策略权重平滑更新
-                         ↓
-       懒惰合并 / 版本保留 / 休眠归档 / 诊断评分 → 下一次检索
-```
-
-归因会在每轮回答后写入，避免长会话压缩丢失信号；中断而没有回答的会话不会把记忆误判为 ignored。多来源结果会分别回溯到 `fts5`、`vector`、`graph`，权重具有样本阈值、平滑更新和安全下限，避免早期噪声让任一路检索失效。
-
-**LLM 记忆蒸馏：**
-
-当相似记忆累计到待合并队列时，Mnemosyne 会在会话结束阶段调用当前模型做一次轻量 consolidation。模型只返回结构化 JSON，决定是否创建原则、合并，或保持分离；合格结果会写成新的 semantic memory，并保留 `abstracted_from` 来源 ID 和图关系边。
-
-```json
-{
-  "action": "create_principle",
-  "name": "rubato-memory-lifecycle",
-  "type": "concept",
-  "summary": "稳定、可复用的长期记忆",
-  "scope": "什么时候该使用这条记忆",
-  "confidence": 0.86,
-  "validity": "什么时候需要重新检查",
-  "conflicts": []
-}
-```
-
-高置信合并后，非手动的原始碎片会转入 `dormant`，避免默认上下文同时注入“总结原则 + 原始碎片”；手动记忆和保护记忆不会被自动降级。若模型不可用、输出不合格，系统会退回规则摘要，后台合并不会阻塞正常对话。
-
-**检索架构（三路 RRF 融合）：**
-
-```
-query → generateEmbedding(query)
-           ↓
-  ┌────────┼────────┐
-FTS5全文  向量相似度  图遍历
-LIKE搜索  cosine   1-hop邻居
-  └────────┼────────┘
-           ↓
-    RRF 加权融合排序
-    (权重随反馈自动调整)
-           ↓
-    过滤 status=active
-    (superseded/dormant/deprecated 排除)
-           ↓
-       Top-5 注入
-```
-
-**记忆类型与进化规则：**
-
-| 类型 | 同 key 新值 | 示例 |
-|------|-----------|------|
-| config / error / api / deploy | 自动 supersede 旧版 | `port=8000` → `port=8080`，旧版标记过期 |
-| note / concept / file / function | 合并追加 | 新知识追加到已有实体 |
-
-## 深度工作能力
-
-### Subagent 递归系统
-
-根 Agent 是唯一的协调者和集成者。Explore / Research / General / Verify 使用 fresh context 做只读工作；Worker 在独立 Git worktree 中实现、测试并提交。所有 Subagent 都通过 `CompleteTask` 返回 Markdown 报告，General 可以继续派发只读 required 子任务（最多 3 层），Worker 不能递归派发。
-
-根 Agent 在创建 TodoWrite 或开始大范围读取前先检查独立范围；存在两个以上可并行的重大范围，或材料明显无法装进单个上下文时，必须拆分任务。根 Agent 保留至少一个不重叠的主体范围并立即执行，其余范围通过 advisory 后台运行。advisory 表示“当前不阻塞”，其结果仍可能是最终汇总必需的；只有缺少结果就没有任何安全、有用的下一步时才使用 required。
-
-```
-Parent (depth=0, AgentTool ✅)
-  ├─ General (depth=1, canSpawn=true)
-  │   ├─ General (depth=2, canSpawn=true)
-  │   │   └─ Verify (depth=3, canSpawn=false — 硬限制)
-  │   └─ Explore (canSpawn=false, 只读)
-  ├─ Research (canSpawn=false, 只读网络研究)
-  ├─ Verify (canSpawn=false, 对抗性审查)
-  └─ Worker (canSpawn=false, 独立 worktree 写入并 commit)
-```
-
-**内置 Subagent 类型**：Explore / Research / General / Verify / Worker，也可在 `.rubato/agents/*.md` 中定义角色。
-
-- `required`：结果是下一步的必要决策门；父 Agent 等待，CLI 用单行状态指示器显示存活状态，Ctrl+C 可取消任务树。
-- `advisory`：当前非阻塞的后台任务；结果可以是最终汇总必需的，根 Agent在 join 点通过 Task wait/get 汇合，完成事件也会唤醒空闲会话。
-- 只读 Subagent 的 allowlist 不包含 Write、Edit、Bash、Skill 或可变 MCP 工具。只有声明 `isolation: worktree` 的 Worker 才能获得 Write、Edit、Bash；其写入目录被固定为任务 worktree。
-- 报告、机器结果和 trace 位于 `~/.rubato/projects/<projectHash>/runs/<sessionId>/`；父 Agent 默认只收到摘要和路径。
-- 根 Agent 先把写任务拆成不重叠 scope，再为每个 Worker 创建 `.rubato/worktrees/<taskId>` 和 `rubato/<session>/<task>` 分支。Worker 必须自行测试并 commit，结果包含 worktree、branch、base/head commit、commits、changed files 和二进制安全 patch。
-- 用户明确要求并行处理所有/多个项目、仓库、目录、模块或子系统时，运行时 delegation gate 会要求根 Agent 至少先创建一个具体的 advisory 子任务；不能只靠模型自觉串行完成。
-- 根 Agent 检查结果后使用普通 `git merge --no-ff` 或 `git cherry-pick` 逐个集成。发生冲突时，由根 Agent 在正常 agent loop 中读取三方内容、编辑、暂存、测试并完成或中止 Git 操作，不由隐藏的合并器自动处理。
-- `Task cleanup` 只会删除干净且已经集成的 worktree；脏或未合并 worktree、branch 和 artifact 都会保留。启动时只清扫超过 TTL、干净且已合并的 Rubato worktree。
-
-### Plan 模式 + Grill Me 意图追踪
-
-防跑偏三阶段闭环：
-
-```
-用户需求 → [Grill Me 需求澄清] → [Plan 意图树] → [按树执行]
-                                                   ↓
-                                       [Grill Me 偏离追踪] ← 每次输入/工具调用
-```
-
-- **需求澄清** — 5 类 Checklist（auth/database/API/frontend/testing），反问直达关键决策
-- **意图树** — Markdown 序列化到 `.agent/plans/{branch}.md`，跨会话自动恢复
-- **偏离追踪** — 3 档灵敏度（strict/normal/loose），文件范围 + 语义 + 依赖三维度检测
-
-### Git 顾问系统
-
-Agent 定位为信息型顾问，所有写操作需用户确认。
-
-| 模块 | 功能 |
-|------|------|
-| preflight | Push 前检查远程差异 + 同文件冲突风险 |
-| team-radar | 纯本地分析，检测谁在改相同文件 |
-| intent-verify | 提交前对比意图树，"你说了改 A 怎么还改了 B？" |
-| archaeology | 自然语言查代码历史 |
-| semantic-blame | 结合 Mnemosyne 讲述"为什么这么写" |
-| conflict-narrator | 冲突时讲双方故事 + 3 种方案 |
-| workflow-learner | 自动学习分支命名/PR 大小/合并偏好 |
-| newbie-guide | 用当前项目实例解释 Git 概念 |
-
----
+记忆分成两半，权限不同：用户画像来自用户本人写下的证据；项目事实（代码结构、配置、依赖、Git 历史）由确定性扫描器从当前 checkout 推导，写成 `authority: repository` 的 card，只作为参考注入标题索引。
 
 ## 快速开始
 
 ```bash
-git clone git@github.com:Jasonhuang115/Rubato-coding-agent.git
-cd Rubato-coding-agent
 npm install
+cp .env.example .env
 npm run build
+npm link
 
-# API Key（Shell 环境变量优先于 .env 文件）
-export DEEPSEEK_API_KEY=sk-your-key
-export TAVILY_API_KEY=tvly-your-key   # Web Search
-
-# 全局命令（使用复制安装，避免开发 link 让命令直接执行工作区脚本）
-npm unlink -g rubato coding-agent 2>/dev/null || true
-PACKAGE_TGZ=$(npm pack --silent)
-npm install -g "$PACKAGE_TGZ"
-rm -f "$PACKAGE_TGZ"
-
-# 交互模式
 rubato
-
-# 单次执行
-rubato -n "帮我写一个 hello world"
+rubato -d /path/to/project "解释这个项目"
+rubato -n "修复当前测试"
 ```
 
----
+常用参数：
 
-## REPL 命令
-
-| 命令 | 说明 |
-|------|------|
-| `/plan` | 查看当前意图树 |
-| `/plan new <描述>` | 开启需求澄清模式 |
-| `/grillme on/off/strict/normal/loose` | 偏离追踪 |
-| `/git` / `/git health` | Git 状态 / 分支健康 |
-| `/remember <标题>` | 手动存入记忆 |
-| `/memory` | 记忆统计 |
-| `/memory list` | 查看对话中积累的记忆 |
-| `/memory list all` | 查看全部记忆（含自动扫描） |
-| `/memory search <q>` | 搜索记忆 |
-| `/journal search <q>` | 搜索知识 |
-| `/model` | 查看/切换模型 |
-| `/tasks` | 查看 Subagent 任务 |
-| `/tasks wait/cancel/cleanup <id>` | 等待、取消或清理任务 |
-| `/tasks watch [id]` | 持续显示一个或全部运行中任务的状态变化 |
-| `/tasks pin/unpin <id>` | 保护或解除保护 artifact |
-| `/tasks stats/prune` | 查看空间占用或按 TTL/LRU 清理 |
-| `/trace [id]` | 查看根 trace 或任务 transcript 路径 |
-| `/help` | 所有命令 |
-| `/exit` | 退出 |
-
----
-
-## 架构
-
-```
-src/
-├── agent/                   # Agent 核心
-│   ├── loop.ts              # Async generator 核心循环
-│   ├── subagent.ts          # 只读/Worker 角色定义、权限解析和兼容入口
-│   ├── subagents/           # Runtime/Scheduler/Runner/Artifact/Trace/Inbox
-│   ├── agent-defs.ts        # 自定义 agent 加载器
-│   ├── read-guard.ts        # 读写守卫
-│   └── planner/             # 意图树 + Grill Me
-├── cli/                     # 命令行入口 + REPL（含多行输入）
-├── context/                 # 优先级上下文注入链
-│   ├── system-prompt.ts     # 委托 PromptAssembler
-│   └── compression.ts       # MicroCompact + Agent Compact
-├── memory/                  # 自进化 RAG（Mnemosyne）
-│   ├── store.ts             # SQLite + FTS5
-│   ├── evaluator.ts         # 六维诊断 + 生命周期决策
-│   ├── consolidator.ts      # 懒惰合并
-│   ├── embedding/           # trigram-hash (384-dim)
-│   └── journal/             # 知识提取 & 回忆
-├── model/                   # LLM 提供商（DeepSeek/Anthropic/OpenAI）
-├── prompt/                  # 四层 Prompt 架构
-│   ├── static.ts            # 静态层（~1200 tokens, 可缓存）
-│   ├── capability.ts        # 能力层（~800 tokens, 工具动态）
-│   ├── dynamic.ts           # 动态层（~600 tokens, 会话级）
-│   └── assembler.ts         # PromptAssembler + ModelProfile + Token 预算
-├── runtime/                 # Agent Runtime
-│   ├── agent-runtime.ts     # 生命周期容器（状态机 + EventBus）
-│   ├── state-machine.ts     # IDLE→PLANNING→EXECUTING→VERIFYING→DONE
-│   ├── event-bus.ts         # 类型化 pub/sub
-│   ├── tool-runtime.ts      # SandboxedDispatcher
-│   ├── budget-manager.ts    # Agent 树资源控制（depth + agent count）
-│   └── session/             # JSONL 会话持久化
-├── security/                # Security Runtime
-│   ├── runtime.ts           # PolicyEngine + CompositeSandbox 统一入口
-│   ├── permissions/         # 权限策略（policy/config）
-│   └── sandbox/             # 5 层 Sandbox
-│       ├── shell-sandbox.ts # 危险模式检测（rm -rf /, mkfs, dd, fork bomb）
-│       ├── fs-sandbox.ts    # 路径越界 + symlink 解析 + 敏感路径
-│       ├── network-sandbox.ts # SSRF + 私有 IP 拦截
-│       ├── git-sandbox.ts   # force-push / hard-reset / clean -fd
-│       └── env-sandbox.ts   # API key / secret / token 过滤
-├── tools/                   # 12 工具
-│   ├── agent.ts             # AgentTool（递归 spawn）
-│   ├── fs/                  # Read / Write / Edit / Grep / Glob
-│   ├── shell/               # Bash
-│   ├── git/                 # Git 顾问系统
-│   ├── web/                 # WebFetch + WebSearch
-│   ├── mcp/                 # MCP 协议
-│   └── registry.ts          # Tool 注册/分发（纯 router）
-└── shared/
-    └── core-types.ts        # 核心类型
+```text
+-d, --dir <path>      工作目录
+-m, --model <name>    覆盖模型
+-p, --provider <name> 覆盖 provider
+-c, --continue        接续当前项目最近一次会话
+-r, --resume [id]     恢复指定会话
+-n, --one-shot        单轮执行后退出
 ```
 
----
+API key 可放在项目的 `.env` / `.env.local`，也可放在 `~/.rubato/.env`。Shell 环境变量优先。支持的变量见 [.env.example](.env.example)。
 
-## 数据存储
+## 文件记忆如何工作
 
+```text
+用户消息
+  └─> hash-chained session JSONL
+       ├─> Fast path：识别明确的“记住/以后/默认/纠正”
+       └─> Session close：提取可追溯 observation
+              └─> 确定性 User Model / Reducer
+                    ├─> 低风险且证据充分：发布新 release
+                    ├─> 证据不足或敏感：candidate / review
+                    └─> 达到阈值：进入 durable Dream queue
+
+Dream runner（启动时后台执行，或 /memory dream --run）
+  └─> Dream worker（Extractor → Critic → Reconciler）
+       └─> 只生成并校验结构化 operation/candidate
+            └─> 确定性策略决定发布、复核或拒绝
+
+项目扫描（无模型调用）
+  └─> package.json / 目录结构 / tsconfig / git log
+       └─> content hash 比对 → 只在 checkout 变化时发布 repository card
+
+新会话
+  ├─> 校验 CURRENT、manifest、文件 hash、purge epoch
+  ├─> 注入有 token 上限的 PROFILE.md
+  ├─> 注入项目事实的“标题 + 地址”索引（不含正文）
+  └─> 按需 Grep catalog.tsv → Read cards/<id>.md
 ```
-~/.rubato/                       # 用户级
-├── mnemosyne/memory.db          #   记忆图谱 (SQLite)
-│   ├── entities                 #     实体（active/superseded/deprecated）
-│   ├── relations                #     关系（12 种关系类型）
-│   ├── access_log               #     访问记录（驱动衰减）
-│   ├── feedback_log             #     反馈信号（驱动进化）
-│   ├── strategy_weights         #     检索策略权重（自适应）
-│   ├── pending_consolidation    #     待合并组（懒惰合并）
-│   └── query_rewrite_rules      #     查询改写规则
-├── journal/journal.db           #   个人技术知识库
-├── global/memory.db             #   跨项目全局记忆
-├── models/                      #   ONNX 嵌入模型
-└── soul.md                      #   人格定义
+
+几个重要边界：
+
+- 只有用户本人写下的内容能成为用户画像证据。Assistant、工具输出和模型猜测不能伪造用户偏好。
+- 项目事实用 `authority: repository` 与用户画像隔离：它不进入 `PROFILE.md`，只作为 reference；工作树与它冲突时以工作树为准。
+- 同一会话的重复表达只取最强证据，避免靠复读把置信度刷高。
+- 明确偏好、约束、目标和纠正走快速路径；习惯和推断要跨会话积累，冲突时进入复核。
+- Dreaming 可以归纳、合并、挑战或暂停候选项，但 LLM 不能直接编辑 `CURRENT`、release 或执行删除。
+- 使用次数、搜索/读取记录和任务结果与“这条记忆是否可信”分开保存；效果反馈只能对已经匹配的结果重新排序，不能把猜测变成事实，也不能召回新条目。
+- 当前请求、系统安全规则和仓库事实始终高于历史记忆。
+
+### 为什么不是 RAG
+
+Rubato 的主要问题不是“从海量文档中找语义相似段落”，而是维护少量、长期、可纠正的用户事实与工作习惯。文件方案让每条记忆都有稳定地址、证据链、生命周期和 Git/Unix 工具可读性：
+
+- 没有 embedding 模型、向量索引、RRF 融合或检索权重调参。
+- 不根据当前 query 自动拼接若干相似片段。
+- `PROFILE.md` 是小而稳定的常驻画像；详细信息保持外置。
+- `catalog.tsv` 和 card 可以直接用 Grep/Read 检查，召回过程可解释。
+- 发布、回滚和隐私删除都有独立、可审计的文件状态。
+
+## 动态更新与生命周期
+
+写入不是直接修改画像，而是经过下面几层：
+
+1. 会话事件先以 hash chain 写入 JSONL，并在正常结束时追加 `session_closed`。
+2. 提取器只接受能回指到用户事件序号与 hash 的 observation。
+3. Reducer 按 logical key、scope、上下文和证据强度生成 ADD、REINFORCE、CONTEXTUALIZE、SUPERSEDE、CONFLICT 等操作。
+4. Publisher 在锁和双重 CAS 下创建全新的不可变 release；`CURRENT` 只在全部文件与 manifest 写完并校验后原子切换。
+5. 旧信息可被 supersede 或 retire；需要隐私删除时走 hard purge，不能用普通回滚恢复。
+
+Dream queue 使用持久化时钟，而不是进程内定时器。默认在以下任一条件满足时排队：
+
+- 新增 5 个已关闭且 hash 校验通过的会话；
+- 有 20 个 pending/review candidate；
+- 最老的未处理 observation 已等待 24 小时。
+
+进程重启后会从文件状态继续，不会因为计时器丢失而漏掉任务。队列里的租约（`POLICY.yml` 的 `dream.lease_minutes`）过期后会被回收，崩溃的 worker 不会把任务永久占住。
+
+排队和执行是两件事：
+
+- `/memory dream` 只入队，不调用模型。
+- `/memory dream --run` 显式排空队列，会调用模型。
+- 启动时有一次后台维护：先做项目事实扫描，再按 `dreamMaxRunsPerStart` 排空少量队列。它不阻塞第一次输入，退出时会被取消；队列为空时连 provider 都不会构造。用 `memory.dreamAutoRun: false` 可以完全关掉。
+
+无论从哪个入口执行，模型都拿不到发布权限：Dream 最多留下待复核 candidate，`CURRENT`、release 和删除仍由确定性策略决定。
+
+项目事实扫描是幂等的：每条事实带 content hash，只有 checkout 真的变了才会发布新 release；不再成立的事实会被退役，同一 scope 里的用户 card 不受影响。学习暂停或记忆关闭时也不扫描。
+
+### 软退役、纠正与彻底遗忘
+
+- `/profile correct`：发布新 revision，并让旧值进入 superseded 历史；适合“我现在改主意了”。
+- `/memory retire`：停止使用某条记忆，但保留可审计历史且可以回滚。
+- `/memory undo`：以新的 release 回到指定历史状态，不修改旧 release。
+- `/profile forget`：隐私级 hard purge。它清理 release、observation、candidate、Dream、session、摘要、访问/结果记录和相关派生物，并写入防复活 ledger。
+
+彻底遗忘前建议先预览：
+
+```text
+/profile forget <logical-key> --dry-run
+/profile forget <logical-key>
 ```
 
----
+`retire` 是可逆的生命周期操作，`forget` 是不可逆的隐私删除，两者不要混用。
+
+## 记忆命令
+
+```text
+/remember <text>
+```
+
+把内容转换为当前会话中的明确用户消息，因此它会进入同一条证据链，而不是旁路写文件。
+
+```text
+/memory stats
+/memory search <query>
+/memory list
+/memory dream            仅入队
+/memory dream --run      入队并立即排空队列（会调用模型）
+/memory bootstrap        重新扫描项目事实
+/memory bootstrap --check 只校验，不写入
+/memory retire <id-or-logical-key>
+/memory undo [target-release-id]
+```
+
+`/memory search` 搜索经过校验的 `catalog.tsv`；它不是语义检索。匹配集合只由文本决定，达到最小使用次数的效果评分只能在已匹配结果内部调整顺序。
+
+`/memory bootstrap --check` 会报告与 checkout 一致、已过期、尚未记录和已不再成立的项目事实，并且不写任何 release。
+
+```text
+/profile show
+/profile why <logical-key>
+/profile correct <logical-key> <new-value>
+/profile forget <logical-key> [--dry-run]
+/profile export
+/profile pause-learning
+/profile resume-learning
+```
+
+`/profile why` 会展示 card revision、scope、confidence 以及对应的用户证据。暂停学习会同时停掉项目事实扫描和 Dream 执行，但不会隐藏已经发布的记忆。
+
+`/journal list/search/stats/recent` 仍作为 `/memory` 的兼容别名，但不再连接旧数据库。
+
+## 磁盘布局
+
+默认数据根目录是 `~/.rubato`，也可用 `RUBATO_HOME` 覆盖。
+
+```text
+~/.rubato/
+├── memory/
+│   ├── global/
+│   │   ├── CURRENT
+│   │   ├── POLICY.yml
+│   │   ├── releases/<release-id>/
+│   │   │   ├── manifest.json
+│   │   │   ├── manifest.sha256
+│   │   │   ├── PROFILE.md
+│   │   │   ├── INDEX.md
+│   │   │   ├── catalog.tsv
+│   │   │   └── cards/<memory-id>.md
+│   │   ├── observations/YYYY/MM/YYYY-MM-DD.jsonl
+│   │   ├── candidates/{pending,review,rejected,published}/
+│   │   └── dreams/<run-id>/
+│   ├── projects/<full-project-sha256>/
+│   │   └── ...与 global 相同的 release/observation/candidate/dream 结构
+│   ├── access.jsonl
+│   ├── outcomes.jsonl
+│   ├── control-events.jsonl
+│   └── purge-ledger.jsonl
+├── projects/<full-project-sha256>/
+│   ├── sessions/<session-id>.jsonl
+│   ├── sessions.json
+│   └── session-catalog.tsv
+└── sessions/                         # 兼容的非项目级会话
+```
+
+release 内的 `PROFILE.md`、`INDEX.md`、`catalog.tsv` 和 card 全部由 manifest hash 覆盖。校验失败时会 fail closed，不会退回读取旧 release 或未发布 candidate。
 
 ## 配置
 
+项目配置写在 `.rubato.yml`，全局配置写在 `~/.rubato/config.yml`。
+
 ```yaml
-# ~/.rubato/config.yml 或 .rubato.yml
 model:
-  provider: deepseek
-  model: deepseek-chat
+  provider: anthropic
+  model: claude-sonnet-4-20250514
   maxRetries: 3
 
-permissions:
-  bash: auto      # Sandbox 拦截具体危险操作，权限默认放行
-  read: auto
-  write: auto
-  edit: auto
-  web: auto
-
-mnemosyne:
-  bootstrap_on_first_open: true
-  bootstrap_max_files: 500
+memory:
+  enabled: true
+  learningEnabled: true
+  profileMaxTokens: 1000
+  bootstrapEnabled: true
+  dreamAutoRun: true
+  dreamMaxRunsPerStart: 2
+  dreamSessionThreshold: 5
+  dreamCandidateThreshold: 20
+  dreamMaxAgeHours: 24
+  autoPublishExplicitLowRisk: true
+  utilityLearningRate: 0.2
+  utilityMinUses: 5
 
 session:
   cleanupPeriodDays: 30
-
-worktree:
-  baseRef: fresh   # fresh=origin/HEAD（不存在时退回 HEAD）；head=当前 HEAD
-
-subagents:
-  maxConcurrent: 4
-  maxWriteConcurrent: 2
 ```
 
-### 自定义 Subagent
+更底层的记忆策略保存在 `~/.rubato/memory/global/POLICY.yml`，它是全局上限而不是默认值：
 
-`.rubato/agents/*.md`：
+- `profile_max_tokens`：注入预算的硬上限。项目里的 `.rubato.yml` 只能调低，不能调高。
+- `prohibited_sensitive_categories`：快速路径拒绝学习的类别（认证凭据、身份证件、健康、政治、宗教、财务、性取向、亲密关系）。删掉某一项就等于允许它进入学习；写入一个没有识别器的类别会被明确报告为无法执行，而不是假装检查过。
+- `dream.lease_minutes`、`dream.max_retries`：队列租约与重试上限。
+- `utility.alpha`、`utility.minimum_uses`：`.rubato.yml` 不写 `utilityLearningRate` / `utilityMinUses` 时使用这里的值。
 
-```markdown
----
-name: api-worker
-description: API implementation worker
-tools: [Read, Grep, Glob, Bash]
-model: inherit
-readonly: false
-isolation: worktree
-canSpawn: false
-maxTurns: 10
----
+旧配置中的 `embedding` 和 `mnemosyne` 字段会被警告并忽略，不会启用兼容运行时。
 
-Implement the assigned non-overlapping scope, run its tests, and commit it.
-```
+## 从旧 Mnemosyne 数据库迁移
 
-自定义角色只要声明 Write、Edit、Bash 或 `tools: ["*"]`，就必须同时声明
-`isolation: worktree`；写角色的 `canSpawn` 会被强制关闭。纯审查角色应只列
-`[Read, Grep, Glob]`，无需 isolation。
-
-### MCP 服务器
-
-`.agent/mcp.json` 或 `~/.rubato/mcp.json`：
-
-```json
-{
-  "servers": {
-    "filesystem": {
-      "command": "npx",
-      "args": ["-y", "@anthropic-ai/mcp-server-filesystem", "/path/to/allowed/dir"]
-    }
-  }
-}
-```
-
----
-
-## 测试
+旧 SQLite 数据绝不会在启动或普通命令中自动打开。迁移是一个显式、一次性的离线脚本，不属于 CLI：
 
 ```bash
-npm test              # 191 tests, 16 suites
+npm run migrate:legacy -- /absolute/path/to/memory.db /absolute/path/to/review-candidates
 ```
 
-| Suite | 测试 | 覆盖 |
-|-------|------|------|
-| memory / memory-attribution | 46 | CRUD、FTS5、手动记忆、关系、反馈、评分、嵌入、LLM 蒸馏、引用归因 |
-| security-sandbox | 63 | Shell/Fs/Network/Git/Env Sandbox + SecurityRuntime 集成 |
-| runtime / prompt / security-policy | 10 | Runtime、Prompt、策略与能力边界回归 |
-| agent-loop-lifecycle | 6 | 会话收尾、CompleteTask、advisory 唤醒和根 Agent 单写流程 |
-| subagent runtime / policy / scheduler / results | 17 | 只读权限、任务终态、artifact、trace、递归槽释放、取消与超时 |
-| tools | 13 | Read/Write/Edit/Bash/Grep/Glob/Web/Todo |
-| context | 9 | CLAUDE.md、Memory.md、Soul、Git Status、Mnemosyne |
-| model | 10 | DeepSeek、OpenAI、Anthropic、Router |
-| permissions | 9 | 策略引擎、规则匹配、Allow/Deny |
-| agent | 8 | AgentLoop、Retry、CircuitBreaker、Compaction |
+`/memory migrate` 不执行迁移，只提示这条命令。迁移边界有意保持很窄：
 
----
+- `better-sqlite3` 是 optional dependency，只在运行该脚本时动态加载；CLI 的依赖图里没有它。
+- 数据库以 `readonly: true` 和 `fileMustExist: true` 打开。
+- 迁移结果只是待复核 candidate，不会写 `CURRENT` 或自动发布。
+- embedding、检索权重、反馈日志和图关系不会进入新运行时。
+- 没有旧数据要迁移时，可以不安装 `better-sqlite3`。
 
-## 技术栈
+## 开发
 
-- **TypeScript** + Node.js (ES2022, ESM)
-- **better-sqlite3** — SQLite + FTS5 全文搜索 + WAL 模式
-- **trigram-hash embedding** — 384 维，零依赖，本地即时生成，无需 GPU
-- **RRF (Reciprocal Rank Fusion)** — 三路检索融合排序
-- **openai** v4 + **@anthropic-ai/sdk** — LLM 提供商
-- **vitest** — 测试框架
+```bash
+npm run build
+npm test
+npm run dev
+```
 
----
+`npm run build` 会先清理 `dist/`，防止已经删除的旧模块以陈旧 JavaScript 的形式混入发布包。
 
-## 参考论文
+核心目录：
 
-| 论文 | 出处 | 借鉴内容 |
-|------|------|---------|
-| [MemStrata](https://arxiv.org/abs/2606.26511) | arXiv 2606.26511 (2026) | 事实时效管理——(subject,relation,object) 三元组 supersession，旧版标记过期而非删除 |
-| RecMem | 2026 | 懒惰巩固——相似记忆积累 N 次才触发 LLM 合并，省 87% token |
-| EvoRAG | 2026 | 反馈反向传播——response-level feedback 回溯到 triplet-level 权重更新 |
-| SegMem-RAG | AAAI 2026 | 自适应检索路由——无监督学习优化多源检索策略 |
-| [RRF](https://plg.uwaterloo.ca/~gvcormac/cormack06-rrf.pdf) | SIGIR 2009 | Reciprocal Rank Fusion 融合多路检索排序 |
+```text
+src/agent/             Agent 主循环、规划与子任务
+src/context/           CLAUDE.md、Soul、verified file-memory、Git context
+src/memory-files/      文件记忆、项目事实扫描、发布、Dreaming、迁移与隐私删除
+src/runtime/session/   hash-chained 会话和项目 session catalog
+src/security/          权限、sandbox、持久化数据清理
+src/tools/             Agent 工具
+test/                  单元、集成与安全回归测试
+```
 
-## License
-
-MIT
+正常运行时的入口依赖图由测试锁定：CLI、context assembler 和 agent loop 均不得依赖 legacy memory、数据库驱动或旧的自动注入源。

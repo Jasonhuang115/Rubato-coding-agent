@@ -11,6 +11,10 @@ import type {
 import { redactText, redactValue } from "./redaction.js";
 import { coverageSummary, emptyCoverageManifest } from "./coverage.js";
 import { WorktreeManager } from "../worktrees/worktree-manager.js";
+import {
+  legacyTruncatedProjectMemoryId,
+  projectMemoryId,
+} from "../../memory-files/paths.js";
 
 export class ArtifactStore {
   readonly projectDir: string;
@@ -21,8 +25,8 @@ export class ArtifactStore {
     projectDir: string,
     rootSessionId: string,
     rubatoHome = process.env.RUBATO_HOME ?? path.join(os.homedir(), ".rubato"),
+    projectHash = projectMemoryId(projectDir),
   ) {
-    const projectHash = hashProject(projectDir);
     this.projectDir = path.join(
       rubatoHome,
       "projects",
@@ -37,13 +41,23 @@ export class ArtifactStore {
     projectDir: string,
     rubatoHome = process.env.RUBATO_HOME ?? path.join(os.homedir(), ".rubato"),
   ): TaskResult[] {
-    const runsDir = path.join(rubatoHome, "projects", hashProject(projectDir), "runs");
-    if (!fs.existsSync(runsDir)) return [];
     const recovered: TaskResult[] = [];
-    for (const entry of fs.readdirSync(runsDir, { withFileTypes: true })) {
-      if (!entry.isDirectory()) continue;
-      const store = new ArtifactStore(projectDir, entry.name, rubatoHome);
-      recovered.push(...store.recoverOrphaned());
+    for (const projectHash of new Set([
+      projectMemoryId(projectDir),
+      legacyTruncatedProjectMemoryId(projectDir),
+    ])) {
+      const runsDir = path.join(rubatoHome, "projects", projectHash, "runs");
+      if (!fs.existsSync(runsDir)) continue;
+      for (const entry of fs.readdirSync(runsDir, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        const store = new ArtifactStore(
+          projectDir,
+          entry.name,
+          rubatoHome,
+          projectHash,
+        );
+        recovered.push(...store.recoverOrphaned());
+      }
     }
     return recovered;
   }
@@ -378,13 +392,6 @@ export class ArtifactStore {
 
 function safeSegment(value: string): string {
   return value.replace(/[^a-zA-Z0-9._-]/g, "_");
-}
-
-function hashProject(projectDir: string): string {
-  return createHash("sha256")
-    .update(path.resolve(projectDir))
-    .digest("hex")
-    .slice(0, 16);
 }
 
 function writeJsonAtomic(filePath: string, value: unknown): void {

@@ -11,9 +11,9 @@ import {
 } from "../agent/subagent.js";
 import { processSubagentRegistry } from "../agent/subagents/registry.js";
 
-// Leave room for task metadata so the entire tool result stays below the
-// parent's 4,000-character preview budget in practice.
-const RESULT_PREVIEW_LENGTH = 3_500;
+// Leave a deterministic ceiling for the complete result, including absolute
+// artifact paths whose length varies with RUBATO_HOME and the project hash.
+const RESULT_MAX_LENGTH = 4_800;
 
 export const agentTool: ToolDefinition = {
   name: "Agent",
@@ -191,13 +191,7 @@ export const agentTool: ToolDefinition = {
 };
 
 function formatRequiredResult(result: TaskResult): string {
-  let preview = "";
-  try {
-    preview = fs.readFileSync(result.reportPath, "utf8").slice(0, RESULT_PREVIEW_LENGTH);
-  } catch {
-    preview = "(report could not be read)";
-  }
-  return [
+  const metadata = [
     `Task completed: ${result.summary}`,
     `Task ID: ${result.taskId}`,
     `Status: ${result.status}`,
@@ -215,8 +209,18 @@ function formatRequiredResult(result: TaskResult): string {
     result.workspace ? `Patch: ${result.workspace.patchPath}` : "",
     "",
     "Report preview:",
-    preview,
   ].filter((line) => line !== "").join("\n");
+  const previewBudget = Math.max(
+    0,
+    RESULT_MAX_LENGTH - metadata.length - 1,
+  );
+  let preview = "";
+  try {
+    preview = fs.readFileSync(result.reportPath, "utf8").slice(0, previewBudget);
+  } catch {
+    preview = "(report could not be read)".slice(0, previewBudget);
+  }
+  return `${metadata}\n${preview}`;
 }
 
 function startRequiredProgressIndicator(

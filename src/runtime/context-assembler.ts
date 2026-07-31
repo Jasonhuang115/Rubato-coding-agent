@@ -1,19 +1,16 @@
 // ContextAssembler — builds the full system prompt from context sources
 // Extracted from loop.ts. Handles:
-//   - ContextChain setup (Soul, ClaudeMd, MemoryMd, Mnemosyne, GitStatus)
-//   - Journal recall
+//   - ContextChain setup (Soul, ClaudeMd, verified FileMemory, GitStatus)
 //   - Git health / conflict checks
-//   - System prompt assembly (PromptAssembler + context text + journal + git)
+//   - System prompt assembly (PromptAssembler + verified file memory + git)
 //   - Resume summary injection
 
 import type { AgentContext, ToolDefinition } from "../shared/core-types.js";
 import { ContextChain } from "../context/sources.js";
 import { ClaudeMdSource } from "../context/claude-md.js";
-import { MemoryMdSource } from "../context/memory-md.js";
 import { GitStatusSource } from "../context/git-status.js";
 import { SoulSource } from "../context/soul.js";
-import { MnemosyneSource } from "../context/mnemosyne-source.js";
-import { sessionStartRecall } from "../memory/journal/recall.js";
+import { FileMemorySource } from "../context/file-memory.js";
 import { sessionStartHook, conflictCheckHook } from "../tools/git/hooks.js";
 import { getPromptAssembler } from "../prompt/assembler.js";
 import { buildSubagentStaticPrompt } from "../prompt/static.js";
@@ -39,7 +36,7 @@ export interface ContextAssemblerOptions {
  * Build the complete system prompt for a session.
  * Chains: Static + Capability prompts (via PromptAssembler)
  *        + Context sources (CLAUDE.md, memory, git, etc.)
- *        + Journal recall
+ *        + verified, bounded file-memory profile
  *        + Git health
  *        + Previous session resume
  */
@@ -82,40 +79,35 @@ export async function assembleContext(
   } else {
     contextChain.register(new SoulSource());
     contextChain.register(new ClaudeMdSource());
-    contextChain.register(new MemoryMdSource());
-    contextChain.register(new MnemosyneSource());
+    contextChain.register(new FileMemorySource());
     contextChain.register(new GitStatusSource());
   }
 
   const contextBlocks = await contextChain.fetchAll(prompt, ctx);
   const contextText = contextBlocks.map((b) => b.content).join("\n\n");
 
-  // 3. Journal recall
-  const journalRecall = contextProfile === "root" ? sessionStartRecall(workingDir) : "";
-
-  // 4. Git health
+  // 3. Git health
   const gitHealth = contextProfile === "root"
     ? await sessionStartHook(workingDir).catch(() => null)
     : null;
 
-  // 5. Conflict check
+  // 4. Conflict check
   const conflictWarning = contextProfile === "root"
     ? await conflictCheckHook(workingDir).catch(() => null)
     : null;
 
-  // 6. Assemble final system prompt
+  // 5. Assemble final system prompt
   let systemPrompt = layeredSystem +
     (contextText ? `\n\n## Project Context\n${contextText}` : "") +
-    (journalRecall ? `\n\n${journalRecall}` : "") +
     (gitHealth ? `\n\n${gitHealth}` : "") +
     (conflictWarning ? `\n\n${conflictWarning}` : "");
 
-  // 7. Resume summary (from previous session)
+  // 6. Resume summary (from previous session)
   if (resumeSummary && contextProfile === "root") {
     systemPrompt += `\n\n## Previous Session Context\nThe following is a summary of a previous session in this project. Use this context to understand what was previously discussed:\n\n${resumeSummary}`;
   }
 
-  // 8. Estimate tokens
+  // 7. Estimate tokens
   const systemTokens = roughTokenEstimate(systemPrompt);
 
   return { systemPrompt, systemTokens };

@@ -1,9 +1,9 @@
-// Semantic Blame — explains WHY a line exists, not just who wrote it
-// Combines git log, commit messages, and memory graph for full context
+// Semantic Blame — explains WHY a line exists, not just who wrote it.
+// The explanation is derived from repository evidence only: blame, log and
+// file history. Personal memory is intentionally not a dependency of this tool.
 
 import { gitExec } from "./advisor.js";
 import { narrateHistory } from "./archaeology.js";
-import type { MnemosyneStore } from "../../memory/store.js";
 
 export interface SemanticBlameResult {
   file: string;
@@ -18,18 +18,15 @@ export interface SemanticBlameResult {
   commitMessage: string;
   /** Full history narrative */
   historyNarrative: string;
-  /** Related bugs/fixes from memory graph */
-  relatedMemories: string[];
   /** Full story combining everything */
   story: string;
 }
 
-/** Full semantic blame: git history + memory graph = complete story */
+/** Full semantic blame from verifiable Git history. */
 export async function semanticBlame(
   workingDir: string,
   file: string,
-  lineNumber: number,
-  memoryStore?: MnemosyneStore
+  lineNumber: number
 ): Promise<SemanticBlameResult | null> {
   try {
     // 1. Get git blame info
@@ -56,21 +53,7 @@ export async function semanticBlame(
     const history = await narrateHistory(workingDir, file, lineNumber);
     const historyNarrative = history?.narrative ?? "";
 
-    // 4. Search memory graph for related bugs/fixes
-    const relatedMemories: string[] = [];
-    if (memoryStore) {
-      try {
-        const keyword = `${file} ${content.trim().slice(0, 50)}`;
-        const memories = memoryStore.searchWithRelevance(keyword, 3);
-        for (const { entity } of memories) {
-          relatedMemories.push(`[${entity.type}] ${entity.name}: ${entity.content.slice(0, 100)}`);
-        }
-      } catch {
-        // Memory store not available — skip
-      }
-    }
-
-    // 5. Weave it all into a story
+    // 4. Weave the repository evidence into a story.
     const story = buildStory(
       file,
       lineNumber,
@@ -79,8 +62,7 @@ export async function semanticBlame(
       date,
       commitHash,
       commitMsg,
-      historyNarrative,
-      relatedMemories
+      historyNarrative
     );
 
     return {
@@ -92,7 +74,6 @@ export async function semanticBlame(
       commitHash,
       commitMessage: commitMsg,
       historyNarrative,
-      relatedMemories,
       story,
     };
   } catch {
@@ -108,8 +89,7 @@ function buildStory(
   date: string,
   hash: string,
   message: string,
-  history: string,
-  memories: string[]
+  history: string
 ): string {
   const parts = [
     `这行代码 \`${lineContent.slice(0, 80)}\`（${file}:${lineNumber}）`,
@@ -125,17 +105,9 @@ function buildStory(
     parts.push("");
   }
 
-  if (memories.length > 0) {
-    parts.push(`**💡 记忆关联**：`);
-    for (const m of memories) {
-      parts.push(`  - ${m}`);
-    }
-    parts.push("");
-  }
-
   parts.push(`---`);
   parts.push(
-    `💡 这个分析结合了 git log、commit message、以及 Mnemosyne 记忆图谱。` +
+    `💡 这个分析结合了 git blame、git log 和文件修改历史。` +
     `如果你需要更详细的上下文（如当时的讨论、PR review 意见），可以告诉我。`
   );
 

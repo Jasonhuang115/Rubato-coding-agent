@@ -12,12 +12,14 @@ const fakeProvider = vi.hoisted(() => ({
   countTokens: vi.fn(async () => 1),
 }));
 
-const persistKnowledge = vi.hoisted(() => vi.fn(() => ({ saved: 0 })));
-const getInjectedMemoriesForSession = vi.hoisted(() => vi.fn(() => []));
-const markReferenced = vi.hoisted(() => vi.fn());
-const markIgnoredForSession = vi.hoisted(() => vi.fn());
-const autoTuneStrategyWeights = vi.hoisted(() => vi.fn());
-const getPendingConsolidations = vi.hoisted(() => vi.fn(() => []));
+const learnFromStoredSessionRecords = vi.hoisted(() => vi.fn(() => ({
+  observed: 0,
+  duplicates: 0,
+  candidates: [],
+  publishedReleaseIds: [],
+  needsReview: 0,
+  skipped: [],
+})));
 
 vi.mock("../src/model/router.js", () => ({
   createProvider: () => fakeProvider,
@@ -27,18 +29,8 @@ vi.mock("../src/runtime/context-assembler.js", () => ({
   assembleContext: vi.fn(async () => ({ systemPrompt: "system", systemTokens: 1 })),
 }));
 
-vi.mock("../src/memory/journal/extractor.js", () => ({
-  persistKnowledge,
-}));
-
-vi.mock("../src/memory/store.js", () => ({
-  getMnemosyneStore: vi.fn(() => ({
-    getInjectedMemoriesForSession,
-    markReferenced,
-    markIgnoredForSession,
-    autoTuneStrategyWeights,
-    getPendingConsolidations,
-  })),
+vi.mock("../src/memory-files/runtime.js", () => ({
+  learnFromStoredSessionRecords,
 }));
 
 vi.mock("../src/tools/git/hooks.js", () => ({
@@ -132,12 +124,12 @@ describe("agentLoop lifecycle", () => {
       id: "lifecycle-session",
       updates: { status: "ended" },
     });
-    expect(markIgnoredForSession).not.toHaveBeenCalled();
-    expect(autoTuneStrategyWeights).toHaveBeenCalled();
-    expect(persistKnowledge).toHaveBeenCalled();
+    expect(learnFromStoredSessionRecords).toHaveBeenCalled();
+    expect(learnFromStoredSessionRecords.mock.calls.at(-1)?.[1])
+      .toMatchObject({ sessionId: "lifecycle-session" });
   });
 
-  it("resolves memory feedback after a successful assistant response", async () => {
+  it("closes the hash-chained session without a database memory side channel", async () => {
     fakeProvider.chat.mockImplementation(async function* () {
       yield { type: "text_delta" as const, text: "A complete answer" };
       yield {
@@ -162,9 +154,7 @@ describe("agentLoop lifecycle", () => {
     }
 
     expect(events).toContainEqual({ type: "text", text: "A complete answer" });
-    expect(getInjectedMemoriesForSession).toHaveBeenCalledWith("answered-session");
-    expect(markIgnoredForSession).toHaveBeenCalledWith("answered-session");
-    expect(autoTuneStrategyWeights).toHaveBeenCalled();
+    expect(learnFromStoredSessionRecords).toHaveBeenCalled();
     const records = fs.readFileSync(
       path.join(homeDir, ".rubato", "sessions", "answered-session.jsonl"),
       "utf8",
@@ -176,6 +166,9 @@ describe("agentLoop lifecycle", () => {
     expect(records).toContainEqual(expect.objectContaining({
       type: "message",
       data: expect.objectContaining({ role: "assistant" }),
+    }));
+    expect(records.at(-1)).toEqual(expect.objectContaining({
+      type: "session_closed",
     }));
   });
 

@@ -2,7 +2,7 @@ import path from "path";
 import fs from "fs";
 import YAML from "yaml";
 import type { AgentConfig, AgentContext } from "../shared/core-types.js";
-import { getMnemosyneStore } from "../memory/store.js";
+import { handleFileMemoryCommand } from "./file-memory-commands.js";
 import { getGitState } from "../tools/git/advisor.js";
 import { getBranchHealth } from "../tools/git/branch-health.js";
 import { getSkillRegistry } from "../skills/registry.js";
@@ -49,113 +49,49 @@ export async function handleGitCommand(input: string, workdir: string): Promise<
   console.log("\n  用法：/git、/git status、/git health");
 }
 
-export async function handleJournalCommand(input: string, workdir: string): Promise<void> {
+export async function handleJournalCommand(
+  input: string,
+  workdir: string,
+  config?: AgentConfig,
+): Promise<void> {
   const args = input.split(/\s+/).slice(1);
-  const store = getMnemosyneStore();
 
   if (input.startsWith("/remember")) {
-    const title = args.join(" ") || "Untitled";
-    store.addManualMemory(title, `Manual save from session at ${workdir}.`, [], "manual", "note");
-    console.log(`\n  📓 已保存到统一记忆图谱：「${title}」(protected)`);
-    return;
-  }
-
-  if (args.length === 0 || args[0] === "recent") {
-    const recent = store.getManualMemories(10);
-    if (recent.length === 0) {
-      console.log("\n  📓 知识库为空。用 /remember <标题> 保存第一条知识！");
-      return;
-    }
-    console.log("\n  📓 个人知识（统一记忆图谱）：");
-    for (const entry of recent) {
-      const icon = entry.type === "error" ? "🔧" : entry.type === "concept" ? "💡" : "📝";
-      const tags = entry.tags ? entry.tags.split(",").filter(Boolean) : [];
-      console.log(`  ${icon} ${entry.name} (${tags.join(", ") || "无标签"}) [protected]`);
-    }
+    const content = args.join(" ").trim();
+    console.log(
+      content
+        ? "\n  /remember 需要作为当前会话的用户消息进入证据链。请直接发送：" +
+          `\n  请记住：${content}`
+        : "\n  用法：/remember <内容>；CLI 会把它转成可追溯的“请记住”用户消息。",
+    );
     return;
   }
 
   if (args[0] === "search") {
-    const query = args.slice(1).join(" ");
-    if (!query) { console.log("\n  用法：/journal search <关键词>"); return; }
-    const results = store.searchWithRelevance(query, 5);
-    if (results.length === 0) { console.log(`\n  未找到与「${query}」相关的记忆。`); return; }
-    console.log(`\n  搜索「${query}」结果：`);
-    for (const { entity, relevance } of results) {
-      const sourceLabel = entity.source === "manual" ? "[手动]" : entity.source === "memories_md" ? "[MD]" : "[自动]";
-      console.log(`  - ${sourceLabel} [${entity.type}] ${entity.name} (相关度: ${relevance.toFixed(2)})`);
-      if (entity.content) console.log(`    ${entity.content.slice(0, 100)}...`);
-    }
+    await handleFileMemoryCommand(
+      `/memory search ${args.slice(1).join(" ")}`,
+      workdir,
+      config,
+    );
     return;
   }
 
   if (args[0] === "stats") {
-    const stats = store.getStats();
-    console.log("\n  📓 统一记忆图谱统计：");
-    console.log(`  总实体：${stats.entities} | 关系：${stats.relations} | 手动知识：${stats.manualMemories}`);
+    await handleFileMemoryCommand("/memory stats", workdir, config);
     return;
   }
 
-  console.log("\n  用法：/journal、/journal search <q>、/journal stats、/journal recent");
+  // `recent` was advertised by tab completion but never handled. The file-memory
+  // list is already ordered, so this is the honest equivalent of the old alias.
+  await handleFileMemoryCommand("/memory list", workdir, config);
 }
 
-const MEMORY_TYPE_ICONS: Record<string, string> = {
-  file: "📄", function: "🔧", class: "🏗️", concept: "💡", config: "⚙️",
-  error: "🐛", deploy: "🚀", api: "🔌", dependency: "📦", test: "✅", note: "📝",
-};
-
-export async function handleMemoryCommand(input: string): Promise<void> {
-  const args = input.split(/\s+/).slice(1);
-  try {
-    const store = getMnemosyneStore();
-    const stats = store.getStats();
-
-    if (args[0] === "stats" || args.length === 0) {
-      console.log("\n  🧠 Mnemosyne 统一记忆图谱：");
-      console.log(`  实体：${stats.entities} | 关系：${stats.relations} | 访问记录：${stats.accessLogs}`);
-      console.log(`  手动知识：${stats.manualMemories} (protected)`);
-      console.log("  存储路径：~/.rubato/mnemosyne/memory.db");
-      return;
-    }
-
-    if (args[0] === "search") {
-      const query = args.slice(1).join(" ");
-      if (!query) { console.log("\n  用法：/memory search <关键词>"); return; }
-      const results = store.searchWithRelevance(query, 5);
-      if (results.length === 0) { console.log(`\n  未找到与「${query}」相关的实体。`); return; }
-      console.log(`\n  搜索「${query}」结果：`);
-      for (const { entity, relevance } of results) {
-        console.log(`  - [${entity.type}] ${entity.name} (相关度: ${relevance.toFixed(2)})`);
-        if (entity.content) console.log(`    ${entity.content.slice(0, 120)}`);
-      }
-      return;
-    }
-
-    if (args[0] === "list") {
-      const showAll = args[1] === "all";
-      const recent = store.getRecentEntities(50);
-      const filtered = showAll ? recent : recent.filter((entity) =>
-        !entity.name.includes("/languages") && !entity.name.includes("/structure") &&
-        entity.source !== "seeder" && entity.type !== "concept"
-      );
-      if (filtered.length === 0) {
-        console.log("\n  📭 暂无对话中积累的记忆。用 /memory list all 查看全部（含自动扫描）。");
-        return;
-      }
-      console.log(`\n  🧠 ${showAll ? "全部记忆" : "对话记忆（不含自动扫描）"}：`);
-      for (const entity of filtered.slice(0, 20)) {
-        const icon = MEMORY_TYPE_ICONS[entity.type] ?? "📝";
-        const source = entity.source === "manual" ? " [手动]" : entity.source === "extractor" ? " [对话提取]" : entity.source === "seeder" ? " [自动扫描]" : "";
-        console.log(`  ${icon} [${entity.type}] ${entity.name}${source}`);
-        if (entity.content) console.log(`     ${entity.content.slice(0, 120)}`);
-      }
-      return;
-    }
-  } catch (error) {
-    console.warn(`\n  记忆系统不可用：${error instanceof Error ? error.message : String(error)}`);
-    return;
-  }
-  console.log("\n  用法：/memory、/memory stats、/memory search <q>、/memory list");
+export async function handleMemoryCommand(
+  input: string,
+  workdir = process.cwd(),
+  config?: AgentConfig,
+): Promise<void> {
+  await handleFileMemoryCommand(input, workdir, config);
 }
 
 export function saveModelPreference(provider: string, model: string): void {

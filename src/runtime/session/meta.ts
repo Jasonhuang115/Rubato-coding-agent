@@ -50,7 +50,7 @@ export function finalizeSessionMeta(meta: SessionMeta): SessionMeta {
   };
 }
 
-// ---- Extension point: Phase 2 Mnemosyne consumer reads this meta ----
+// ---- Generic post-session metadata consumers ----
 
 export interface MetaConsumer {
   consume(meta: SessionMeta): Promise<void>;
