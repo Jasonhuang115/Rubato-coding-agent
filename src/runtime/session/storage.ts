@@ -1,15 +1,14 @@
 // Session storage — append-only, hash-chained JSONL session records.
-// Supports project-scoped storage (when projectHash is provided) with
-// fallback to legacy flat ~/.rubato/sessions/ for sub-agents.
+// Sessions are always project-scoped under the canonical project SHA-256.
 
 import { createHash, randomUUID } from "crypto";
 import fs from "fs";
-import os from "os";
 import path from "path";
 import { warnRecoverable } from "../../shared/diagnostics.js";
 import type { SessionMeta, SessionRecord } from "../../shared/core-types.js";
 import { redactValue } from "../../agent/subagents/redaction.js";
 import { isMemorySessionPurged } from "../../memory-files/release.js";
+import { getRubatoHome } from "../../shared/rubato-home.js";
 
 export type SessionEventType = SessionRecord["type"] | "session_closed";
 
@@ -39,20 +38,13 @@ export interface SessionVerificationResult {
   error?: string;
 }
 
-function getRubatoHome(): string {
-  return path.resolve(process.env.RUBATO_HOME ?? path.join(os.homedir(), ".rubato"));
-}
-
-function getSessionDir(projectHash?: string): string {
-  if (projectHash) {
-    return path.join(getRubatoHome(), "projects", projectHash, "sessions");
-  }
-  return path.join(getRubatoHome(), "sessions");
+function getSessionDir(projectHash: string): string {
+  return path.join(getRubatoHome(), "projects", projectHash, "sessions");
 }
 
 export class SessionStore {
   private readonly sessionId: string;
-  private readonly projectHash?: string;
+  private readonly projectHash: string;
   private dir: string;
   private filePath: string;
   private initialized = false;
@@ -62,7 +54,10 @@ export class SessionStore {
   private previousHash: string | null = null;
   private records: StoredSessionRecord[] = [];
 
-  constructor(sessionId: string, projectHash?: string) {
+  constructor(sessionId: string, projectHash: string) {
+    if (!/^[a-f0-9]{64}$/.test(projectHash)) {
+      throw new Error("SessionStore requires a canonical SHA-256 project ID.");
+    }
     this.sessionId = sessionId;
     this.projectHash = projectHash;
     this.dir = getSessionDir(projectHash);
@@ -210,9 +205,8 @@ export class SessionStore {
 
 // ---- Session loader (reads back JSONL) ----
 
-export function loadSession(sessionId: string, baseDir?: string): StoredSessionRecord[] {
-  const dir = baseDir ?? path.join(getRubatoHome(), "sessions");
-  const filePath = path.join(dir, `${sessionId}.jsonl`);
+export function loadSession(sessionId: string, baseDir: string): StoredSessionRecord[] {
+  const filePath = path.join(baseDir, `${sessionId}.jsonl`);
 
   if (!fs.existsSync(filePath)) return [];
 
@@ -234,10 +228,9 @@ export function loadSession(sessionId: string, baseDir?: string): StoredSessionR
 
 export function verifySession(
   sessionId: string,
-  baseDir?: string,
+  baseDir: string,
 ): SessionVerificationResult {
-  const dir = baseDir ?? path.join(getRubatoHome(), "sessions");
-  const filePath = path.join(dir, `${sessionId}.jsonl`);
+  const filePath = path.join(baseDir, `${sessionId}.jsonl`);
   if (!fs.existsSync(filePath)) {
     return {
       valid: false,
@@ -257,18 +250,6 @@ export function verifySession(
       error: error instanceof Error ? error.message : String(error),
     };
   }
-}
-
-export const verifySessionChain = verifySession;
-
-export function listSessions(projectHash?: string): string[] {
-  const dir = getSessionDir(projectHash);
-  if (!fs.existsSync(dir)) return [];
-
-  return fs
-    .readdirSync(dir)
-    .filter((f) => f.endsWith(".jsonl"))
-    .map((f) => f.replace(".jsonl", ""));
 }
 
 function hashRecord(record: Omit<StoredSessionRecord, "hash">): string {

@@ -3,6 +3,7 @@
 import fs from "fs";
 import type { ToolDefinition, AgentContext, ToolResult } from "../shared/core-types.js";
 import { resolveToolPath } from "./path-utils.js";
+import type { AgentMode } from "../shared/core-types.js";
 
 const tools = new Map<string, ToolDefinition>();
 
@@ -21,12 +22,14 @@ export function getAllTools(): ToolDefinition[] {
   return Array.from(tools.values());
 }
 
-export function getReadTools(): ToolDefinition[] {
-  return getAllTools().filter((t) => t.type === "read");
-}
+export const PLAN_TOOL_NAMES = new Set([
+  "Read", "Grep", "Glob", "WebFetch", "WebSearch", "Agent", "Task", "SubmitPlan",
+]);
 
-export function getWriteTools(): ToolDefinition[] {
-  return getAllTools().filter((t) => t.type === "write");
+export function getToolsForMode(mode: AgentMode): ToolDefinition[] {
+  const all = getAllTools();
+  if (mode === "plan") return all.filter((tool) => PLAN_TOOL_NAMES.has(tool.name));
+  return all.filter((tool) => tool.name !== "SubmitPlan");
 }
 
 export async function dispatch(

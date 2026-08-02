@@ -1,10 +1,10 @@
 // Tests for runtime components used by the production agent loop.
 import { describe, it, expect } from "vitest";
 import {
-  roughTokenEstimate,
   estimateMessageTokens,
   getAutoCompactThreshold,
 } from "../src/runtime/compaction-controller.js";
+import { roughTokenEstimate } from "../src/shared/tokens.js";
 
 describe("CompactionController token estimation", () => {
   it("estimates text and structured messages", () => {

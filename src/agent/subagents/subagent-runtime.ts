@@ -605,6 +605,7 @@ export class SubagentRuntime implements TaskService {
         onConfirmTool: record.onConfirmTool,
         trace: this.trace,
         onActivity,
+        mode: input.mode,
       }), record.controller.signal);
     } catch (error) {
       output = {

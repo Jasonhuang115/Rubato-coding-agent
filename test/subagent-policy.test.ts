@@ -89,8 +89,6 @@ describe("subagent capability boundary", () => {
       config: {
         model: { provider: "test", model: "test" },
         permissions,
-        embedding: { source: "local_hash" },
-        mnemosyne: { bootstrap_on_first_open: false, bootstrap_max_files: 1 },
         session: { cleanupPeriodDays: 30 },
       },
     } as AgentContext);

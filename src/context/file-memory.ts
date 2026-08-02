@@ -1,7 +1,6 @@
 // Verified file-memory context — bounded PROFILE injection plus grep-first recall.
 //
-// This source deliberately performs no query ranking, top-k selection, embeddings,
-// or RAG. It reads only the immutable releases named by each scope's CURRENT
+// This source reads only the immutable releases named by each scope's CURRENT
 // pointer, verifies their manifests and compiled artifacts, then injects the
 // bounded PROFILE.md files. Detailed memories remain external files that the
 // agent can discover with Grep and open with Read.
@@ -156,8 +155,8 @@ export class FileMemorySource implements ContextSource {
       "",
       "### On-demand read-only recall",
       "",
-      "No top-k or RAG retrieval was performed. When more detail is relevant, use " +
-        "Grep on the exact catalog path, then Read only the referenced card. " +
+      "Only the bounded verified profiles are preloaded. When more detail is relevant, " +
+        "Grep the exact catalog path, then Read only the referenced card. " +
         "Do not inspect older releases or candidate memory.",
     );
     for (const release of releases) {

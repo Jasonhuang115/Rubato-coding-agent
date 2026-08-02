@@ -23,12 +23,13 @@ import {
   MemoryScopeLockedError,
   listCurrentCards,
   publishMemoryRelease,
-  purgeMemories,
+  purgeMemoriesWithinLock,
   readCurrentRelease,
   readCurrentReleaseId,
   readMemoryRelease,
   rollbackMemoryRelease,
   verifyRelease,
+  withMemoryScopeLock,
 } from "../src/memory-files/release.js";
 import type {
   MemoryCard,
@@ -383,13 +384,13 @@ describe("immutable file memory releases", () => {
       }],
     });
 
-    const purged = purgeMemories(paths, {
+    const purged = withMemoryScopeLock(paths, () => purgeMemoriesWithinLock(paths, {
       baseReleaseId: "rel_002",
       releaseId: "rel_003",
       ids: [forgotten.id],
       logicalKeys: [forgotten.logicalKey],
       reason: `Forget ${forgotten.logicalKey}`,
-    });
+    }));
     expect(purged.cards).toEqual([]);
     const ledger = fs.readFileSync(paths.purgeLedgerPath, "utf8");
     expect(ledger).not.toContain(forgotten.id);

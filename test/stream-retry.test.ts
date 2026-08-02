@@ -47,7 +47,6 @@ describe("stream retry policy", () => {
       workingDir: process.cwd(),
       ctx: { sessionId: "test", workingDir: process.cwd() } as AgentContext,
       toolRuntime: {} as never,
-      planManager: {} as never,
       maxRetries: 3,
     });
 

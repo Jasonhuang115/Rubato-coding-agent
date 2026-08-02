@@ -6,7 +6,6 @@ import {
   listMemoryAccessEvents,
   recordMemoryFileAccess,
   sessionMemoryAccess,
-  summarizeMemoryAccess,
 } from "../src/memory-files/access.js";
 
 describe("file-memory access telemetry", () => {
@@ -48,14 +47,8 @@ describe("file-memory access telemetry", () => {
       searched: ["pref-detail"],
       read: ["pref-detail"],
     });
-    expect(summarizeMemoryAccess(listMemoryAccessEvents(memoryRoot))).toEqual([
-      expect.objectContaining({
-        memory_id: "pref-detail",
-        access_count: 2,
-        search_count: 1,
-        read_count: 1,
-      }),
-    ]);
+    expect(listMemoryAccessEvents(memoryRoot).map((event) => event.action))
+      .toEqual(["search", "read"]);
   });
 
   it("ignores files outside a verified release", () => {

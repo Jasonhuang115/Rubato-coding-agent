@@ -4,6 +4,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import type { AgentConfig, ModelProvider, StreamRenderer, ToolDefinition } from "../src/shared/core-types.js";
+import { projectMemoryId } from "../src/memory-files/paths.js";
 
 const fakeProvider = vi.hoisted(() => ({
   name: "test",
@@ -36,7 +37,6 @@ vi.mock("../src/memory-files/runtime.js", () => ({
 vi.mock("../src/tools/git/hooks.js", () => ({
   sessionEndHook: vi.fn(async () => ({ advice: [] })),
   prePushHook: vi.fn(async () => null),
-  preCommitHook: vi.fn(async () => null),
 }));
 
 const renderer: StreamRenderer = {
@@ -61,8 +61,6 @@ const config: AgentConfig = {
     edit: "auto",
     web: "auto",
   },
-  embedding: { source: "local_hash" },
-  mnemosyne: { bootstrap_on_first_open: false, bootstrap_max_files: 100 },
   session: { cleanupPeriodDays: 30 },
 };
 
@@ -95,7 +93,7 @@ describe("agentLoop lifecycle", () => {
 
     const updates: Array<{ id: string; updates: Record<string, unknown> }> = [];
     const sessionManager = {
-      getProjectHash: () => "test-project",
+      getProjectHash: () => "c".repeat(64),
       updateSession: (id: string, update: Record<string, unknown>) => {
         updates.push({ id, updates: update });
       },
@@ -156,7 +154,14 @@ describe("agentLoop lifecycle", () => {
     expect(events).toContainEqual({ type: "text", text: "A complete answer" });
     expect(learnFromStoredSessionRecords).toHaveBeenCalled();
     const records = fs.readFileSync(
-      path.join(homeDir, ".rubato", "sessions", "answered-session.jsonl"),
+      path.join(
+        homeDir,
+        ".rubato",
+        "projects",
+        projectMemoryId(homeDir),
+        "sessions",
+        "answered-session.jsonl",
+      ),
       "utf8",
     ).trim().split("\n").map((line) => JSON.parse(line));
     expect(records).toContainEqual(expect.objectContaining({

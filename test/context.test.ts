@@ -1,7 +1,7 @@
 // Context system tests
 import { describe, it, expect } from "vitest";
 import { ContextChain } from "../src/context/sources.js";
-import { microCompact, snipContent, snipLines } from "../src/context/compression.js";
+import { microCompact } from "../src/context/compression.js";
 import { microCompactBeforeRequest } from "../src/context/micro-compact.js";
 import type { ContextSource, ContextBlock, AgentContext } from "../src/shared/core-types.js";
 
@@ -26,8 +26,6 @@ function mockCtx(): AgentContext {
         edit: "auto",
         web: "auto",
       },
-      embedding: { source: "local_hash" },
-      mnemosyne: { bootstrap_on_first_open: false, bootstrap_max_files: 100 },
       session: { cleanupPeriodDays: 30 },
     },
     depth: 0,
@@ -178,31 +176,5 @@ describe("MicroCompact", () => {
 
     // Running the compactor again without new results is a no-op.
     expect(microCompactBeforeRequest(compacted.messages).cleared).toBe(0);
-  });
-});
-
-describe("Snip", () => {
-  it("truncates long content", () => {
-    const longContent = "x".repeat(100_000);
-    const snipped = snipContent(longContent, 1000);
-
-    expect(snipped.length).toBeLessThan(longContent.length);
-    expect(snipped).toContain("truncated");
-  });
-
-  it("keeps short content intact", () => {
-    const short = "hello world";
-    const snipped = snipContent(short, 1000);
-    expect(snipped).toBe(short);
-  });
-
-  it("truncates lines", () => {
-    const lines = Array.from({ length: 100 }, (_, i) => `line ${i}`);
-    const result = snipLines(lines, 20);
-
-    expect(result).toContain("truncated");
-    // Should contain some lines from the head and tail
-    expect(result).toContain("line 0");
-    expect(result).toContain("line 99");
   });
 });

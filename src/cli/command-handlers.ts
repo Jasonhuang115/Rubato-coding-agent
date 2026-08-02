@@ -7,8 +7,7 @@ import { getGitState } from "../tools/git/advisor.js";
 import { getBranchHealth } from "../tools/git/branch-health.js";
 import { getSkillRegistry } from "../skills/registry.js";
 import { spawnSubagent } from "../agent/subagent.js";
-import { PolicyEngine } from "../permissions/policy.js";
-import { PlanManager } from "../agent/planner/manager.js";
+import { PolicyEngine } from "../security/policy/engine.js";
 import { SessionManager } from "../runtime/session/manager.js";
 import { processSubagentRegistry } from "../agent/subagents/registry.js";
 import { scrubPersistedData } from "../security/scrub.js";
@@ -84,14 +83,6 @@ export async function handleJournalCommand(
   // `recent` was advertised by tab completion but never handled. The file-memory
   // list is already ordered, so this is the honest equivalent of the old alias.
   await handleFileMemoryCommand("/memory list", workdir, config);
-}
-
-export async function handleMemoryCommand(
-  input: string,
-  workdir = process.cwd(),
-  config?: AgentConfig,
-): Promise<void> {
-  await handleFileMemoryCommand(input, workdir, config);
 }
 
 export function saveModelPreference(provider: string, model: string): void {
@@ -348,6 +339,7 @@ export async function handleSkillCommand(input: string, workdir: string, config:
     readGuard: { hasRead: () => false, markAsRead: () => {}, serialize: () => ({ files: {} }) },
     permissionManager: new PolicyEngine(permissions),
     config: { ...config, permissions },
+    mode: "default",
     depth: 0,
   };
   try {
@@ -359,41 +351,4 @@ export async function handleSkillCommand(input: string, workdir: string, config:
     console.warn(`\n  ✖ Skill "${skill.name}" failed: ${error instanceof Error ? error.message : String(error)}`);
   }
   return null;
-}
-
-export function handlePlanCommand(input: string, pm: PlanManager): void {
-  const args = input.split(/\s+/).slice(1);
-  if (args.length === 0 || args[0] === "show") { console.log("\n" + pm.showPlan()); return; }
-  if (args[0] === "list") {
-    const plans = pm.listPlans();
-    console.log(plans.length ? `\n  已保存的计划：\n${plans.map((plan) => `    - ${plan}`).join("\n")}` : "\n  没有保存的计划。");
-    return;
-  }
-  if (args[0] === "new") {
-    const desc = args.slice(1).join(" ");
-    if (!desc) { console.log("\n  用法：/plan new <任务描述>"); return; }
-    pm.startRequirementsGathering(desc);
-    console.log(`\n  🔍 需求澄清模式：对「${desc}」开始收集信息。`);
-    return;
-  }
-  if (args[0] === "done") {
-    const plan = pm.getActivePlan();
-    if (!plan) { console.log("\n  没有活跃计划。"); return; }
-    plan.status = "done";
-    pm.savePlan();
-    console.log(`\n  ✅ 计划「${plan.title}」已标记为完成。`);
-    return;
-  }
-  console.log("\n  未知的 plan 子命令。试试 /plan、/plan new、/plan list、/plan done");
-}
-
-export function handleGrillMeCommand(input: string, pm: PlanManager): void {
-  const arg = input.split(/\s+/)[1];
-  if (!arg || arg === "status") {
-    const config = pm.getGrillMeConfig();
-    console.log(`\n  Grill Me: ${config.enabled ? "🟢 ON" : "🔴 OFF"} | 灵敏度: ${config.sensitivity}`);
-  } else if (arg === "on") { pm.setGrillMeSensitivity("normal"); console.log("\n  🟢 Grill Me 已开启（灵敏度：normal）");
-  } else if (arg === "off") { pm.toggleGrillMe(); console.log("\n  🔴 Grill Me 已关闭");
-  } else if (["strict", "normal", "loose"].includes(arg)) { pm.setGrillMeSensitivity(arg as "strict" | "normal" | "loose"); console.log(`\n  Grill Me 灵敏度已设为：${arg}`);
-  } else console.log("\n  用法：/grillme on|off|strict|normal|loose|status");
 }

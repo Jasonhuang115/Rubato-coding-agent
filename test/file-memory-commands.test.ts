@@ -217,9 +217,8 @@ describe("file-memory CLI commands", () => {
     await handleFileMemoryCommand("/memory list", project);
     const text = joinedOutput();
 
-    expect(text).toContain("文件记忆统计（无向量库 / 无 RAG）");
+    expect(text).toContain("文件记忆统计");
     expect(text).toContain("verified cards：2");
-    expect(text).toContain("npm run migrate:legacy");
     expect(text).toContain("workflow.testing");
     expect(text).toContain("Test workflow");
     expect(text).toContain("project-v1");
@@ -405,14 +404,11 @@ describe("file-memory CLI commands", () => {
     expect(joinedOutput()).toContain("不可回滚 purge ledger");
   });
 
-  it("routes legacy migration to the offline script and reports mutation usage errors", async () => {
-    await handleFileMemoryCommand("/memory legacy migrate", project);
+  it("reports mutation usage errors", async () => {
     await handleFileMemoryCommand("/memory correct", project);
     await handleProfileCommand("/profile retire", project);
     const text = joinedOutput();
 
-    expect(text).toContain("npm run migrate:legacy");
-    expect(text).toContain("只产出待复核 candidate");
     expect(text).toContain("请使用 /profile correct");
     expect(text).toContain("请使用 /memory retire");
   });

@@ -10,12 +10,14 @@ import {
 } from "../src/runtime/session/storage.js";
 import { SessionManager } from "../src/runtime/session/manager.js";
 import {
-  purgeMemories,
+  purgeMemoriesWithinLock,
   readCurrentReleaseId,
+  withMemoryScopeLock,
 } from "../src/memory-files/release.js";
 import { resolveMemoryScopePaths } from "../src/memory-files/paths.js";
 
 describe("hash-chained session storage", () => {
+  const projectId = "a".repeat(64);
   let tempDir: string;
   let previousRubatoHome: string | undefined;
 
@@ -33,7 +35,7 @@ describe("hash-chained session storage", () => {
   });
 
   it("adds chain metadata and seals the session with session_closed", () => {
-    const store = new SessionStore("session-1", "project-1");
+    const store = new SessionStore("session-1", projectId);
     store.init();
     store.writeMessage({ role: "user", content: "hello" });
     store.writeToolEvent({ tool: "Read", result: "ok" });
@@ -65,7 +67,7 @@ describe("hash-chained session storage", () => {
   });
 
   it("detects a modified record", () => {
-    const store = new SessionStore("session-2", "project-1");
+    const store = new SessionStore("session-2", projectId);
     store.init();
     store.writeMessage({ role: "user", content: "original" });
     store.close();
@@ -84,24 +86,24 @@ describe("hash-chained session storage", () => {
   });
 
   it("continues an open valid chain but refuses a closed chain", () => {
-    const first = new SessionStore("session-3", "project-1");
+    const first = new SessionStore("session-3", projectId);
     first.init();
     first.writeMessage({ role: "user", content: "first" });
 
-    const resumed = new SessionStore("session-3", "project-1");
+    const resumed = new SessionStore("session-3", projectId);
     resumed.init();
     resumed.writeMessage({ role: "assistant", content: "second" });
     resumed.close();
 
     const records = loadSession("session-3", path.dirname(resumed.getFilePath()));
     expect(records.map((record) => record.seq)).toEqual([0, 1, 2]);
-    expect(() => new SessionStore("session-3", "project-1").init()).toThrow(
+    expect(() => new SessionStore("session-3", projectId).init()).toThrow(
       "Cannot append to closed session",
     );
   });
 
   it("does not recreate a live session after a privacy tombstone", () => {
-    const projectId = "project-privacy";
+    const projectId = "b".repeat(64);
     const sessionId = "session-purged-live";
     const store = new SessionStore(sessionId, projectId);
     store.init();
@@ -114,10 +116,10 @@ describe("hash-chained session storage", () => {
       scope: "project",
       projectId,
     });
-    purgeMemories(paths, {
-      baseReleaseId: readCurrentReleaseId(paths),
-      sessionIds: [sessionId],
-    });
+    withMemoryScopeLock(paths, () => purgeMemoriesWithinLock(paths, {
+        baseReleaseId: readCurrentReleaseId(paths),
+        sessionIds: [sessionId],
+      }));
     fs.unlinkSync(sessionPath);
 
     store.writeMessage({ role: "assistant", content: "late write" });
@@ -127,7 +129,7 @@ describe("hash-chained session storage", () => {
   });
 });
 
-describe("SessionManager project IDs and legacy compatibility", () => {
+describe("SessionManager canonical project IDs", () => {
   let tempDir: string;
   let previousRubatoHome: string | undefined;
 
@@ -172,7 +174,7 @@ describe("SessionManager project IDs and legacy compatibility", () => {
     expect(created.firstMessage).toBe("hello");
   });
 
-  it("discovers and reads sessions from the legacy slug directory", () => {
+  it("ignores a legacy slug directory", () => {
     const workspace = path.join(tempDir, "legacy workspace");
     const legacyId = legacyProjectId(workspace);
     const legacyBase = path.join(process.env.RUBATO_HOME!, "projects", legacyId);
@@ -205,18 +207,14 @@ describe("SessionManager project IDs and legacy compatibility", () => {
     );
 
     const manager = new SessionManager(workspace);
-    expect(manager.listSessions().map((record) => record.id)).toContain("legacy-session");
-    expect(manager.getSessionPath("legacy-session")).toBe(
+    expect(manager.listSessions()).toEqual([]);
+    expect(manager.getSessionPath("legacy-session")).not.toBe(
       path.join(legacySessions, "legacy-session.jsonl"),
     );
-    expect(manager.loadSessionHistory("legacy-session")).toContain("from the old directory");
-
-    manager.deleteSession("legacy-session");
-    expect(fs.existsSync(path.join(legacySessions, "legacy-session.jsonl"))).toBe(false);
-    expect(new SessionManager(workspace).getSession("legacy-session")).toBeUndefined();
+    expect(fs.existsSync(path.join(legacySessions, "legacy-session.jsonl"))).toBe(true);
   });
 
-  it("discovers the former truncated SHA-256 project directory", () => {
+  it("ignores a former truncated SHA-256 project directory", () => {
     const workspace = path.join(tempDir, "truncated workspace");
     const legacyId = createHash("sha256")
       .update(path.resolve(workspace))
@@ -241,8 +239,7 @@ describe("SessionManager project IDs and legacy compatibility", () => {
 
     const manager = new SessionManager(workspace);
     expect(manager.getProjectHash()).toHaveLength(64);
-    expect(manager.listSessions().map((record) => record.id))
-      .toContain("truncated-session");
+    expect(manager.listSessions()).toEqual([]);
   });
 });
 

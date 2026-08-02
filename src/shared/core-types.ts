@@ -52,7 +52,7 @@ export interface ToolResult {
   content: string;
   isError?: boolean;
   /** Runtime-only control signal. It is never serialized as a normal tool result. */
-  control?: TaskCompletionControl;
+  control?: AgentControl;
 }
 
 // ---- Agent context (passed to every tool) ----
@@ -63,7 +63,7 @@ export interface AgentContext {
   readGuard: ReadGuardState;
   permissionManager: PermissionManager;
   config: AgentConfig;
-  planManager?: PlanManager;
+  mode: AgentMode;
   /** Recursion depth. 0 = root agent. */
   depth: number;
   /** Present only while a managed subagent task is running. */
@@ -87,12 +87,8 @@ export interface AgentContext {
   };
 }
 
-export interface PlanManager {
-  getActivePlan(): { title: string; status: string; goal: string } | null;
-  getPlanSummary(): string;
-  onUserMessage(message: string): string | null;
-  onToolCall(toolName: string, input: Record<string, unknown>): string | null;
-}
+export type AgentMode = "default" | "plan";
+export type PlanPhase = "planning" | "awaiting_approval";
 
 export interface ReadGuardState {
   hasRead(filePath: string): boolean;
@@ -258,7 +254,6 @@ export interface SessionMeta {
   totalTokens: number;
   duration: number;
   branch: string;
-  fileHistory: string[];
   summary?: string;
   firstMessage?: string;
   messageCount?: number;
@@ -269,22 +264,6 @@ export interface SessionRecord {
   type: "session_meta" | "message" | "tool_event" | "compaction";
   timestamp: number;
   data: unknown;
-}
-
-// ---- Session Index ----
-
-export type SessionStatus = "active" | "ended";
-
-export interface SessionIndexEntry {
-  id: string;
-  createdAt: number;
-  lastActiveAt: number;
-  firstMessage: string;
-  model: string;
-  tokenCount: number;
-  messageCount: number;
-  status: SessionStatus;
-  summary?: string;
 }
 
 // ---- Subagent ----
@@ -338,6 +317,8 @@ export interface AgentTaskInput {
   timeout_ms?: number;
   isolation?: "worktree";
   scope?: string[];
+  /** Inherited runtime mode; used to keep nested Plan exploration read-only. */
+  mode?: AgentMode;
   /**
    * `exhaustive` enables a runtime-enforced file/line coverage gate.
    * `auto` (the default) also enables it when the task wording promises
@@ -411,6 +392,15 @@ export interface TaskCompletionControl {
   type: "task_completion";
   completion: CompleteTaskInput;
 }
+
+export interface PlanReadyControl {
+  type: "plan_ready";
+  title: string;
+  markdown: string;
+  path: string;
+}
+
+export type AgentControl = TaskCompletionControl | PlanReadyControl;
 
 export interface SubagentRuntimeContext {
   rootSessionId: string;

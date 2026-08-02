@@ -4,12 +4,6 @@ import type { Message } from "../shared/core-types.js";
 
 // ---- MicroCompact: condense individual messages ----
 
-export interface CompactSummary {
-  type: "summary";
-  originalCount: number;
-  summary: string;
-}
-
 /**
  * MicroCompact replaces old message blocks with short summaries.
  * Ensures tool_use/tool_result pairs stay together to avoid API 400 errors.
@@ -133,57 +127,6 @@ function summarizeMessages(messages: Message[]): Message {
   parts.push(`\n[End of compressed context — continue from here]`);
 
   return { role: "user", content: parts.join("\n") };
-}
-
-// ---- Snip: truncate large content blocks ----
-
-export interface SnipOptions {
-  maxToolResultLength: number;
-  maxLinesPerRead: number;
-}
-
-export const DEFAULT_SNIP_OPTIONS: SnipOptions = {
-  maxToolResultLength: 50_000,
-  maxLinesPerRead: 2_000,
-};
-
-/**
- * Snip truncates large tool results to prevent context overflow.
- * Keeps the head and tail of the content with a truncation marker.
- */
-export function snipContent(
-  content: string,
-  maxLength: number = DEFAULT_SNIP_OPTIONS.maxToolResultLength
-): string {
-  if (content.length <= maxLength) return content;
-
-  const headSize = Math.floor(maxLength * 0.6);
-  const tailSize = Math.floor(maxLength * 0.3);
-
-  const head = content.substring(0, headSize);
-  const tail = content.substring(content.length - tailSize);
-  const skipped = content.length - headSize - tailSize;
-
-  return `${head}\n\n[${skipped.toLocaleString()} bytes truncated...]\n\n${tail}`;
-}
-
-/**
- * Snip lines from Read tool output to keep context manageable.
- */
-export function snipLines(
-  lines: string[],
-  maxLines: number = DEFAULT_SNIP_OPTIONS.maxLinesPerRead
-): string {
-  if (lines.length <= maxLines) return lines.join("\n");
-
-  const headLines = Math.floor(maxLines * 0.6);
-  const tailLines = Math.floor(maxLines * 0.3);
-  const skipped = lines.length - headLines - tailLines;
-
-  const head = lines.slice(0, headLines).join("\n");
-  const tail = lines.slice(-tailLines).join("\n");
-
-  return `${head}\n\n... [${skipped} lines truncated] ...\n\n${tail}`;
 }
 
 // ============================================================

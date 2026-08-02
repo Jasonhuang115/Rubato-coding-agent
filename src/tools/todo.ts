@@ -2,9 +2,6 @@
 
 import type { ToolDefinition } from "../shared/core-types.js";
 
-// In-memory todo store (per session)
-const todos = new Map<string, TodoItem[]>();
-
 interface TodoItem {
   content: string;
   status: "pending" | "in_progress" | "completed";
@@ -43,9 +40,8 @@ export const todoWriteTool: ToolDefinition = {
   type: "write",
   requiresApproval: false,
   isConcurrencySafe: false,
-  async handler(input, ctx) {
+  async handler(input) {
     const items = input.todos as TodoItem[];
-    const sessionId = ctx.sessionId;
 
     // Validate
     const inProgressCount = items.filter(
@@ -59,8 +55,6 @@ export const todoWriteTool: ToolDefinition = {
         isError: false,
       };
     }
-
-    todos.set(sessionId, items);
 
     const counts = {
       pending: items.filter((t) => t.status === "pending").length,
@@ -85,11 +79,3 @@ export const todoWriteTool: ToolDefinition = {
     };
   },
 };
-
-export function getTodos(sessionId: string): TodoItem[] {
-  return todos.get(sessionId) ?? [];
-}
-
-export function clearTodos(sessionId: string): void {
-  todos.delete(sessionId);
-}

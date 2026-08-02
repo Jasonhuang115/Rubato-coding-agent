@@ -110,7 +110,6 @@ export interface SlashCommandDescriptor {
 export interface SlashCommandContext {
   workingDir: string;
   config: unknown;
-  planManager: unknown;
   /** Spawn a subagent for fork-mode skill invocation */
   spawnSkillAgent: (skill: SkillDefinition, task: string) => Promise<string>;
 }

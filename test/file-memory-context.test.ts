@@ -79,7 +79,7 @@ describe("verified file-memory context", () => {
       content.indexOf("PROJECT PROFILE"),
     );
     expect(content).toMatch(/current request[\s\S]*always take precedence/i);
-    expect(content).toContain("No top-k or RAG retrieval was performed");
+    expect(content).toContain("Only the bounded verified profiles are preloaded");
     expect(content).toContain(`Global catalog: \`${global.catalogPath}\``);
     expect(content).toContain(`Global cards: \`${global.cardsDir}\``);
     expect(content).toContain(`Project catalog: \`${project.catalogPath}\``);

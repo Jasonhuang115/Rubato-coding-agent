@@ -11,10 +11,8 @@ import {
   verifyRelease,
 } from "../../memory-files/release.js";
 import type { MemoryScopePaths } from "../../memory-files/types.js";
-import {
-  legacyTruncatedProjectMemoryId,
-  projectMemoryId,
-} from "../../memory-files/paths.js";
+import { projectMemoryId } from "../../memory-files/paths.js";
+import { getRubatoHome } from "../../shared/rubato-home.js";
 
 const TOOL_RESULT_PATTERN = /^[A-Za-z0-9_-]+\.txt$/;
 const NATIVE_READ_TOOLS = new Set(["Read", "Grep", "Glob"]);
@@ -123,10 +121,6 @@ export class FsSandbox implements ISandbox {
   }
 }
 
-function getRubatoHome(): string {
-  return path.resolve(process.env.RUBATO_HOME ?? path.join(os.homedir(), ".rubato"));
-}
-
 function resolveRubatoArtifactRead(
   resolved: string,
   workingDir: string,
@@ -178,11 +172,7 @@ function resolveAllowedRubatoRead(
   workingDir: string,
   rubatoHome: string,
 ): string | undefined {
-  const projectIds = [
-    projectId(workingDir),
-    legacyTruncatedProjectMemoryId(workingDir),
-    legacyProjectId(workingDir),
-  ];
+  const projectIds = [projectId(workingDir)];
 
   for (const id of new Set(projectIds)) {
     const projectBase = path.join(rubatoHome, "projects", id);
@@ -368,12 +358,4 @@ function isDirectChild(candidate: string, parent: string): boolean {
 
 function projectId(workingDir: string): string {
   return projectMemoryId(workingDir);
-}
-
-function legacyProjectId(workingDir: string): string {
-  return path.resolve(workingDir)
-    .replace(/[^a-zA-Z0-9]/g, "-")
-    .replace(/-+/g, "-")
-    .replace(/^-|-$/g, "")
-    .slice(0, 64) || "root";
 }

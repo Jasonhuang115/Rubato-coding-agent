@@ -175,13 +175,6 @@ export async function bootstrapProjectMemory(
   return result;
 }
 
-/** Repository-authored cards from the current release, keyed by logical key. */
-export function currentRepositoryCards(
-  paths: MemoryScopePaths,
-): Map<string, MemoryCard> {
-  return safeCurrentRepositoryCards(paths);
-}
-
 export function isRepositoryCard(card: MemoryCard): boolean {
   return card.authority === REPOSITORY_AUTHORITY;
 }

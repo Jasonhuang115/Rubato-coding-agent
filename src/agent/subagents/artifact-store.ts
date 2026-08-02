@@ -1,5 +1,4 @@
 import fs from "fs";
-import os from "os";
 import path from "path";
 import { createHash, randomUUID } from "crypto";
 import type {
@@ -11,10 +10,8 @@ import type {
 import { redactText, redactValue } from "./redaction.js";
 import { coverageSummary, emptyCoverageManifest } from "./coverage.js";
 import { WorktreeManager } from "../worktrees/worktree-manager.js";
-import {
-  legacyTruncatedProjectMemoryId,
-  projectMemoryId,
-} from "../../memory-files/paths.js";
+import { projectMemoryId } from "../../memory-files/paths.js";
+import { getRubatoHome } from "../../shared/rubato-home.js";
 
 export class ArtifactStore {
   readonly projectDir: string;
@@ -24,7 +21,7 @@ export class ArtifactStore {
   constructor(
     projectDir: string,
     rootSessionId: string,
-    rubatoHome = process.env.RUBATO_HOME ?? path.join(os.homedir(), ".rubato"),
+    rubatoHome = getRubatoHome(),
     projectHash = projectMemoryId(projectDir),
   ) {
     this.projectDir = path.join(
@@ -39,25 +36,21 @@ export class ArtifactStore {
 
   static recoverProjectOrphans(
     projectDir: string,
-    rubatoHome = process.env.RUBATO_HOME ?? path.join(os.homedir(), ".rubato"),
+    rubatoHome = getRubatoHome(),
   ): TaskResult[] {
+    const projectHash = projectMemoryId(projectDir);
+    const runsDir = path.join(rubatoHome, "projects", projectHash, "runs");
+    if (!fs.existsSync(runsDir)) return [];
     const recovered: TaskResult[] = [];
-    for (const projectHash of new Set([
-      projectMemoryId(projectDir),
-      legacyTruncatedProjectMemoryId(projectDir),
-    ])) {
-      const runsDir = path.join(rubatoHome, "projects", projectHash, "runs");
-      if (!fs.existsSync(runsDir)) continue;
-      for (const entry of fs.readdirSync(runsDir, { withFileTypes: true })) {
-        if (!entry.isDirectory()) continue;
-        const store = new ArtifactStore(
-          projectDir,
-          entry.name,
-          rubatoHome,
-          projectHash,
-        );
-        recovered.push(...store.recoverOrphaned());
-      }
+    for (const entry of fs.readdirSync(runsDir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const store = new ArtifactStore(
+        projectDir,
+        entry.name,
+        rubatoHome,
+        projectHash,
+      );
+      recovered.push(...store.recoverOrphaned());
     }
     return recovered;
   }

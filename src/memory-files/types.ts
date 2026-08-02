@@ -50,7 +50,7 @@ export interface MemoryEvidence {
   sessionId: string;
   eventSeq: number;
   eventHash: string;
-  actor: "user" | "tool" | "repository" | "assistant" | "migration";
+  actor: "user" | "tool" | "repository" | "assistant";
   signal: string;
   excerpt?: string;
 }

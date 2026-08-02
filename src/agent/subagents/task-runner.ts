@@ -9,6 +9,7 @@ import type {
   ToolDefinition,
 } from "../../shared/core-types.js";
 import { agentLoop } from "../loop.js";
+import { AgentModeController } from "../mode.js";
 import { TraceSink } from "./trace-sink.js";
 import {
   makesExhaustiveClaim,
@@ -35,6 +36,7 @@ export interface TaskRunnerInput {
   ) => Promise<import("../../shared/core-types.js").ConfirmDecision>;
   trace: TraceSink;
   onActivity: (activity: string, toolName?: string) => void;
+  mode?: "default" | "plan";
 }
 
 export interface TaskRunnerOutput {
@@ -94,6 +96,8 @@ export class TaskRunner {
     });
 
     try {
+      const modeController = new AgentModeController();
+      if (input.mode === "plan") modeController.enablePlan();
       for await (const event of agentLoop({
         config: input.config,
         workingDir: input.workingDir,
@@ -109,6 +113,7 @@ export class TaskRunner {
         abortSignal: input.abortSignal,
         onConfirmTool: input.onConfirmTool,
         taskRuntime: runtimeContext,
+        modeController,
       })) {
         switch (event.type) {
           case "turn_start":

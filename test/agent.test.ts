@@ -2,7 +2,7 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { ReadGuard } from "../src/agent/read-guard.js";
 import { ContextChain } from "../src/context/sources.js";
-import { PolicyEngine } from "../src/permissions/policy.js";
+import { PolicyEngine } from "../src/security/policy/engine.js";
 import { register, clear } from "../src/tools/registry.js";
 import type { AgentConfig, AgentContext, ContextBlock, ContextSource } from "../src/shared/core-types.js";
 
@@ -28,8 +28,6 @@ function mockCtx(overrides?: Partial<AgentContext>): AgentContext {
         edit: "auto",
         web: "auto",
       },
-      embedding: { source: "local_hash" },
-      mnemosyne: { bootstrap_on_first_open: false, bootstrap_max_files: 100 },
       session: { cleanupPeriodDays: 30 },
     },
     depth: 0,
@@ -178,16 +176,4 @@ describe("Session meta", () => {
     expect(meta.timestamp).toBeGreaterThan(0);
   });
 
-  it("records file access history", async () => {
-    const { createSessionMeta, recordFileAccess } = await import("../src/runtime/session/meta.js");
-
-    const meta = createSessionMeta("s1", "test-model");
-    recordFileAccess(meta, "/tmp/a.ts");
-    recordFileAccess(meta, "/tmp/b.ts");
-    recordFileAccess(meta, "/tmp/a.ts"); // duplicate
-
-    expect(meta.fileHistory).toHaveLength(2); // no duplicates
-    expect(meta.fileHistory).toContain("/tmp/a.ts");
-    expect(meta.fileHistory).toContain("/tmp/b.ts");
-  });
 });

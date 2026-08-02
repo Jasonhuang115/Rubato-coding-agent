@@ -15,7 +15,6 @@ import {
   loadSession,
   verifySession,
 } from "../runtime/session/storage.js";
-import { SessionManager } from "../runtime/session/manager.js";
 import {
   failDream,
   leaseNextDream,
@@ -196,7 +195,6 @@ export async function runNextDream(
     const input = loadVerifiedDreamInput(
       running,
       repository,
-      options.workingDir,
     );
 
     extractor = parseExtractorOutput(await requestStructuredStage(
@@ -363,7 +361,6 @@ export async function runNextDream(
 function loadVerifiedDreamInput(
   run: DreamRun,
   repository: FileMemoryRepository,
-  workingDir: string,
 ): VerifiedDreamInput {
   const allObservations = repository.listObservations(run.scope);
   const observationsById = new Map(
@@ -401,7 +398,6 @@ function loadVerifiedDreamInput(
     const session = loadVerifiedSessionEvents(
       sessionId,
       repository,
-      workingDir,
       run.scope,
     );
     for (const event of session.events) {
@@ -450,7 +446,6 @@ function loadVerifiedDreamInput(
 function loadVerifiedSessionEvents(
   sessionId: string,
   repository: FileMemoryRepository,
-  workingDir: string,
   scope: "global" | "project",
 ): { events: SourceEvent[]; projectId?: string } {
   if (!EVENT_ID_PATTERN.test(sessionId)) {
@@ -461,26 +456,11 @@ function loadVerifiedSessionEvents(
     ? findProjectSession(
         rootDir,
         repository.projectId,
-        [
-          SessionManager.resolveTruncatedProjectHash(workingDir),
-          SessionManager.resolveLegacyProjectHash(workingDir),
-        ],
         sessionId,
       )
     : findGlobalSession(
         rootDir,
         sessionId,
-        new Map([
-          [repository.projectId, repository.projectId],
-          [
-            SessionManager.resolveTruncatedProjectHash(workingDir),
-            repository.projectId,
-          ],
-          [
-            SessionManager.resolveLegacyProjectHash(workingDir),
-            repository.projectId,
-          ],
-        ]),
       );
   if (!location) throw new Error(`Dream session not found: ${sessionId}`);
 
@@ -516,14 +496,11 @@ interface SessionLocation {
 function findProjectSession(
   rootDir: string,
   projectId: string,
-  legacyProjectIds: string[],
   sessionId: string,
 ): SessionLocation | undefined {
-  for (const id of new Set([projectId, ...legacyProjectIds])) {
-    const sessionDir = path.join(rootDir, "projects", id, "sessions");
-    if (hasSafeSessionFile(rootDir, sessionDir, sessionId)) {
-      return { sessionDir, projectId };
-    }
+  const sessionDir = path.join(rootDir, "projects", projectId, "sessions");
+  if (hasSafeSessionFile(rootDir, sessionDir, sessionId)) {
+    return { sessionDir, projectId };
   }
   return undefined;
 }
@@ -531,7 +508,6 @@ function findProjectSession(
 function findGlobalSession(
   rootDir: string,
   sessionId: string,
-  knownProjectAliases: Map<string, string>,
 ): SessionLocation | undefined {
   const projectsDir = path.join(rootDir, "projects");
   const matches: SessionLocation[] = [];
@@ -543,7 +519,7 @@ function findGlobalSession(
     for (const project of projects) {
       if (
         !project.isDirectory() ||
-        !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(project.name)
+        !/^[a-f0-9]{64}$/.test(project.name)
       ) {
         continue;
       }
@@ -551,16 +527,10 @@ function findGlobalSession(
       if (hasSafeSessionFile(rootDir, sessionDir, sessionId)) {
         matches.push({
           sessionDir,
-          projectId: knownProjectAliases.get(project.name) ?? project.name,
+          projectId: project.name,
         });
       }
     }
-  }
-  const flatSessionDir = path.join(rootDir, "sessions");
-  if (hasSafeSessionFile(rootDir, flatSessionDir, sessionId)) {
-    // A legacy flat transcript has no trustworthy project ownership. It can
-    // be evidence, but cannot satisfy the cross-project promotion threshold.
-    matches.push({ sessionDir: flatSessionDir });
   }
   if (matches.length > 1) {
     throw new Error(`Dream session ID is ambiguous across projects: ${sessionId}`);

@@ -12,8 +12,6 @@ import {
   handleModelCommand,
   handleSessionsCommand,
   handleSkillCommand,
-  handlePlanCommand,
-  handleGrillMeCommand,
   handleTasksCommand,
   handleTraceCommand,
   handleScrubCommand,
@@ -37,13 +35,14 @@ import { grepTool } from "../tools/grep.js";
 import { globTool } from "../tools/glob.js";
 import { webFetchTool, webSearchTool } from "../tools/web.js";
 import { todoWriteTool } from "../tools/todo.js";
-import { planTool } from "../tools/plan.js";
+import { submitPlanTool } from "../tools/submit-plan.js";
 import { agentTool } from "../tools/agent.js";
 import { skillTool } from "../tools/skill.js";
 import { taskTool } from "../tools/task.js";
 import { memoryFeedbackTool } from "../tools/memory-feedback.js";
 import { memoryProposeTool } from "../tools/memory-propose.js";
-import { PlanManager } from "../agent/planner/manager.js";
+import { AgentModeController } from "../agent/mode.js";
+import { handlePlanModeCommand } from "./plan-mode-command.js";
 import { initCustomDefinitions } from "../agent/agent-defs.js";
 import { McpClient } from "../tools/mcp/client.js";
 import { readMultiLineInput } from "./multiline-input.js";
@@ -67,7 +66,7 @@ register(globTool);
 register(webFetchTool);
 register(webSearchTool);
 register(todoWriteTool);
-register(planTool);
+register(submitPlanTool);
 register(agentTool);
 register(taskTool);
 register(skillTool);
@@ -79,8 +78,7 @@ register(memoryProposeTool);
 function getSlashCompletions(): string[] {
   const builtin = [
     "/exit", "/quit", "/compact", "/clear", "/help", "/paste",
-    "/plan", "/plan new", "/plan list", "/plan done", "/plan show",
-    "/grillme", "/grillme on", "/grillme off", "/grillme strict", "/grillme normal", "/grillme loose",
+    "/plan", "/plan on", "/plan off", "/plan status",
     "/git", "/git health",
     "/journal", "/journal recent", "/journal search", "/journal stats",
     "/remember",
@@ -126,8 +124,7 @@ function showSlashMenu(): void {
   console.log("  /paste             Send the full text currently in the clipboard");
   console.log("  /clear              Start a fresh session");
   console.log("  /compact            Compact context");
-  console.log("  /plan               Show plan | /plan new <desc> | /plan done");
-  console.log("  /grillme            Toggle plan tracking | /grillme on/off/strict/normal/loose");
+  console.log("  /plan               Show Plan mode status | /plan on | /plan off");
   console.log("  /git                Git status | /git health");
   console.log("  /journal            Legacy alias for file-memory list/search");
   console.log("  /remember <text>    Send a traceable explicit memory statement");
@@ -163,13 +160,13 @@ interface LoopState {
 
 async function getFirstMessage(
   rl: readline.Interface,
-  planManager: PlanManager,
+  modeController: AgentModeController,
   workdir: string,
   config: AgentConfig,
 ): Promise<string> {
   // eslint-disable-next-line no-constant-condition
   while (true) {
-    const trimmed = await readMultiLineInput(rl, "\n▸ You: ");
+    const trimmed = await readMultiLineInput(rl, modeController.mode === "plan" ? "\n▸ Plan: " : "\n▸ You: ");
     if (!trimmed) return "/exit";
 
     // Handle slash commands locally, loop back for real message
@@ -185,8 +182,7 @@ async function getFirstMessage(
       }
     }
     if (trimmed === "/help") { showHelp(); continue; }
-    if (trimmed.startsWith("/plan")) { handlePlanCommand(trimmed, planManager); continue; }
-    if (trimmed.startsWith("/grillme")) { handleGrillMeCommand(trimmed, planManager); continue; }
+    if (trimmed.startsWith("/plan")) { handlePlanModeCommand(trimmed, modeController); continue; }
     if (trimmed.startsWith("/git")) { handleGitCommand(trimmed, workdir); continue; }
     if (trimmed.startsWith("/remember")) {
       const remembered = rememberCommandAsMessage(trimmed);
@@ -205,9 +201,7 @@ async function getFirstMessage(
 
 function showHelp(): void {
   console.log("\n  REPL Commands:");
-  console.log("  /plan               Show plan | /plan new <desc> | /plan done");
-  console.log("  /grillme on/off     Toggle Grill Me tracking");
-  console.log("  /grillme strict|normal|loose — Set sensitivity");
+  console.log("  /plan on|off|status Switch or inspect Plan mode");
   console.log("  /git                Show current git status");
   console.log("  /git health         Show branch health summary");
   console.log("  /journal search <q> Legacy alias for file-memory search");
@@ -234,7 +228,7 @@ function rememberCommandAsMessage(input: string): string | null {
 
 function createRepl(
   rl: readline.Interface,
-  planManager: PlanManager,
+  modeController: AgentModeController,
   workdir: string,
   config: AgentConfig,
   loopOptions: { forceCompaction?: boolean },
@@ -246,7 +240,7 @@ function createRepl(
   return async (signal?: AbortSignal) => {
     const promptAgain = () => createRepl(
       rl,
-      planManager,
+      modeController,
       workdir,
       config,
       loopOptions,
@@ -255,7 +249,8 @@ function createRepl(
       currentSessionId,
       onSessionFinalize,
     )(signal);
-    const trimmed = await readMultiLineInput(rl, "\n▸ You: ", signal);
+    const prompt = modeController.mode === "plan" ? "\n▸ Plan: " : "\n▸ You: ";
+    const trimmed = await readMultiLineInput(rl, prompt, signal);
     if (trimmed === null) return null;
     if (trimmed === "/") {
       showSlashMenu();
@@ -277,6 +272,7 @@ function createRepl(
           onSessionFinalize();
           loopState.shouldRestart = true;
           loopState.newSessionId = randomUUID();
+          modeController.clearPending();
           console.log("\n  ✨ Session saved. Starting fresh...");
           return null;
         } else if (trimmed === "/compact") {
@@ -307,11 +303,9 @@ function createRepl(
           console.log("  /paste            — Send the full clipboard as one prompt");
           console.log("  /clear             — Start a fresh session (saves current)");
           console.log("  /compact           — Summarize earlier context to free space");
-          console.log("  /plan             — Show current plan");
-          console.log("  /plan new <desc>  — Start a new plan (gathering mode)");
-          console.log("  /plan done        — Mark plan as completed");
-          console.log("  /grillme on/off   — Toggle Grill Me tracking");
-          console.log("  /grillme strict|normal|loose — Set sensitivity");
+          console.log("  /plan on          — Enter read-only Plan mode");
+          console.log("  /plan off         — Exit Plan mode without executing a plan");
+          console.log("  /plan status      — Show mode, phase, and latest plan path");
           console.log("  /git              — Show current git status");
           console.log("  /git health       — Show branch health summary");
           console.log("  /journal search <q> — Legacy file-memory search alias");
@@ -335,10 +329,7 @@ function createRepl(
           }
           return promptAgain();
         } else if (trimmed.startsWith("/plan")) {
-          handlePlanCommand(trimmed, planManager);
-          return promptAgain();
-        } else if (trimmed.startsWith("/grillme")) {
-          handleGrillMeCommand(trimmed, planManager);
+          handlePlanModeCommand(trimmed, modeController);
           return promptAgain();
         } else if (trimmed.startsWith("/git")) {
           handleGitCommand(trimmed, workdir);
@@ -368,6 +359,10 @@ function createRepl(
           handleScrubCommand(trimmed);
           return promptAgain();
         } else if (trimmed.startsWith("/") && getSkillRegistry().getSkill(trimmed.split(/\s+/)[0].slice(1))) {
+          if (modeController.mode === "plan") {
+            console.log("\n  Skills are unavailable in Plan mode. Use /plan off first.");
+            return promptAgain();
+          }
           const passthrough = await handleSkillCommand(trimmed, workdir, config);
           if (typeof passthrough === "string") {
             // Inline skill: pass through to the model
@@ -527,12 +522,7 @@ async function main(): Promise<void> {
   // Load skills from .rubato/skills/
   try { loadAllSkills(workdir); } catch (error) { warnRecoverable(`skills:${workdir}:load`, error); }
 
-  // Load and display active plan
-  const planManager = new PlanManager(workdir);
-  const planSummary = planManager.getPlanSummary();
-  if (planSummary) {
-    console.log(`\n${planSummary}`);
-  }
+  const modeController = new AgentModeController();
 
   // Repository facts and queued Dreams are refreshed in the background so the
   // first turn is never delayed by a project scan or a model-backed Dream.
@@ -553,7 +543,7 @@ async function main(): Promise<void> {
   }
 
   if (interactive) {
-    console.log(`Mode: interactive (type /exit to quit, /help for help)`);
+    console.log(`Mode: default (interactive; type /exit to quit, /help for help)`);
   }
 
   // ---- Handle --continue / --resume ----
@@ -636,7 +626,7 @@ async function main(): Promise<void> {
 
   // In interactive mode with no initial prompt, wait for the user's first real message
   if (interactive && !prompt && !continueSession && !resumeSession) {
-    effectivePrompt = await getFirstMessage(rl!, planManager, workdir, config);
+    effectivePrompt = await getFirstMessage(rl!, modeController, workdir, config);
     if (effectivePrompt === "/exit") {
       console.log("Exiting...");
       if (rl) rl.close();
@@ -734,10 +724,11 @@ async function main(): Promise<void> {
         sessionManager,
         resumeSummary,
         getNextUserMessage: rl
-          ? createRepl(rl, planManager, workdir, config, loopOptions, sessionManager, loopState, getSessionId, onSessionFinalize)
+          ? createRepl(rl, modeController, workdir, config, loopOptions, sessionManager, loopState, getSessionId, onSessionFinalize)
           : undefined,
         forceCompaction: loopOptions.forceCompaction,
         onConfirmTool: rl ? createConfirmPrompt(rl) : undefined,
+        modeController,
       })) {
         switch (event.type) {
           case "turn_start":
@@ -755,9 +746,11 @@ async function main(): Promise<void> {
             break;
 
           case "tool_result":
-            renderer.renderToolResult(
-              `${event.name}: ${event.isError ? "✖" : "✓"} ${event.result.substring(0, 200)}`
-            );
+            if (event.name !== "SubmitPlan") {
+              renderer.renderToolResult(
+                `${event.name}: ${event.isError ? "✖" : "✓"} ${event.result.substring(0, 200)}`
+              );
+            }
             break;
 
           case "error":
@@ -774,6 +767,12 @@ async function main(): Promise<void> {
 
           case "waiting_for_input":
             processing = false; // idle — Ctrl+C will exit
+            break;
+
+          case "plan_ready":
+            console.log(`\n${event.plan.markdown}`);
+            console.log(`\n  Saved: ${event.plan.path}`);
+            console.log("\n  执行这个计划？输入 y 执行，或直接说明需要修改的地方：");
             break;
 
           case "done":
@@ -803,7 +802,10 @@ async function main(): Promise<void> {
 
     // If restarting, wait for user input instead of auto-sending a prompt
     if (loopState.shouldRestart) {
-      effectivePrompt = await readMultiLineInput(rl!, "\n▸ You: ") || "/exit";
+      effectivePrompt = await readMultiLineInput(
+        rl!,
+        modeController.mode === "plan" ? "\n▸ Plan: " : "\n▸ You: ",
+      ) || "/exit";
       if (effectivePrompt === "/exit") {
         console.log("Exiting...");
         break;

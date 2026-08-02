@@ -37,17 +37,14 @@ describe("normal runtime has no legacy RAG/database dependency", () => {
     expect(graph.externalSpecifiers.has("better-sqlite3")).toBe(false);
   });
 
-  it("confines the optional SQLite driver to the explicit migration bridge", () => {
-    // Only loading the driver is forbidden. Naming the package as a string (for
-    // example when detecting a project's declared dependencies) is harmless, so
-    // this matches module specifiers rather than any mention of the name.
+  it("contains no SQLite driver or migration bridge", () => {
     const sqliteImports = allTypeScriptFiles(SRC_ROOT)
       .filter((filePath) =>
         /(?:from|import|require)\s*\(?\s*["']better-sqlite3["']/
           .test(fs.readFileSync(filePath, "utf8")))
       .map((filePath) => path.relative(PROJECT_ROOT, filePath))
       .sort();
-    expect(sqliteImports).toEqual(["src/memory-files/migration.ts"]);
+    expect(sqliteImports).toEqual([]);
 
     const packageJson = JSON.parse(
       fs.readFileSync(path.join(PROJECT_ROOT, "package.json"), "utf8"),
@@ -56,22 +53,9 @@ describe("normal runtime has no legacy RAG/database dependency", () => {
       optionalDependencies?: Record<string, string>;
     };
     expect(packageJson.dependencies?.["better-sqlite3"]).toBeUndefined();
-    expect(packageJson.optionalDependencies?.["better-sqlite3"]).toBeTruthy();
-
-    const migration = fs.readFileSync(
-      path.join(SRC_ROOT, "memory-files", "migration.ts"),
-      "utf8",
-    );
-    const functionOffset = migration.indexOf(
-      "export async function migrateLegacyMnemosyne",
-    );
-    const importOffset = migration.indexOf(
-      "await import(\"better-sqlite3\")",
-    );
-    expect(functionOffset).toBeGreaterThanOrEqual(0);
-    expect(importOffset).toBeGreaterThan(functionOffset);
-    expect(migration).toContain("readonly: true");
-    expect(migration).toContain("fileMustExist: true");
+    expect(packageJson.optionalDependencies?.["better-sqlite3"]).toBeUndefined();
+    expect(fs.existsSync(path.join(SRC_ROOT, "memory-files", "migration.ts")))
+      .toBe(false);
   });
 });
 

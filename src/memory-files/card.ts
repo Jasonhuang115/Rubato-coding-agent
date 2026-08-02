@@ -206,7 +206,7 @@ export function validateMemoryCard(card: MemoryCard): void {
     }
     if (card.evidence.some((item) => item.actor !== "user")) {
       throw new Error(
-        "Assistant, tool, repository, and migration events cannot support a user belief.",
+        "Assistant, tool, and repository events cannot support a user belief.",
       );
     }
   }
@@ -262,7 +262,7 @@ function validateEvidence(item: MemoryEvidence): void {
     throw new Error("Evidence eventSeq must be a non-negative integer.");
   }
   if (!item.eventHash.trim()) throw new Error("Evidence eventHash cannot be empty.");
-  if (!["user", "tool", "repository", "assistant", "migration"].includes(item.actor)) {
+  if (!["user", "tool", "repository", "assistant"].includes(item.actor)) {
     throw new Error(`Invalid evidence actor: ${item.actor}`);
   }
   if (!item.signal.trim()) throw new Error("Evidence signal cannot be empty.");

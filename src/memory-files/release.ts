@@ -175,19 +175,10 @@ export function rollbackMemoryRelease(
   });
 }
 
-export function purgeMemories(
-  paths: MemoryScopePaths,
-  input: PurgeMemoriesInput,
-): MemoryReleaseSnapshot {
-  return withMemoryScopeLock(paths, () =>
-    purgeMemoriesWithinLock(paths, input));
-}
-
 /**
  * Apply a purge while the caller already owns this scope's publication lock.
- * Normal callers should use purgeMemories(); this exists for the hard-purge
- * orchestrator so the fail-closed ledger, new release, and physical cleanup
- * share one lock.
+ * The hard-purge orchestrator keeps the fail-closed ledger, new release, and
+ * physical cleanup under the same lock.
  */
 export function purgeMemoriesWithinLock(
   paths: MemoryScopePaths,

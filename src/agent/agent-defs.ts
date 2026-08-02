@@ -118,5 +118,3 @@ export async function findDefinition(name: string): Promise<SubagentDefinition |
   try { const { getBuiltinDefinition } = await import("./subagent.js"); return getBuiltinDefinition(name); } catch { /* not built-in */ }
   return customDefs.find((d) => d.name === name) ?? null;
 }
-
-export function getCustomDefinitions(): SubagentDefinition[] { return [...customDefs]; }

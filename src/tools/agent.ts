@@ -48,10 +48,6 @@ export const agentTool: ToolDefinition = {
         description:
           "Use exhaustive when the assignment promises every-file/every-line inspection; runtime coverage must close before completed is accepted.",
       },
-      run_in_background: {
-        type: "boolean",
-        description: "Deprecated compatibility alias: true=advisory, false=required",
-      },
       isolation: {
         type: "string",
         enum: ["worktree"],
@@ -77,6 +73,21 @@ export const agentTool: ToolDefinition = {
     }
 
     const subagentType = String(rawInput.subagent_type ?? "general");
+    if (ctx.mode === "plan") {
+      const allowedTypes = new Set(["explore", "research", "general", "verify"]);
+      if (!allowedTypes.has(subagentType)) {
+        return {
+          content: `Plan mode allows only explore, research, general, or verify subagents; received "${subagentType}".`,
+          isError: true,
+        };
+      }
+      if (rawInput.isolation !== undefined || rawInput.scope !== undefined) {
+        return {
+          content: "Plan mode does not allow worktree isolation or write scopes.",
+          isError: true,
+        };
+      }
+    }
     let definition;
     try {
       definition = getBuiltinDefinition(subagentType);
@@ -91,12 +102,9 @@ export const agentTool: ToolDefinition = {
       }
     }
 
-    const requestedDependency = rawInput.dependency === "advisory" ||
-      rawInput.dependency === "required"
-      ? rawInput.dependency
-      : rawInput.run_in_background === true
-        ? "advisory"
-        : "required";
+    const requestedDependency = rawInput.dependency === "advisory"
+      ? "advisory"
+      : "required";
     const dependency = ctx.taskRuntime ? "required" : requestedDependency;
     const requestedIsolation = rawInput.isolation === "worktree"
       ? "worktree"
@@ -104,6 +112,9 @@ export const agentTool: ToolDefinition = {
     const isolation = requestedIsolation ?? definition.isolation;
     const requestsMutation = definition.tools.includes("*") ||
       definition.tools.some((name) => ["Write", "Edit", "Bash"].includes(name));
+    if (ctx.mode === "plan" && requestsMutation) {
+      return { content: "Plan mode blocked a subagent definition with mutation tools.", isError: true };
+    }
     if (requestsMutation && isolation !== "worktree") {
       return {
         content:
@@ -141,6 +152,7 @@ export const agentTool: ToolDefinition = {
       coverage: rawInput.coverage === "exhaustive" ? "exhaustive" : "auto",
       isolation,
       scope,
+      mode: ctx.mode,
     };
     const rootSessionId = ctx.taskRuntime?.rootSessionId ?? ctx.sessionId;
     const runtime = processSubagentRegistry.getOrCreate(rootSessionId, ctx.workingDir, ctx.config);

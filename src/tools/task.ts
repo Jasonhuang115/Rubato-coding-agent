@@ -25,6 +25,9 @@ export const taskTool: ToolDefinition = {
     }
     const runtime = processSubagentRegistry.get(ctx.sessionId);
     const action = String(input.action ?? "");
+    if (ctx.mode === "plan" && !new Set(["list", "get", "wait", "watch", "stats"]).has(action)) {
+      return { content: `Task action "${action}" is blocked in Plan mode.`, isError: true };
+    }
     if (!runtime) {
       return {
         content: action === "list" ? "[]" : "No subagent runtime exists for this session.",

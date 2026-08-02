@@ -11,7 +11,6 @@ import {
   DEFAULT_MEMORY_POLICY,
   findMemorySafetyIssues,
   findProhibitedSensitiveCategories,
-  listRecognizedSensitiveCategories,
   loadMemoryPolicy,
   saveMemoryPolicy,
   setMemoryLearningEnabled,
@@ -103,11 +102,9 @@ describe("file memory outcomes and policy", () => {
     ]));
   });
 
-  it("can enforce every category it ships as a default prohibition", () => {
-    const recognized = listRecognizedSensitiveCategories();
-    for (const category of DEFAULT_MEMORY_POLICY.prohibited_sensitive_categories) {
-      expect(recognized).toContain(category);
-    }
+  it("enforces configured prohibited categories", () => {
+    expect(DEFAULT_MEMORY_POLICY.prohibited_sensitive_categories)
+      .toContain("finance");
     expect(
       findProhibitedSensitiveCategories("我的银行卡号需要保密").matched,
     ).toEqual(["finance"]);

@@ -18,15 +18,7 @@ const CONFIG_FILE_NAMES = [
 
 const ENV_FILE_NAMES = [".env", ".env.local"];
 
-/**
- * Old configuration files may still contain these keys. They are accepted
- * only so the loader can emit a migration warning; neither key is part of the
- * runtime AgentConfig or forwarded to the agent.
- */
-type ConfigFileInput = Partial<AgentConfig> & {
-  embedding?: unknown;
-  mnemosyne?: unknown;
-};
+type ConfigFileInput = Partial<AgentConfig>;
 
 /**
  * Load .env files from working directory and home directory.
@@ -128,15 +120,6 @@ export function loadConfig(workingDir: string): AgentConfig {
     } catch (error) {
       warnRecoverable(`config:${homeConfigPath}:load`, error);
     }
-  }
-
-  // Build final config with defaults. Legacy embedding/Mnemosyne settings are
-  // deliberately ignored: the normal runtime is file-backed and has no RAG.
-  if (fileConfig.embedding || fileConfig.mnemosyne) {
-    console.warn(
-      "Warning: embedding/mnemosyne settings are deprecated and ignored; " +
-      "Rubato now uses file-backed memory with grep/Read recall.",
-    );
   }
 
   const config: AgentConfig = {

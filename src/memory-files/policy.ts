@@ -2,7 +2,7 @@ import { randomUUID } from "crypto";
 import fs from "fs";
 import path from "path";
 import YAML from "yaml";
-import { getRubatoHome } from "./outcome.js";
+import { getRubatoHome } from "../shared/rubato-home.js";
 
 export interface MemoryPolicy {
   schema: "rubato.memory.policy/v1";
@@ -103,10 +103,6 @@ export function findProhibitedSensitiveCategories(
     if (pattern.test(text)) matched.push(category);
   }
   return { matched, unenforceable };
-}
-
-export function listRecognizedSensitiveCategories(): string[] {
-  return Object.keys(SENSITIVE_CATEGORY_PATTERNS).sort();
 }
 
 export function getMemoryPolicyPath(rootDir?: string): string {

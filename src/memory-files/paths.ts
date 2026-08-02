@@ -1,8 +1,8 @@
 import { createHash } from "crypto";
 import fs from "fs";
-import os from "os";
 import path from "path";
 import type { MemoryScope, MemoryScopePaths } from "./types.js";
+import { getRubatoHome } from "../shared/rubato-home.js";
 
 export interface ResolveMemoryScopePathsInput {
   /** Rubato's data root. Defaults to RUBATO_HOME or ~/.rubato. */
@@ -18,22 +18,11 @@ export function projectMemoryId(projectDir: string): string {
     .digest("hex");
 }
 
-/**
- * Compatibility identifier used by older builds. New writes must use the full
- * SHA-256 projectMemoryId; this value only discovers or cleans up data already
- * stored under the former truncated directory.
- */
-export function legacyTruncatedProjectMemoryId(projectDir: string): string {
-  return projectMemoryId(projectDir).slice(0, 16);
-}
-
 export function resolveMemoryScopePaths(
   input: ResolveMemoryScopePathsInput,
 ): MemoryScopePaths {
   const rootDir = path.resolve(
-    input.rootDir ??
-      process.env.RUBATO_HOME ??
-      path.join(os.homedir(), ".rubato"),
+    input.rootDir ?? getRubatoHome(),
   );
   const memoryDir = path.join(rootDir, "memory");
 
@@ -44,9 +33,9 @@ export function resolveMemoryScopePaths(
   } else {
     projectId = input.projectId ??
       (input.projectDir ? projectMemoryId(input.projectDir) : undefined);
-    if (!projectId || !/^[a-zA-Z0-9._-]{1,128}$/.test(projectId)) {
+    if (!projectId || !/^[a-f0-9]{64}$/.test(projectId)) {
       throw new Error(
-        "Project memory scope requires a safe projectId or a projectDir.",
+        "Project memory scope requires a canonical SHA-256 projectId or a projectDir.",
       );
     }
     scopeDir = path.join(memoryDir, "projects", projectId);

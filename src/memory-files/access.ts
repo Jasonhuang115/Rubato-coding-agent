@@ -14,14 +14,6 @@ export interface MemoryAccessEvent {
   memory_ids: string[];
 }
 
-export interface MemoryAccessSummary {
-  memory_id: string;
-  access_count: number;
-  search_count: number;
-  read_count: number;
-  last_accessed_at: string;
-}
-
 interface LocatedMemoryPath {
   memoryRoot: string;
   releaseId: string;
@@ -107,34 +99,6 @@ export function sessionMemoryAccess(
     searched: [...searched].sort(),
     read: [...read].sort(),
   };
-}
-
-export function summarizeMemoryAccess(
-  events: MemoryAccessEvent[],
-): MemoryAccessSummary[] {
-  const summaries = new Map<string, MemoryAccessSummary>();
-  for (const event of events) {
-    for (const id of event.memory_ids) {
-      const previous = summaries.get(id);
-      const next: MemoryAccessSummary = previous ?? {
-        memory_id: id,
-        access_count: 0,
-        search_count: 0,
-        read_count: 0,
-        last_accessed_at: event.recorded_at,
-      };
-      next.access_count++;
-      if (event.action === "read") next.read_count++;
-      else next.search_count++;
-      if (event.recorded_at > next.last_accessed_at) {
-        next.last_accessed_at = event.recorded_at;
-      }
-      summaries.set(id, next);
-    }
-  }
-  return [...summaries.values()].sort((left, right) =>
-    right.access_count - left.access_count ||
-    left.memory_id.localeCompare(right.memory_id));
 }
 
 function locateVerifiedMemoryPath(filePath: string): LocatedMemoryPath | null {

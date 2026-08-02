@@ -15,15 +15,13 @@ import type {
   StreamRenderer,
   ConfirmDecision,
   ToolDefinition,
-  TaskCompletionControl,
+  AgentControl,
 } from "../shared/core-types.js";
 import type { AgentEvent } from "../agent/loop.js";
 import { dispatch } from "../tools/registry.js";
 import { ToolRuntime } from "./tool-runtime.js";
 import type { ToolRuntimeResult } from "./tool-runtime.js";
-import { PlanManager } from "../agent/planner/manager.js";
-import type { PlanDoc } from "../agent/planner/tree.js";
-import { prePushHook, preCommitHook } from "../tools/git/hooks.js";
+import { prePushHook } from "../tools/git/hooks.js";
 
 // ---- Configuration ----
 
@@ -54,7 +52,7 @@ export interface TurnResult {
   stopReason: "end_turn" | "tool_use" | "max_tokens";
   /** Whether any tool was denied by the user. */
   toolDenied: boolean;
-  taskCompletion?: TaskCompletionControl;
+  control?: AgentControl;
   toolExecutions: Array<{
     id: string;
     name: string;
@@ -88,7 +86,6 @@ export interface TurnOptions {
   workingDir: string;
   ctx: AgentContext;
   toolRuntime: ToolRuntime;
-  planManager: PlanManager;
   onConfirmTool?: (toolName: string, input: Record<string, unknown>) => Promise<ConfirmDecision>;
   /** Number of stream retries after the initial attempt. */
   maxRetries?: number;
@@ -158,7 +155,7 @@ export async function processStream(
             name,
             input: event.input,
           });
-          renderer.renderToolUse(name, event.input);
+          if (name !== "SubmitPlan") renderer.renderToolUse(name, event.input);
         }
         break;
 
@@ -190,7 +187,7 @@ export async function* executeTurn(
 ): AsyncGenerator<AgentEvent, TurnResult> {
   const {
     provider, model, systemPrompt, messages, tools,
-    renderer, workingDir, ctx, toolRuntime, planManager, onConfirmTool,
+    renderer, workingDir, ctx, toolRuntime, onConfirmTool,
   } = options;
 
   const maxRetries = Math.max(0, options.maxRetries ?? DEFAULT_MAX_RETRIES);
@@ -296,9 +293,11 @@ export async function* executeTurn(
   const readCalls: ToolUseBlock[] = [];
   const writeCalls: ToolUseBlock[] = [];
   let toolDenied = false;
-  let taskCompletion: TaskCompletionControl | undefined;
+  let control: AgentControl | undefined;
   const toolExecutions: TurnResult["toolExecutions"] = [];
-  const completionIndex = toolUses.findIndex((toolUse) => toolUse.name === "CompleteTask");
+  const completionIndex = toolUses.findIndex((toolUse) =>
+    toolUse.name === "CompleteTask" || toolUse.name === "SubmitPlan"
+  );
   const executableToolUses = completionIndex >= 0
     ? toolUses.slice(0, completionIndex + 1)
     : toolUses;
@@ -341,7 +340,7 @@ export async function* executeTurn(
 
     for (const { toolUse, result } of readResults) {
       if (result.denied) toolDenied = true;
-      if (result.control) taskCompletion = result.control;
+      if (result.control) control = result.control;
       toolExecutions.push({
         id: toolUse.id,
         name: toolUse.name,
@@ -373,13 +372,8 @@ export async function* executeTurn(
     }
   }
 
-  // Execute write tools serially (with git hook + deviation checks)
+  // Execute non-concurrent tools serially.
   for (const tu of writeCalls) {
-    const toolWarning = planManager.onToolCall(tu.name, tu.input);
-    if (toolWarning) {
-      yield { type: "warning", message: toolWarning };
-    }
-
     // Git hooks
     if (tu.name === "Bash") {
       const cmd = (tu.input.command as string) ?? "";
@@ -395,15 +389,6 @@ export async function* executeTurn(
           }
         } catch { /* best-effort */ }
       }
-      if (/\bgit\s+commit\b/.test(cmd)) {
-        try {
-          const commitHook = await preCommitHook(repoDir, planManager.getActivePlan() as PlanDoc | null);
-          if (commitHook) {
-            for (const w of commitHook.warnings) yield { type: "warning", message: w };
-            for (const s of commitHook.suggestions) yield { type: "warning", message: `💡 ${s}` };
-          }
-        } catch { /* best-effort */ }
-      }
     }
 
     const result = await executeToolCall(
@@ -415,8 +400,8 @@ export async function* executeTurn(
       options.onToolTrace,
     );
     if (result.denied) toolDenied = true;
-    if (result.control) taskCompletion = result.control;
-    if (result.control) break;
+    if (result.control) control = result.control;
+    if (result.control?.type === "task_completion") break;
     toolExecutions.push({
       id: tu.id,
       name: tu.name,
@@ -443,6 +428,7 @@ export async function* executeTurn(
         is_error: result.isError,
       }],
     });
+    if (result.control) break;
   }
 
   return {
@@ -451,7 +437,7 @@ export async function* executeTurn(
     usage,
     stopReason,
     toolDenied,
-    taskCompletion,
+    control,
     toolExecutions,
   };
 }
@@ -469,7 +455,7 @@ async function executeToolCall(
   content: string;
   isError: boolean;
   denied: boolean;
-  control?: TaskCompletionControl;
+  control?: AgentControl;
   security?: ToolRuntimeResult["security"];
 }> {
   const startedAt = Date.now();

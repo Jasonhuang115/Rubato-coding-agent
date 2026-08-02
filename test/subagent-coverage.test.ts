@@ -63,8 +63,6 @@ describe("observable exhaustive coverage gate", () => {
       config: {
         model: { provider: "test", model: "test" },
         permissions: { bash: "auto", read: "auto", write: "auto", edit: "auto", web: "auto" },
-        embedding: { source: "local_hash" },
-        mnemosyne: { bootstrap_on_first_open: false, bootstrap_max_files: 1 },
         session: { cleanupPeriodDays: 30 },
       },
       taskRuntime,

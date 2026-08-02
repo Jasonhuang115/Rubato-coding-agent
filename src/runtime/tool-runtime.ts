@@ -19,7 +19,7 @@ import { dispatch } from "../tools/registry.js";
 import type {
   AgentContext,
   ConfirmDecision,
-  TaskCompletionControl,
+  AgentControl,
   ToolDefinition,
   ToolResult,
 } from "../shared/core-types.js";
@@ -31,7 +31,7 @@ export interface ToolRuntimeResult {
   isError: boolean;
   /** True when the user explicitly denied a "confirm" tool. */
   denied: boolean;
-  control?: TaskCompletionControl;
+  control?: AgentControl;
   /** Security metadata attached to every execution (for audit / logging). */
   security?: {
     verdict: SecurityDecision["verdict"];
@@ -91,6 +91,18 @@ export class ToolRuntime {
     input: Record<string, unknown>,
     ctx: AgentContext,
   ): Promise<ToolRuntimeResult> {
+    if (ctx.mode === "plan") {
+      const allowed = new Set([
+        "Read", "Grep", "Glob", "WebFetch", "WebSearch", "Agent", "Task", "SubmitPlan",
+      ]);
+      if (!allowed.has(toolName) && !(toolName === "CompleteTask" && ctx.taskRuntime)) {
+        return {
+          content: `Plan mode blocked tool "${toolName}". Only read-only exploration and SubmitPlan are allowed.`,
+          isError: true,
+          denied: false,
+        };
+      }
+    }
     const scopedTool = this.tools?.get(toolName);
     if (this.tools && !scopedTool) {
       return {
@@ -110,7 +122,7 @@ export class ToolRuntime {
 
     // CompleteTask is a runtime control protocol, not a project action. It
     // bypasses ordinary permission policy but remains scoped to subagents.
-    if (toolName === "CompleteTask" && scopedTool) {
+    if ((toolName === "CompleteTask" || toolName === "SubmitPlan") && scopedTool) {
       return this.fromToolResult(await scopedTool.handler(input, ctx));
     }
 

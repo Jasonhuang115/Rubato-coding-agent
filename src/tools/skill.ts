@@ -4,7 +4,7 @@
 import type { ToolDefinition, AgentContext } from "../shared/core-types.js";
 import { getSkillRegistry } from "../skills/registry.js";
 import { spawnSubagent } from "../agent/subagent.js";
-import { PolicyEngine } from "../permissions/policy.js";
+import { PolicyEngine } from "../security/policy/engine.js";
 
 export const skillTool: ToolDefinition = {
   name: "Skill",

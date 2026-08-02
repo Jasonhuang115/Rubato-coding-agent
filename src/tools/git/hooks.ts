@@ -3,7 +3,6 @@
 
 import { getGitState, getCurrentBranch, isGitRepo } from "./advisor.js";
 import { runPreflight } from "./preflight.js";
-import { verifyIntent } from "./intent-verify.js";
 import { getBranchHealth } from "./branch-health.js";
 import { narrateHistory } from "./archaeology.js";
 import { quickBlame } from "./semantic-blame.js";
@@ -12,7 +11,6 @@ import { scanTeamRadar } from "./team-radar.js";
 import { learnWorkflow, checkAgainstProfile } from "./workflow-learner.js";
 import { hasConflicts, listConflictedFiles, narrateConflict } from "./conflict-narrator.js";
 import { warnRecoverable } from "../../shared/diagnostics.js";
-import type { PlanDoc } from "../../agent/planner/tree.js";
 
 // ---- Types ----
 
@@ -58,37 +56,6 @@ export async function prePushHook(workingDir: string): Promise<GitHookResult> {
     }
     for (const c of radar.collisions.slice(0, 3)) {
       warnings.push(`[Team Radar] ⚠️ \`${c.branch}\` (${c.author}) 也修改了 \`${c.file}\``);
-    }
-  }
-
-  return { warnings, suggestions, blocked };
-}
-
-// ---- Hook: Pre-Commit Check ----
-
-export async function preCommitHook(
-  workingDir: string,
-  plan: PlanDoc | null
-): Promise<GitHookResult> {
-  const warnings: string[] = [];
-  const suggestions: string[] = [];
-  let blocked = false;
-
-  if (!(await isGitRepo(workingDir))) {
-    return { warnings: [], suggestions: [], blocked: false };
-  }
-
-  // Intent verification
-  const verification = await verifyIntent(workingDir, plan);
-  if (verification && !verification.matchesIntent) {
-    if (verification.suspicious.length > 0) {
-      warnings.push(`[意图验证] ⚠️ ${verification.suspicious.length} 个文件不在计划范围内：${verification.suspicious.join(", ")}`);
-    }
-    if (verification.unrelated.length > 0) {
-      warnings.push(`[意图验证] ❓ ${verification.unrelated.length} 个文件与计划无关：${verification.unrelated.join(", ")}`);
-    }
-    if (verification.suggestedMessage) {
-      suggestions.push(`建议的 commit message：${verification.suggestedMessage}`);
     }
   }
 

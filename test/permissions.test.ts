@@ -1,6 +1,6 @@
 // Permissions system tests
 import { describe, it, expect } from "vitest";
-import { PolicyEngine } from "../src/permissions/policy.js";
+import { PolicyEngine } from "../src/security/policy/engine.js";
 import { DEFAULT_PERMISSIONS } from "../src/permissions/config.js";
 
 describe("PolicyEngine", () => {

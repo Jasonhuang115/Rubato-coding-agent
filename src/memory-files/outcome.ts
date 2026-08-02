@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "crypto";
 import fs from "fs";
-import os from "os";
 import path from "path";
+import { getRubatoHome } from "../shared/rubato-home.js";
 
 export interface OutcomeVector {
   task_utility: number;
@@ -45,12 +45,6 @@ export interface UtilityEstimate {
 }
 
 const ZERO_HASH = "0".repeat(64);
-
-export function getRubatoHome(): string {
-  return path.resolve(
-    process.env.RUBATO_HOME ?? path.join(os.homedir(), ".rubato"),
-  );
-}
 
 export function getOutcomePath(): string {
   return path.join(getRubatoHome(), "memory", "outcomes.jsonl");

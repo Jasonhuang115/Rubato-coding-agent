@@ -23,10 +23,9 @@ function mockCtx(overrides?: Partial<AgentContext>): AgentContext {
         edit: "auto",
         web: "auto",
       },
-      embedding: { source: "local_hash" },
-      mnemosyne: { bootstrap_on_first_open: false, bootstrap_max_files: 100 },
       session: { cleanupPeriodDays: 30 },
     },
+    mode: "default",
     depth: 0,
     ...overrides,
   };
@@ -229,7 +228,7 @@ describe("Edit tool", () => {
 
 describe("Todo tool", () => {
   it("updates todo list", async () => {
-    const { todoWriteTool, clearTodos } = await import("../src/tools/todo.js");
+    const { todoWriteTool } = await import("../src/tools/todo.js");
     const ctx = mockCtx();
 
     const result = await todoWriteTool.handler(
@@ -246,7 +245,5 @@ describe("Todo tool", () => {
     expect(result.content).toContain("Todo list updated");
     expect(result.content).toContain("task 1");
     expect(result.content).toContain("task 2");
-
-    clearTodos(ctx.sessionId);
   });
 });

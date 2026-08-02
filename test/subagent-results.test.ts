@@ -24,8 +24,6 @@ vi.mock("../src/agent/loop.js", () => ({
 const config: AgentConfig = {
   model: { provider: "test", model: "test-model" },
   permissions: { bash: "auto", read: "auto", write: "auto", edit: "auto", web: "auto" },
-  embedding: { source: "local_hash" },
-  mnemosyne: { bootstrap_on_first_open: false, bootstrap_max_files: 100 },
   session: { cleanupPeriodDays: 30 },
 };
 
@@ -112,34 +110,6 @@ describe("managed subagent result delivery", () => {
     const transcript = fs.readFileSync(result.transcriptPath!, "utf8");
     expect(transcript).toContain("found src/example.ts");
     expect(transcript).not.toContain("thinking");
-  });
-
-  it("runs advisory work through the registry and acknowledges it when the legacy handle waits", async () => {
-    loopState.events = [
-      {
-        type: "task_completion",
-        completion: {
-          status: "completed",
-          summary: "Background evidence ready.",
-          report_markdown: "# Background\n\nReady.",
-        },
-      },
-      { type: "done", reason: "task_completion" },
-    ];
-
-    const { spawnSubagentInBackground } = await import("../src/agent/subagent.js");
-    const handle = spawnSubagentInBackground(definition, "background task", context(), config);
-    const result = await handle.wait();
-    await Promise.resolve();
-
-    expect(result.agentId).toBe(handle.agentId);
-    expect(result.taskId).toBe(handle.taskId);
-    expect(handle.status).toBe("completed");
-    const { processSubagentRegistry } = await import("../src/agent/subagents/registry.js");
-    const runtime = processSubagentRegistry.get(sessionId)!;
-    expect(runtime.inbox.drain()).toEqual([]);
-    const trace = fs.readFileSync(runtime.artifacts.tracePath, "utf8");
-    expect(trace).toContain("background_notification_acknowledged");
   });
 
   it("keeps required Agent output bounded and points to full local artifacts", async () => {

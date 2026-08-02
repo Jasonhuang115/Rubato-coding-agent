@@ -1,8 +1,8 @@
 import fs from "fs";
-import os from "os";
 import path from "path";
 import { randomUUID } from "crypto";
 import { redactText, redactValue } from "../agent/subagents/redaction.js";
+import { getRubatoHome } from "../shared/rubato-home.js";
 
 export interface ScrubOptions {
   /** Defaults to ~/.rubato (or RUBATO_HOME). */
@@ -35,9 +35,7 @@ const TEXT_EXTENSIONS = new Set([".jsonl", ".json", ".md", ".txt"]);
  */
 export function scrubPersistedData(options: ScrubOptions = {}): ScrubReport {
   const configuredRoot = path.resolve(
-    options.rubatoHome ??
-      process.env.RUBATO_HOME ??
-      path.join(os.homedir(), ".rubato"),
+    options.rubatoHome ?? getRubatoHome(),
   );
   const target = path.resolve(options.target ?? configuredRoot);
   const report: ScrubReport = {

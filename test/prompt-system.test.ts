@@ -1,6 +1,6 @@
 // PromptAssembler tests — the prompt path used by ContextAssembler.
 import { describe, it, expect } from "vitest";
-import { PromptAssembler, getPromptAssembler, resetPromptAssembler } from "../src/prompt/assembler.js";
+import { PromptAssembler, getPromptAssembler } from "../src/prompt/assembler.js";
 import { assembleContext } from "../src/runtime/context-assembler.js";
 import { buildCapabilityPrompt } from "../src/prompt/capability.js";
 
@@ -10,7 +10,7 @@ const ctx = {
   readGuard: {} as any,
   permissionManager: {} as any,
   config: { model: { provider: "deepseek", model: "deepseek-chat" } } as any,
-  planManager: { getPlanSummary: () => "" } as any,
+  mode: "default" as const,
   depth: 0,
 };
 
@@ -21,22 +21,14 @@ const tools = [
 
 describe("PromptAssembler", () => {
   it("assembles the three production prompt layers", () => {
-    const layers = new PromptAssembler("deepseek").assemble(ctx, tools);
+    const layers = new PromptAssembler().assemble(ctx, tools);
     expect(layers.static).toBeTruthy();
     expect(layers.capability).toContain("Read");
     expect(layers.dynamic).toBeTruthy();
   });
 
-  it("estimates and checks the assembled prompt budget", () => {
-    const assembler = new PromptAssembler("deepseek");
-    const estimate = assembler.estimateTokens(ctx, tools);
-    expect(estimate.total).toBeGreaterThan(0);
-    expect(assembler.checkBudget(ctx, tools).excess).toBeGreaterThanOrEqual(0);
-  });
-
   it("keeps one production singleton", () => {
-    resetPromptAssembler();
-    const first = getPromptAssembler("deepseek");
+    const first = getPromptAssembler();
     expect(getPromptAssembler()).toBe(first);
   });
 

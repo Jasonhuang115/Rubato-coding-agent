@@ -17,7 +17,6 @@ import {
 } from "../src/memory-files/extractor.js";
 import {
   createBelief,
-  planBeliefMaintenance,
   planUserModelOperations,
   scoreBelief,
   type UserBelief,
@@ -263,25 +262,6 @@ describe("belief confidence and lifecycle states", () => {
     expect(belief.status).toBe("tentative");
   });
 
-  it("plans retirement when decayed confidence has become negligible", () => {
-    const oldHabit = beliefFrom(
-      observation({ signal: "habit" }),
-      { id: "old-habit", halfLifeDays: 30 }
-    );
-    const afterSixHalfLives =
-      Date.parse(T0) + 180 * 24 * 60 * 60 * 1000;
-
-    const operations = planBeliefMaintenance(
-      [oldHabit],
-      { now: afterSixHalfLives }
-    );
-    expect(operations).toHaveLength(1);
-    expect(operations[0]).toMatchObject({
-      kind: "RETIRE",
-      targetIds: ["old-habit"],
-      statusPatches: [{ beliefId: "old-habit", status: "retired" }],
-    });
-  });
 });
 
 describe("logical key and scope update planning", () => {

@@ -14,7 +14,6 @@ import {
   normalizeObservationValue,
   normalizeScope,
   sameScope,
-  scopeKey,
   type UserMemoryScope,
   type UserObservation,
   type UserSignal,
@@ -642,61 +641,4 @@ export function planUserModelOperations(
   }
 
   return operations;
-}
-
-export function planBeliefMaintenance(
-  existing: UserBelief[],
-  options: PlanUserModelOptions = {}
-): UserModelOperation[] {
-  const now = nowMs(options.now);
-  const operations: UserModelOperation[] = [];
-
-  for (const belief of existing) {
-    if (TERMINAL_STATUSES.has(belief.status)) continue;
-    const refreshed = refreshBelief(belief, now);
-
-    if (refreshed.confidence < DEFAULT_STATUS_THRESHOLDS.retireBelow) {
-      operations.push({
-        kind: "RETIRE",
-        logicalKey: belief.logicalKey,
-        scope: belief.scope,
-        targetIds: [belief.id],
-        evidenceIds: belief.evidence.map((item) => item.id),
-        proposedBelief: { ...refreshed, status: "retired" },
-        statusPatches: [{ beliefId: belief.id, status: "retired" }],
-        reason: "Decayed confidence fell below the retirement threshold",
-        requiresReview: true,
-      });
-      continue;
-    }
-
-    if (
-      refreshed.status !== belief.status
-      || Math.abs(refreshed.confidence - belief.confidence) > 1e-9
-    ) {
-      operations.push({
-        kind: "RECLASSIFY",
-        logicalKey: belief.logicalKey,
-        scope: belief.scope,
-        targetIds: [belief.id],
-        evidenceIds: belief.evidence.map((item) => item.id),
-        proposedBelief: refreshed,
-        statusPatches: [{
-          beliefId: belief.id,
-          status: refreshed.status,
-        }],
-        reason: "Recalculate status and confidence after time decay",
-        requiresReview: true,
-      });
-    }
-  }
-
-  return operations;
-}
-
-/** Stable serialized identity for conflict grouping and grep-friendly indexes. */
-export function beliefIdentity(
-  belief: Pick<UserBelief, "logicalKey" | "scope">
-): string {
-  return `${normalizeLogicalKey(belief.logicalKey)}\u001f${scopeKey(belief.scope)}`;
 }

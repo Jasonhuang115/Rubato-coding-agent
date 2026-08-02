@@ -4,7 +4,7 @@ import type {
   ObservationProposal,
   SourceEvent,
 } from "../memory-files/extractor.js";
-import { getRubatoHome } from "../memory-files/outcome.js";
+import { getRubatoHome } from "../shared/rubato-home.js";
 import { projectMemoryId } from "../memory-files/paths.js";
 import { learnFromObservationProposals } from "../memory-files/runtime.js";
 import {

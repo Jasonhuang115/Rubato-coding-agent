@@ -1,8 +1,6 @@
 import type { OutcomeVector } from "../memory-files/outcome.js";
-import {
-  getRubatoHome,
-  recordMemoryOutcome,
-} from "../memory-files/outcome.js";
+import { recordMemoryOutcome } from "../memory-files/outcome.js";
+import { getRubatoHome } from "../shared/rubato-home.js";
 import { sessionMemoryAccess } from "../memory-files/access.js";
 import type { ToolDefinition } from "../shared/core-types.js";
 import path from "path";

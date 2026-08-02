@@ -8,7 +8,6 @@ import type {
   StreamEvent,
 } from "../src/shared/core-types.js";
 import { SessionStore } from "../src/runtime/session/storage.js";
-import { SessionManager } from "../src/runtime/session/manager.js";
 import {
   queueDream,
   leaseNextDream,
@@ -19,10 +18,7 @@ import {
   type DreamProposal,
 } from "../src/memory-files/dream-worker.js";
 import { buildUserProfile } from "../src/memory-files/catalog.js";
-import {
-  legacyTruncatedProjectMemoryId,
-  projectMemoryId,
-} from "../src/memory-files/paths.js";
+import { projectMemoryId } from "../src/memory-files/paths.js";
 import { FileMemoryRepository } from "../src/memory-files/repository.js";
 import { readCurrentRelease } from "../src/memory-files/release.js";
 import type { MemoryCard } from "../src/memory-files/types.js";
@@ -350,136 +346,6 @@ describe("periodic LLM Dream worker", () => {
     expect(readCurrentRelease(repository.projectPaths)).toBeNull();
   });
 
-  it.each(["truncated", "slug"] as const)(
-    "discovers %s legacy project-session directories but publishes under the full SHA project",
-    async (variant) => {
-      const legacyId = variant === "truncated"
-        ? legacyTruncatedProjectMemoryId(projectA)
-        : SessionManager.resolveLegacyProjectHash(projectA);
-      const session = closedSessionInProjectStore(
-        legacyId,
-        `${variant}-session`,
-        "I prefer to run focused tests first.",
-      );
-      const repository = new FileMemoryRepository({
-        rootDir,
-        projectDir: projectA,
-      });
-      queueDream(repository.dreamsDir("project"), {
-        scope: "project",
-        project_id: repository.projectId,
-        reason: `${variant} compatibility`,
-        session_ids: [session.sessionId],
-        observation_ids: [],
-        candidate_ids: [],
-      });
-      const proposal = claimProposal({
-        proposalId: `${variant}-preference`,
-        sourceEventIds: [session.eventId],
-        scope: { kind: "project", value: repository.projectId },
-        signal: "explicit_preference",
-        value: "run focused tests first",
-      });
-
-      const result = await runNextDream({
-        workingDir: projectA,
-        rootDir,
-        scope: "project",
-        owner: "worker",
-        model: new FakeModelProvider(pipelineResponses(proposal)),
-      });
-
-      expect(result?.run.status).toBe("published");
-      expect(readCurrentRelease(repository.projectPaths)?.cards[0])
-        .toMatchObject({
-          status: "active",
-          scope: "project",
-          contexts: { projects: [repository.projectId] },
-        });
-    },
-  );
-
-  it("reads a closed legacy flat session without inventing project ownership", async () => {
-    const session = closedFlatSession(
-      "flat-session",
-      "This is legacy unscoped evidence.",
-    );
-    const repository = new FileMemoryRepository({
-      rootDir,
-      projectDir: projectA,
-    });
-    queueDream(repository.dreamsDir("global"), {
-      scope: "global",
-      reason: "legacy flat session",
-      session_ids: [session.sessionId],
-      observation_ids: [],
-      candidate_ids: [],
-    });
-    const noop: DreamProposal = {
-      proposal_id: "flat-noop",
-      operation: "NOOP",
-      source_event_ids: [session.eventId],
-      target_ids: [],
-      derives_from: [],
-      reason: "No durable claim",
-    };
-    const model = new FakeModelProvider(pipelineResponses(noop));
-
-    const result = await runNextDream({
-      workingDir: projectA,
-      rootDir,
-      scope: "global",
-      owner: "worker",
-      model,
-    });
-
-    expect(result?.run.status).toBe("rejected");
-    expect(model.calls).toHaveLength(3);
-    expect(model.calls[0].messages[0].content).not.toContain(
-      '"project_id":"legacy-flat"',
-    );
-  });
-
-  it("rejects a symlinked legacy flat transcript before calling the model", async () => {
-    const session = closedFlatSession(
-      "flat-symlink",
-      "I prefer concise answers.",
-    );
-    const transcript = path.join(
-      rootDir,
-      "sessions",
-      `${session.sessionId}.jsonl`,
-    );
-    const target = path.join(rootDir, "real-flat-session.jsonl");
-    fs.renameSync(transcript, target);
-    fs.symlinkSync(target, transcript);
-    const repository = new FileMemoryRepository({
-      rootDir,
-      projectDir: projectA,
-    });
-    queueDream(repository.dreamsDir("global"), {
-      scope: "global",
-      reason: "symlink rejection",
-      session_ids: [session.sessionId],
-      observation_ids: [],
-      candidate_ids: [],
-      max_retries: 0,
-    });
-    const model = new FakeModelProvider([]);
-
-    const result = await runNextDream({
-      workingDir: projectA,
-      rootDir,
-      scope: "global",
-      owner: "worker",
-      model,
-    });
-
-    expect(result?.run.status).toBe("needs_review");
-    expect(result?.error).toContain("symlink");
-    expect(model.calls).toHaveLength(0);
-  });
-
   it("recovers an expired lease, retries structured output, and preserves queue idempotency", async () => {
     const session = closedSession(
       projectA,
@@ -569,29 +435,6 @@ function closedSession(
   return fixture;
 }
 
-function closedSessionInProjectStore(
-  projectStoreId: string,
-  sessionId: string,
-  content: string,
-): SessionFixture {
-  const fixture = openSessionInStore(sessionId, content, projectStoreId);
-  const store = activeStores.get(sessionId)!;
-  store.close();
-  activeStores.delete(sessionId);
-  return fixture;
-}
-
-function closedFlatSession(
-  sessionId: string,
-  content: string,
-): SessionFixture {
-  const fixture = openSessionInStore(sessionId, content);
-  const store = activeStores.get(sessionId)!;
-  store.close();
-  activeStores.delete(sessionId);
-  return fixture;
-}
-
 const activeStores = new Map<string, SessionStore>();
 
 function openSession(
@@ -599,19 +442,7 @@ function openSession(
   sessionId: string,
   content: string,
 ): SessionFixture {
-  return openSessionInStore(
-    sessionId,
-    content,
-    projectMemoryId(projectDir),
-  );
-}
-
-function openSessionInStore(
-  sessionId: string,
-  content: string,
-  projectStoreId?: string,
-): SessionFixture {
-  const store = new SessionStore(sessionId, projectStoreId);
+  const store = new SessionStore(sessionId, projectMemoryId(projectDir));
   store.init();
   store.writeMessage({ role: "user", content });
   activeStores.set(sessionId, store);

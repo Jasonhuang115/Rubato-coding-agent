@@ -164,13 +164,3 @@ export function sameScope(
 ): boolean {
   return scopeKey(left) === scopeKey(right);
 }
-
-export function sameObservationValue(
-  left: Pick<UserObservation, "value"> | string,
-  right: Pick<UserObservation, "value"> | string
-): boolean {
-  const leftValue = typeof left === "string" ? left : left.value;
-  const rightValue = typeof right === "string" ? right : right.value;
-  return normalizeObservationValue(leftValue)
-    === normalizeObservationValue(rightValue);
-}

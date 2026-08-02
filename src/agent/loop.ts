@@ -16,17 +16,18 @@ import type {
   ToolDefinition,
   ConfirmDecision,
   CompleteTaskInput,
+  PlanReadyControl,
   SubagentRuntimeContext,
 } from "../shared/core-types.js";
 import { createProvider } from "../model/router.js";
-import { getAllTools } from "../tools/registry.js";
+import { getAllTools, getToolsForMode } from "../tools/registry.js";
 import { SecurityRuntime } from "../security/runtime.js";
 import { ToolRuntime } from "../runtime/tool-runtime.js";
 import { ReadGuard } from "./read-guard.js";
 import { SessionStore } from "../runtime/session/storage.js";
 import { createSessionMeta, finalizeSessionMeta } from "../runtime/session/meta.js";
 import type { SessionManager } from "../runtime/session/manager.js";
-import { PlanManager } from "../agent/planner/manager.js";
+import { AgentModeController } from "./mode.js";
 import {
   learnFromStoredSessionRecords,
   type FileMemoryLearningResult,
@@ -45,6 +46,7 @@ import {
 import { processSubagentRegistry } from "./subagents/registry.js";
 import type { TaskInboxEvent } from "./subagents/conversation-inbox.js";
 import { RootDelegationGate } from "./delegation-gate.js";
+import { projectMemoryId } from "../memory-files/paths.js";
 
 // ---- Configuration ----
 
@@ -72,7 +74,8 @@ export type AgentEvent =
   | { type: "compacting"; reason: string }
   | { type: "waiting_for_input" }
   | { type: "completion_retry"; attempt: number }
-  | { type: "task_completion"; completion: CompleteTaskInput };
+  | { type: "task_completion"; completion: CompleteTaskInput }
+  | { type: "plan_ready"; plan: PlanReadyControl };
 
 // ---- Abort mechanism (delegates to StepExecutor) ----
 
@@ -109,6 +112,8 @@ export interface AgentLoopOptions {
   taskRuntime?: SubagentRuntimeContext;
   /** Extra model turns reserved solely for submitting CompleteTask. */
   completionRetryTurns?: number;
+  /** Root CLI session mode; omitted contexts always use default mode. */
+  modeController?: AgentModeController;
 }
 
 // ---- Main loop ----
@@ -121,7 +126,9 @@ export async function* agentLoop(
   // ---- Setup ----
   const sessionId = options.sessionId ?? randomUUID();
   let provider = createProvider(config.model);
-  const tools = options.tools ?? getAllTools();
+  const registeredTools = options.tools ?? getAllTools();
+  const modeController = options.modeController ?? new AgentModeController();
+  let tools = options.tools ?? getToolsForMode(modeController.mode);
   const isRootProfile = (options.contextProfile ?? "root") === "root";
   const rootRuntime = isRootProfile
     ? processSubagentRegistry.getOrCreate(sessionId, workingDir, config)
@@ -140,13 +147,13 @@ export async function* agentLoop(
     securityRuntime,
     workingDir,
     onConfirmTool: options.onConfirmTool,
-    tools,
+    tools: registeredTools,
   });
 
   const readGuard = new ReadGuard();
 
   // Session storage
-  const projectHash = options.sessionManager?.getProjectHash();
+  const projectHash = options.sessionManager?.getProjectHash() ?? projectMemoryId(workingDir);
   const sessionStore = new SessionStore(sessionId, projectHash);
   const persistConversation = (options.contextProfile ?? "root") === "root";
   if (persistConversation) {
@@ -169,8 +176,6 @@ export async function* agentLoop(
     { firstMessage: prompt.slice(0, 200) },
   );
 
-  // Plan manager
-  const planManager = new PlanManager(workingDir);
   const delegationGate = isRootProfile
     ? new RootDelegationGate(prompt)
     : undefined;
@@ -182,21 +187,29 @@ export async function* agentLoop(
     readGuard,
     permissionManager,
     config,
-    planManager,
+    mode: modeController.mode,
     depth: options.depth ?? 0,
     taskRuntime: options.taskRuntime,
     abortSignal: options.abortSignal,
     onConfirmTool: options.onConfirmTool,
     delegationGate,
   };
+  if (ctx.mode === "plan") {
+    rootRuntime?.trace.append({
+      type: "agent_mode_changed",
+      sessionId,
+      agentId: sessionId,
+      mode: ctx.mode,
+    });
+    if (persistConversation) sessionStore.writeToolEvent({ type: "agent_mode_changed", mode: ctx.mode });
+  }
 
   // ---- Build system prompt via ContextAssembler ----
-  const { systemPrompt, systemTokens } = await assembleContext({
+  let { systemPrompt, systemTokens } = await assembleContext({
     workingDir,
     prompt,
     ctx,
     tools,
-    providerName: config.model.provider,
     resumeSummary: options.resumeSummary,
     roleSystemPrompt: options.roleSystemPrompt,
     contextProfile: options.contextProfile,
@@ -226,6 +239,7 @@ export async function* agentLoop(
   let doneReason: string | null = null;
   let forcingCompletion = false;
   let completionRetryCount = 0;
+  let assembledMode = ctx.mode;
 
   for (let turn = 0; turn < maxTurns && !doneReason; turn++) {
     if (options.abortSignal?.aborted) {
@@ -233,6 +247,27 @@ export async function* agentLoop(
       break;
     }
     options.taskRuntime?.onActivity?.(`model turn ${turn + 1}`);
+    if (!options.tools && modeController.mode !== assembledMode) {
+      ctx.mode = modeController.mode;
+      tools = getToolsForMode(ctx.mode);
+      ({ systemPrompt, systemTokens } = await assembleContext({
+        workingDir,
+        prompt,
+        ctx,
+        tools,
+        resumeSummary: options.resumeSummary,
+        roleSystemPrompt: options.roleSystemPrompt,
+        contextProfile: options.contextProfile,
+      }));
+      assembledMode = ctx.mode;
+      rootRuntime?.trace.append({
+        type: "agent_mode_changed",
+        sessionId,
+        agentId: sessionId,
+        mode: ctx.mode,
+      });
+      if (persistConversation) sessionStore.writeToolEvent({ type: "agent_mode_changed", mode: ctx.mode });
+    }
     // Dynamic provider switching
     if (provider.name !== config.model.provider) {
       provider = createProvider(config.model);
@@ -308,7 +343,6 @@ export async function* agentLoop(
         workingDir,
         ctx,
         toolRuntime,
-        planManager,
         onConfirmTool: options.onConfirmTool,
         maxRetries: config.model.maxRetries,
         abortSignal: options.abortSignal,
@@ -398,7 +432,7 @@ export async function* agentLoop(
       usage,
       stopReason,
       toolDenied,
-      taskCompletion,
+      control,
       toolExecutions,
     } = turnResult;
     rootRuntime?.trace.append({
@@ -430,10 +464,53 @@ export async function* agentLoop(
       usage: usage ? { input: usage.input, output: usage.output } : undefined,
     };
 
-    if (taskCompletion) {
-      yield { type: "task_completion", completion: taskCompletion.completion };
+    if (control?.type === "task_completion") {
+      yield { type: "task_completion", completion: control.completion };
       doneReason = "task_completion";
       break;
+    }
+    if (control?.type === "plan_ready") {
+      modeController.markReady(control);
+      rootRuntime?.trace.append({
+        type: "plan_submitted",
+        sessionId,
+        agentId: sessionId,
+        path: control.path,
+        title: control.title,
+      });
+      if (persistConversation) {
+        sessionStore.writeToolEvent({ type: "plan_submitted", path: control.path, title: control.title });
+      }
+      yield { type: "plan_ready", plan: control };
+      if (!options.getNextUserMessage) {
+        doneReason = "plan_ready";
+        break;
+      }
+      yield { type: "waiting_for_input" };
+      const nextMessage = await options.getNextUserMessage();
+      if (!nextMessage || !nextMessage.trim()) {
+        doneReason = "user_exit";
+        break;
+      }
+      const raw = nextMessage.trim();
+      const transformed = modeController.transformUserInput(raw);
+      ctx.mode = modeController.mode;
+      messages.push({ role: "user", content: transformed.modelMessage });
+      if (persistConversation) {
+        sessionStore.writeMessage({ role: "user", content: raw });
+        sessionStore.writeToolEvent({
+          type: transformed.event === "approved" ? "plan_approved" : "plan_revision_requested",
+          path: control.path,
+        });
+      }
+      rootRuntime?.trace.append({
+        type: transformed.event === "approved" ? "plan_approved" : "plan_revision_requested",
+        sessionId,
+        agentId: sessionId,
+        path: control.path,
+      });
+      sessionMeta.messageCount = (sessionMeta.messageCount ?? 0) + 1;
+      continue;
     }
 
     if (
@@ -535,11 +612,10 @@ export async function* agentLoop(
           doneReason = "user_exit";
           break;
         }
-        const deviationWarning = planManager.onUserMessage(nextMessage.trim());
-        delegationGate?.observeUserMessage(nextMessage.trim());
-        if (deviationWarning) {
-          yield { type: "warning", message: deviationWarning };
-        }
+        const rawMessage = nextMessage.trim();
+        const transformed = modeController.transformUserInput(rawMessage);
+        ctx.mode = modeController.mode;
+        delegationGate?.observeUserMessage(rawMessage);
         const notifications = runtime?.inbox.drain() ?? [];
         if (notifications.length > 0) {
           runtime?.trace.append({
@@ -555,9 +631,9 @@ export async function* agentLoop(
           }
           messages.push({ role: "user", content: formatInboxEvents(notifications) });
         }
-        messages.push({ role: "user", content: nextMessage.trim() });
+        messages.push({ role: "user", content: transformed.modelMessage });
         if (persistConversation) {
-          sessionStore.writeMessage({ role: "user", content: nextMessage.trim() });
+          sessionStore.writeMessage({ role: "user", content: rawMessage });
           const learned = learnLatestUserMemory(
             sessionStore,
             workingDir,
@@ -585,14 +661,13 @@ export async function* agentLoop(
           doneReason = "user_exit";
           break;
         }
-        const deviationWarning = planManager.onUserMessage(nextMessage.trim());
-        delegationGate?.observeUserMessage(nextMessage.trim());
-        if (deviationWarning) {
-          yield { type: "warning", message: deviationWarning };
-        }
-        messages.push({ role: "user", content: nextMessage.trim() });
+        const rawMessage = nextMessage.trim();
+        const transformed = modeController.transformUserInput(rawMessage);
+        ctx.mode = modeController.mode;
+        delegationGate?.observeUserMessage(rawMessage);
+        messages.push({ role: "user", content: transformed.modelMessage });
         if (persistConversation) {
-          sessionStore.writeMessage({ role: "user", content: nextMessage.trim() });
+          sessionStore.writeMessage({ role: "user", content: rawMessage });
           const learned = learnLatestUserMemory(
             sessionStore,
             workingDir,

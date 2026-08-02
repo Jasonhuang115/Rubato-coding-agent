@@ -7,11 +7,7 @@ import {
   hardPurgeMemories,
   previewHardPurge,
 } from "../src/memory-files/hard-purge.js";
-import {
-  legacyTruncatedProjectMemoryId,
-  projectMemoryId,
-  resolveMemoryScopePaths,
-} from "../src/memory-files/paths.js";
+import { projectMemoryId, resolveMemoryScopePaths } from "../src/memory-files/paths.js";
 import {
   isMemorySessionPurged,
   publishMemoryRelease,
@@ -125,8 +121,8 @@ describe("file-memory hard purge", () => {
     expect(fs.existsSync(fixture.privateCandidate)).toBe(false);
     expect(fs.existsSync(fixture.privateDream)).toBe(false);
     expect(fs.existsSync(fixture.privateSession)).toBe(false);
-    expect(fs.existsSync(fixture.truncatedSession)).toBe(false);
-    expect(fs.existsSync(fixture.slugSession)).toBe(false);
+    expect(fs.existsSync(fixture.truncatedSession)).toBe(true);
+    expect(fs.existsSync(fixture.slugSession)).toBe(true);
     expect(fs.existsSync(fixture.globalDerivedSkill)).toBe(false);
     expect(fs.existsSync(fixture.projectDerivedSkill)).toBe(false);
 
@@ -149,12 +145,6 @@ describe("file-memory hard purge", () => {
       expect(findLiteralMatches([
         paths.scopeDir,
         path.join(rootDir, "projects", projectMemoryId(workdir)),
-        path.join(
-          rootDir,
-          "projects",
-          legacyTruncatedProjectMemoryId(workdir),
-        ),
-        path.join(rootDir, "projects", legacyProjectId(workdir)),
         path.join(rootDir, "skills"),
         path.join(workdir, ".rubato", "skills"),
         fixture.accessPath,
@@ -242,7 +232,7 @@ describe("file-memory hard purge", () => {
     expect(fs.existsSync(paths.purgeLedgerPath)).toBe(false);
   });
 
-  it("cleans a global memory from every safe project and legacy flat sessions", () => {
+  it("cleans global memory from canonical projects without discovering flat sessions", () => {
     const globalPaths = resolveMemoryScopePaths({
       rootDir,
       scope: "global",
@@ -269,8 +259,8 @@ describe("file-memory hard purge", () => {
       changes: [{ type: "create", card: globalCard }],
     });
 
-    const projectA = path.join(rootDir, "projects", "project-a");
-    const projectB = path.join(rootDir, "projects", "project-b");
+    const projectA = path.join(rootDir, "projects", "a".repeat(64));
+    const projectB = path.join(rootDir, "projects", "b".repeat(64));
     const evidenceSession = path.join(
       projectA,
       "sessions",
@@ -346,7 +336,7 @@ describe("file-memory hard purge", () => {
     expect(result.complete).toBe(true);
     expect(fs.existsSync(evidenceSession)).toBe(false);
     expect(fs.existsSync(textMatchSession)).toBe(false);
-    expect(fs.existsSync(legacySession)).toBe(false);
+    expect(fs.existsSync(legacySession)).toBe(true);
     expect(fs.existsSync(safeSession)).toBe(true);
     expect(fs.readFileSync(path.join(projectB, "sessions.json"), "utf8"))
       .toContain("safe-session");
@@ -512,7 +502,7 @@ function buildCompleteFixture(
   const truncatedSession = path.join(
     rootDir,
     "projects",
-    legacyTruncatedProjectMemoryId(workdir),
+    createHash("sha256").update(path.resolve(workdir)).digest("hex").slice(0, 16),
     "sessions",
     "truncated-private.jsonl",
   );

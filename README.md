@@ -1,8 +1,8 @@
 # Rubato
 
-Rubato 是一个本地运行的 coding agent。它把模型推理、代码工具、项目计划、并行子任务、Git 工作流和文件式记忆组织在同一个终端工作流中。
+Rubato 是一个本地运行的 coding agent。它把模型推理、代码工具、Plan Mode、并行子任务、Git 工作流和文件式记忆组织在同一个终端工作流中。
 
-README 按六个部分介绍当前系统：基本使用、Agent Runtime、Subagent、Plan 与意图追踪、记忆系统，以及 Git 操作。
+README 按六个部分介绍当前系统：基本使用、Agent Runtime、Subagent、Plan Mode、记忆系统，以及 Git 操作。
 
 ## 1. Rubato 基本情况与使用方式
 
@@ -13,7 +13,7 @@ README 按六个部分介绍当前系统：基本使用、Agent Runtime、Subage
 - 默认进入连续对话的交互式 REPL，也支持 one-shot 和管道输入
 - 在 workspace 中读取、检索、修改文件并运行构建、测试和命令
 - 保存项目会话，支持恢复、压缩和跨会话长期记忆
-- 使用 Plan 管理复杂任务，使用 Subagent 并行探索、验证和实现
+- 使用 Plan Mode 调查并批准复杂方案，使用 Subagent 并行探索、验证和实现
 - 感知当前 Git 分支、工作树、提交历史和团队工作流
 - 通过 Skill 与 MCP 扩展能力
 
@@ -168,7 +168,7 @@ CLI 参数与环境
   → 项目规则与 CLAUDE.md
   → 已验证的全局和项目记忆
   → Git 分支、工作树和近期提交
-  → 当前 Plan 与可用 Skill
+  → 当前 Runtime Mode 与可用 Skill
   → 根 Agent system prompt
 ```
 
@@ -187,7 +187,7 @@ CLI 参数与环境
   → 模型完成本轮回答
 ```
 
-Read、Grep、Glob 等并发安全的读取工具可以在同一 step 中并行执行；Write、Edit、Bash、Plan 等写工具按顺序执行。这样的调度让检索保持并发，同时让文件修改、命令和计划状态具有确定的先后顺序。
+Read、Grep、Glob 等并发安全的读取工具可以在同一 step 中并行执行；Write、Edit、Bash 和控制类工具按顺序执行。这样的调度让检索保持并发，同时让文件修改、命令和模式转换具有确定的先后顺序。
 
 ### 内置工具
 
@@ -198,7 +198,8 @@ Rubato 注册 15 个核心工具：
 | 文件与搜索 | `Read`、`Grep`、`Glob` | 阅读文件、查找文本和枚举路径 |
 | 修改与执行 | `Write`、`Edit`、`Bash` | 创建/修改文件，运行构建、测试和 Git 命令 |
 | Web | `WebFetch`、`WebSearch` | 读取网页，通过 Tavily 搜索 |
-| 任务组织 | `TodoWrite`、`Plan` | 管理本轮待办和持久化意图树 |
+| 任务组织 | `TodoWrite` | 管理 default mode 中的临时待办 |
+| 规划提交 | `SubmitPlan` | 提交 Plan Mode 生成的最终 Markdown |
 | 多 Agent | `Agent`、`Task` | 创建与管理 Subagent 任务 |
 | 扩展 | `Skill` | 调用已加载 Skill |
 | 记忆 | `MemoryFeedback`、`MemoryPropose` | 记录记忆效果，提交可审计候选 |
@@ -207,7 +208,7 @@ MCP server 提供的工具会动态追加，并以 `mcp:<server>:<tool>` 命名�
 
 ### 上下文、压缩与会话恢复
 
-当前进程中的用户消息、Assistant 回复、工具结果、计划状态和最近文件构成 Agent 的工作上下文。当上下文接近模型窗口时，Runtime 会先整理陈旧工具结果，再把较早对话压缩为摘要，同时保留近期消息和最近访问的文件路径。`/compact` 可以手动触发同一流程。
+当前进程中的用户消息、Assistant 回复、工具结果、模式状态和最近文件构成 Agent 的工作上下文。当上下文接近模型窗口时，Runtime 会先整理陈旧工具结果，再把较早对话压缩为摘要，同时保留近期消息和最近访问的文件路径。`/compact` 可以手动触发同一流程。
 
 session 事件以 JSONL 追加，并通过 `seq`、`prev_hash`、`hash` 形成 hash chain。`-c`、`-r` 和 `/sessions resume` 从会话摘要、目标和关键事件组装紧凑恢复上下文。
 
@@ -328,83 +329,56 @@ worker 完成时要求工作树干净，并通过 `CompleteTask` 返回测试结
 /trace [task-id]              查看根 trace 或任务 transcript 路径
 ```
 
-## 4. Plan 模式与意图追踪
+## 4. Plan 模式
 
-Plan 模式把复杂请求转换为可持久化的意图树。它记录目标、澄清结果、任务层级、依赖、关键决策、预计涉及的文件和执行进度。
-
-### 从需求到计划
-
-用户明确说“规划”“计划”“先想一下”“怎么修”“怎么改”，或提出信息不足的多步任务时，Agent 会进入需求澄清。`/plan new <description>` 可以显式启动这一流程。
+Plan Mode 是 Agent Runtime 的一种会话模式。它用于先调查项目、澄清关键决策并形成可直接执行的方案，再由用户决定是否进入实现阶段。模式只由用户显式切换：
 
 ```text
-任务描述
-  → 识别任务类型与关键缺口
-  → 每批询问 2–3 个高优先级问题
-  → 汇总范围、约束、技术选择和测试要求
-  → 生成 intention tree
-  → 展示计划并等待用户确认
-  → 保存并开始执行
+/plan on       进入 Plan Mode
+/plan off      退出 Plan Mode，不执行待确认计划
+/plan status   查看当前模式、阶段和最近计划路径
+/plan          等同于 /plan status
 ```
 
-认证、数据库、API、前端等任务有对应的澄清清单；普通任务会围绕核心目标、范围边界、技术约束和验收标准提问。用户说“按默认方案”“直接给方案”或 `skip` 时，Agent 会用默认项完成计划并等待确认。
+进入后终端提示符变为 `▸ Plan:`。此时普通输入都会交给规划 Runtime；`/clear` 会清除当前会话和待确认计划，同时保留当前模式。
 
-### Intention Tree
+### 调查和澄清
 
-计划保存在当前项目：
+Plan Mode 先使用仓库证据回答能够从环境中确定的问题，再沿着决策依赖逐项澄清。需要用户选择时，每次只问一个问题，同时给出推荐答案和简短理由。规划会覆盖目标、范围、接口、数据流、异常与失败处理、兼容性、测试和验收标准，直到方案足以直接实施。
+
+整个规划过程使用 Markdown。Runtime 向模型公开的工具集合固定为：
 
 ```text
-.agent/plans/<branch>.md
+Read  Grep  Glob
+WebFetch  WebSearch
+Agent  Task
+SubmitPlan
 ```
 
-一个计划包含：
+其中 `Agent` 只可启动 `explore`、`research`、`general` 和 `verify` 类型的只读任务；`Task` 只可查询、等待和观察任务。Runtime 会在工具执行前再次校验当前模式，因此写文件、编辑、Shell、动态 MCP 工具和具有写权限的 Subagent 不会在 Plan Mode 中执行。
+
+### 提交、修订和批准
+
+方案完整后，Agent 通过 `SubmitPlan` 提交最终 Markdown。计划按项目绝对路径的 SHA-256 隔离，保存在：
 
 ```text
-PlanDoc
-├── title / status / branch
-├── goal
-├── clarifications
-├── tasks
-│   ├── pending
-│   ├── in_progress
-│   ├── done
-│   ├── blocked
-│   └── skipped
-├── decisions
-└── files
+~/.rubato/projects/<project-sha256>/plans/plan-<session-id>.md
 ```
 
-任务节点支持嵌套和 `dependsOn`。Agent 使用 `Plan` 工具创建计划、添加任务、完成节点、标记阻塞、展示状态和正式启动计划。完成一个节点后，Runtime 会激活下一个 pending 节点。
+设置 `RUBATO_HOME` 时会使用对应的数据根目录。同一个 planning session 的后续修订会原子覆盖同一文件。
 
-### Grill Me 意图追踪
-
-Grill Me 默认开启，以 `normal` 灵敏度监控两类偏离：
-
-1. **用户意图偏离**：活跃计划尚未完成时开始新任务，或修改已经执行的关键决策；
-2. **工具执行偏离**：访问计划范围外的文件，或跳过任务依赖直接修改。
-
-检测到偏离时，Rubato 会展示当前目标、进度、影响和可选动作，例如：暂停计划处理新任务、记录稍后处理、继续当前计划、修订计划或确认继续执行。
-
-灵敏度含义：
-
-| 模式 | 行为 |
-| --- | --- |
-| `strict` | 同时检查消息相关性、计划文件范围和任务依赖 |
-| `normal` | 关注明显的新任务、决策变化和范围偏移 |
-| `loose` | 只关注清晰的阻塞和重大偏离 |
-
-命令：
+提交后 CLI 展示完整计划和保存路径，并询问是否执行：
 
 ```text
-/plan                         查看当前计划
-/plan new <description>       开始需求澄清并创建计划
-/plan list                    列出已保存计划
-/plan done                    标记计划完成
-/grillme status               查看状态
-/grillme on|off               开关意图追踪
-/grillme strict|normal|loose  设置本次进程的灵敏度
+执行这个计划？输入 y 执行，或直接说明需要修改的地方：
 ```
 
-计划文件按分支持久化；Grill Me 的开关和灵敏度属于当前 Rubato 进程状态。
+- 输入 `y`、`yes`、`是`、`执行`、`开始执行` 或 `按计划执行`：计划被批准，Runtime 自动切回 default mode，并立即把完整计划作为执行上下文交给正常 Agent。
+- 输入 `n`、`no`、`否` 或 `继续规划`：保留 Plan Mode，继续调整方案。
+- 输入其他文字：作为计划反馈进入下一轮规划，新的 `SubmitPlan` 会更新本地 Markdown。
+- 输入 `/plan off`：退出 Plan Mode，不触发执行。
+
+计划批准代表可以开始实现；Git commit、push、PR 和其他外部操作仍遵循各自的正常授权规则。
 
 ## 5. 记忆系统：短期与长期记忆
 
@@ -416,7 +390,7 @@ Rubato 的记忆由短期会话上下文和长期文件记忆组成。短期层�
 
 - 用户消息与 Assistant 回复；
 - 工具调用和结果；
-- 当前 Plan、Todo 和任务结果；
+- 当前 Plan Mode 状态、Todo 和任务结果；
 - 最近读取的文件与压缩摘要。
 
 它在当前轮立即生效。接近上下文上限时，Runtime 会整理较早内容，根 Agent 保留约 60 条近期消息，Subagent 保留约 24 条，并重新提供最近访问的文件路径。
@@ -546,6 +520,7 @@ Dream 队列和租约写入文件，进程重启后可以继续。`/memory dream
     ├── sessions/<session-id>.jsonl
     ├── sessions.json
     ├── session-catalog.tsv
+    ├── plans/plan-<session-id>.md
     └── runs/<root-session-id>/
         ├── trace.jsonl
         └── tasks/<task-id>/...
@@ -555,7 +530,7 @@ release 内容受 manifest hash 保护。校验通过的 `CURRENT` release 是 A
 
 ## 6. Git 相关操作
 
-Rubato 把 Git 作为 Agent Runtime、Plan、Subagent 和项目记忆共同使用的项目事实来源与协作边界。
+Rubato 把 Git 作为 Agent Runtime、Plan Mode、Subagent 和项目记忆共同使用的项目事实来源与协作边界。
 
 ### 启动时的 Git 上下文
 
@@ -576,14 +551,11 @@ Agent 可以使用 `git status`、`git diff`、`git log`、`git branch`、`git s
 默认 Git policy：
 
 - commit、push 和创建 PR 由用户明确提出；
-- commit 前检查计划意图、改动范围和建议的 commit message；
 - push 前检查远端同步、未提交文件、分支重叠和潜在冲突；
 - destructive Git 操作进入高风险检查；
 - 根工作树保持用户当前状态，worker 的实现位于独立 worktree。
 
-### Pre-commit 与 Pre-push 检查
-
-当 Bash 即将执行 `git commit` 时，Runtime 会把 staged/changed files 与当前 Plan 的 files 和任务意图比较，提示计划外、可疑或无关文件。
+### Pre-push 检查
 
 当 Bash 即将执行 `git push` 时，Runtime 会执行 preflight：
 

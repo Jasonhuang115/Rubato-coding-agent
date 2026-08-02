@@ -15,6 +15,7 @@ import { sessionStartHook, conflictCheckHook } from "../tools/git/hooks.js";
 import { getPromptAssembler } from "../prompt/assembler.js";
 import { buildSubagentStaticPrompt } from "../prompt/static.js";
 import { buildCapabilityPrompt } from "../prompt/capability.js";
+import { roughTokenEstimate } from "../shared/tokens.js";
 
 export interface AssembledContext {
   systemPrompt: string;
@@ -26,7 +27,6 @@ export interface ContextAssemblerOptions {
   prompt: string;
   ctx: AgentContext;
   tools: ToolDefinition[];
-  providerName?: string;
   resumeSummary?: string;
   roleSystemPrompt?: string;
   contextProfile?: "root" | "subagent" | "compact";
@@ -48,7 +48,6 @@ export async function assembleContext(
     prompt,
     ctx,
     tools,
-    providerName,
     resumeSummary,
     roleSystemPrompt,
     contextProfile = "root",
@@ -68,7 +67,7 @@ export async function assembleContext(
         ),
         buildCapabilityPrompt(tools),
       ].join("\n\n")
-    : getPromptAssembler(providerName).assembleFlat(ctx, tools);
+    : getPromptAssembler().assembleFlat(ctx, tools);
 
   // 2. Build context chain
   const contextChain = new ContextChain();
@@ -111,24 +110,4 @@ export async function assembleContext(
   const systemTokens = roughTokenEstimate(systemPrompt);
 
   return { systemPrompt, systemTokens };
-}
-
-// ---- Token estimation (inline to avoid circular deps) ----
-
-function roughTokenEstimate(text: string): number {
-  let tokens = 0;
-  for (const ch of text) {
-    const code = ch.codePointAt(0) ?? 0;
-    if (
-      (code >= 0x4e00 && code <= 0x9fff) ||
-      (code >= 0x3400 && code <= 0x4dbf) ||
-      (code >= 0x3000 && code <= 0x303f) ||
-      (code >= 0xff00 && code <= 0xffef)
-    ) {
-      tokens += 1.5;
-    } else {
-      tokens += 0.25;
-    }
-  }
-  return tokens;
 }

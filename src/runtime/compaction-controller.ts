@@ -12,6 +12,7 @@ import { microCompact } from "../context/compression.js";
 import { compactViaSubagent } from "../context/compression.js";
 import { microCompactBeforeRequest } from "../context/micro-compact.js";
 import type { ReadGuardState } from "../shared/core-types.js";
+import { roughTokenEstimate } from "../shared/tokens.js";
 
 // ---- Configuration ----
 
@@ -139,27 +140,6 @@ export function runMicroCompact(messages: Message[]): MicroCompactResult {
     return { cleared: true, count: mcResult.cleared, messages: mcResult.messages };
   }
   return { cleared: false, count: 0, messages };
-}
-
-// ---- Token estimation (CJK-aware) ----
-
-/** Rough token count for a single string. CJK (~1.5 tokens/char), ASCII (~0.25 tokens/char). */
-export function roughTokenEstimate(text: string): number {
-  let tokens = 0;
-  for (const ch of text) {
-    const code = ch.codePointAt(0) ?? 0;
-    if (
-      (code >= 0x4e00 && code <= 0x9fff) ||   // CJK Unified
-      (code >= 0x3400 && code <= 0x4dbf) ||   // CJK Ext-A
-      (code >= 0x3000 && code <= 0x303f) ||   // CJK punctuation
-      (code >= 0xff00 && code <= 0xffef)      // Fullwidth forms
-    ) {
-      tokens += 1.5;
-    } else {
-      tokens += 0.25;
-    }
-  }
-  return tokens;
 }
 
 /** Estimate tokens for a message array. Pads by 4/3 for safety. */

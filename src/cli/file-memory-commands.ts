@@ -50,11 +50,6 @@ import type {
 } from "../memory-files/types.js";
 import type { UserObservation } from "../memory-files/observation.js";
 
-const LEGACY_MIGRATION_HINT =
-  "Legacy 迁移在 CLI 之外离线运行（CLI 依赖图不允许加载 SQLite）：" +
-  "npm run migrate:legacy -- <path/to/memory.db> [输出目录]。" +
-  "它只产出待复核 candidate，不会发布记忆。";
-
 interface LoadedScope {
   label: "global" | "project";
   paths: MemoryScopePaths;
@@ -177,14 +172,6 @@ export async function handleFileMemoryCommand(
     return;
   }
 
-  if (
-    action === "migrate" ||
-    action === "legacy-migrate" ||
-    (action === "legacy" && args[1] === "migrate")
-  ) {
-    console.log(`\n  ${LEGACY_MIGRATION_HINT}`);
-    return;
-  }
 
   if (action === "dream") {
     queueManualDreams(repository);
@@ -946,7 +933,7 @@ function printStats(
   const utility = memoryUtilityRanking(config);
   const lines = [
     "",
-    "  🧠 文件记忆统计（无向量库 / 无 RAG）",
+    "  🧠 文件记忆统计",
     `  学习：${policy.learning_enabled ? "运行中" : "已暂停"}`,
     `  verified cards：${cards.length}（其中项目事实 ${repositoryCards.length}）` +
     ` | observations：${observations.length} | candidates：${candidates.length} | dreams：${dreams.length}`,
@@ -982,7 +969,6 @@ function printStats(
       );
     }
   }
-  lines.push("", `  ${LEGACY_MIGRATION_HINT}`);
   console.log(lines.join("\n"));
 }
 
@@ -1343,8 +1329,7 @@ function printMemoryUsage(): void {
     "  /memory bootstrap       重新扫描项目事实（代码结构/配置/Git 历史）\n" +
     "  /memory bootstrap --check  只校验，不写入\n" +
     "  /memory retire <id-or-logical-key>  （可回滚，非隐私删除）\n" +
-    "  /memory undo [target-release-id]\n" +
-    `  ${LEGACY_MIGRATION_HINT}`,
+    "  /memory undo [target-release-id]",
   );
 }
 

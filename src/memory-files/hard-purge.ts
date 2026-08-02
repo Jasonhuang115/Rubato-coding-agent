@@ -13,11 +13,7 @@ import {
   readCurrentReleaseId,
   withMemoryScopeLock,
 } from "./release.js";
-import {
-  legacyTruncatedProjectMemoryId,
-  projectMemoryId,
-  resolveMemoryScopePaths,
-} from "./paths.js";
+import { projectMemoryId, resolveMemoryScopePaths } from "./paths.js";
 import type { MemoryCard, MemoryScopePaths } from "./types.js";
 
 export type HardPurgeIntent = "forget" | "purge";
@@ -76,8 +72,6 @@ export interface HardPurgeResidual {
   reason:
     | "unclassified_skill"
     | "symbolic_link_not_followed"
-    | "opaque_legacy_store"
-    | "unmapped_legacy_session"
     | "unsupported_artifact"
     | "unreadable"
     | "cleanup_failed"
@@ -145,19 +139,6 @@ interface SessionStoreLocation {
   summaryPath?: string;
   catalogPath?: string;
 }
-
-/**
- * retire: publish a release without the active card; history stays.
- * undo: create a new release from an older snapshot; history stays.
- * forget: hard-purge one or more identified memories (id/key required).
- * purge: incident-response hard purge; exact sensitive values are also valid.
- */
-export const MEMORY_REMOVAL_SEMANTICS = Object.freeze({
-  retire: "Remove from the active release but retain recoverable history.",
-  undo: "Create a new release from an older snapshot.",
-  forget: "Physically remove identified memories and their derived artifacts.",
-  purge: "Physically remove sensitive values and identified memories.",
-});
 
 export function previewHardPurge(options: HardPurgeOptions): HardPurgePlan {
   return buildHardPurgePlan(options).publicPlan;
@@ -360,8 +341,6 @@ function buildHardPurgePlan(options: HardPurgeOptions): InternalPlan {
     locations,
     residuals,
   );
-  detectUnsupportedStores(resolved, residuals);
-
   const purgeIds = sortedUnique([...targets.ids, ...identity.ids]);
   const purgeLogicalKeys = sortedUnique([
     ...targets.logicalKeys,
@@ -423,34 +402,16 @@ function resolveOptions(options: HardPurgeOptions): {
     ? path.dirname(suppliedRoot)
     : suppliedRoot;
   const projectId = projectMemoryId(options.workdir);
-  const truncatedId = legacyTruncatedProjectMemoryId(options.workdir);
-  const legacyId = legacyProjectId(options.workdir);
   const paths = resolveMemoryScopePaths({
     rootDir: rubatoRoot,
     scope: options.scope,
     ...(options.scope === "project" ? { projectId } : {}),
   });
-  const artifactScopePaths = options.scope === "global"
-    ? [paths]
-    : dedupeScopePaths([
-        paths,
-        resolveMemoryScopePaths({
-          rootDir: rubatoRoot,
-          scope: "project",
-          projectId: truncatedId,
-        }),
-        resolveMemoryScopePaths({
-          rootDir: rubatoRoot,
-          scope: "project",
-          projectId: legacyId,
-        }),
-      ]);
+  const artifactScopePaths = [paths];
   const sessionStorage = discoverSessionStorage(
     rubatoRoot,
     options.scope,
     projectId,
-    truncatedId,
-    legacyId,
   );
   return {
     rubatoRoot,
@@ -467,8 +428,6 @@ function discoverSessionStorage(
   rubatoRoot: string,
   scope: "global" | "project",
   projectId: string,
-  truncatedId: string,
-  legacyId: string,
 ): {
   stores: SessionStoreLocation[];
   residuals: HardPurgeResidual[];
@@ -476,11 +435,7 @@ function discoverSessionStorage(
   const residuals: HardPurgeResidual[] = [];
   let projectBaseDirs: string[];
   if (scope === "project") {
-    projectBaseDirs = [...new Set([
-      path.join(rubatoRoot, "projects", projectId),
-      path.join(rubatoRoot, "projects", truncatedId),
-      path.join(rubatoRoot, "projects", legacyId),
-    ])];
+    projectBaseDirs = [path.join(rubatoRoot, "projects", projectId)];
   } else {
     projectBaseDirs = [];
     const projectsRoot = path.join(rubatoRoot, "projects");
@@ -503,7 +458,7 @@ function discoverSessionStorage(
               });
             } else if (
               entry.isDirectory() &&
-              /^[a-zA-Z0-9._-]{1,128}$/.test(entry.name)
+              /^[a-f0-9]{64}$/.test(entry.name)
             ) {
               projectBaseDirs.push(entryPath);
             } else if (entry.isDirectory()) {
@@ -525,9 +480,6 @@ function discoverSessionStorage(
     summaryPath: path.join(projectBase, "sessions.json"),
     catalogPath: path.join(projectBase, "session-catalog.tsv"),
   }));
-  if (scope === "global") {
-    stores.push({ sessionsDir: path.join(rubatoRoot, "sessions") });
-  }
   return {
     stores,
     residuals,
@@ -1025,20 +977,6 @@ function planControlEventCleanup(
   }
 }
 
-function detectUnsupportedStores(
-  resolved: ReturnType<typeof resolveOptions>,
-  residuals: HardPurgeResidual[],
-): void {
-  const legacyDb = path.join(
-    resolved.rubatoRoot,
-    "mnemosyne",
-    "memory.db",
-  );
-  if (fs.existsSync(legacyDb)) {
-    residuals.push({ path: legacyDb, reason: "opaque_legacy_store" });
-  }
-}
-
 function scanManagedText(
   plan: InternalPlan,
   excluded: Set<string>,
@@ -1492,14 +1430,6 @@ function normalizeLines(lines: string[]): string {
   return meaningful.length > 0 ? `${meaningful.join("\n")}\n` : "";
 }
 
-function legacyProjectId(workdir: string): string {
-  return path.resolve(workdir)
-    .replace(/[^a-zA-Z0-9]/g, "-")
-    .replace(/-+/g, "-")
-    .replace(/^-|-$/g, "")
-    .slice(0, 64) || "root";
-}
-
 function compareLocations(
   left: Pick<HardPurgeLocation, "category" | "path">,
   right: Pick<HardPurgeLocation, "category" | "path">,
@@ -1540,16 +1470,6 @@ function dedupeResiduals(
 function sortedUnique(values: string[]): string[] {
   return [...new Set(values.map((value) => value.trim()).filter(Boolean))]
     .sort();
-}
-
-function dedupeScopePaths(pathsList: MemoryScopePaths[]): MemoryScopePaths[] {
-  const seen = new Set<string>();
-  return pathsList.filter((paths) => {
-    const key = path.resolve(paths.scopeDir);
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
 }
 
 function isWithin(candidate: string, root: string): boolean {

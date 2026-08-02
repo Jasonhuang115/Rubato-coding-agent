@@ -24,7 +24,6 @@ vi.mock("../src/tools/git/hooks.js", () => ({
   conflictCheckHook: vi.fn(async () => null),
   sessionEndHook: vi.fn(async () => ({ advice: [] })),
   prePushHook: vi.fn(async () => null),
-  preCommitHook: vi.fn(async () => null),
 }));
 
 const renderer: StreamRenderer = {
@@ -43,8 +42,6 @@ const renderer: StreamRenderer = {
 const config: AgentConfig = {
   model: { provider: "test", model: "test-model", maxRetries: 0 },
   permissions: { bash: "auto", read: "auto", write: "auto", edit: "auto", web: "auto" },
-  embedding: { source: "local_hash" },
-  mnemosyne: { bootstrap_on_first_open: false, bootstrap_max_files: 10 },
   session: { cleanupPeriodDays: 30 },
   subagents: {
     maxConcurrent: 2,

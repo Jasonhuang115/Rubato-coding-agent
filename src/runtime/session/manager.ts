@@ -4,14 +4,11 @@
 import { randomUUID } from "crypto";
 import fs from "fs";
 import path from "path";
-import os from "os";
 import { loadSession } from "./storage.js";
 import { writeSessionCatalog } from "./catalog.js";
 import { warnRecoverable } from "../../shared/diagnostics.js";
-import {
-  legacyTruncatedProjectMemoryId,
-  projectMemoryId,
-} from "../../memory-files/paths.js";
+import { projectMemoryId } from "../../memory-files/paths.js";
+import { getRubatoHome } from "../../shared/rubato-home.js";
 
 // ---- Types ----
 
@@ -31,18 +28,6 @@ export interface SessionRecord {
 
 function hashProjectDir(workdir: string): string {
   return projectMemoryId(workdir);
-}
-
-function legacyProjectDirId(workdir: string): string {
-  return path.resolve(workdir)
-    .replace(/[^a-zA-Z0-9]/g, "-")
-    .replace(/-+/g, "-")
-    .replace(/^-|-$/g, "")
-    .slice(0, 64) || "root";
-}
-
-function getRubatoHome(): string {
-  return path.resolve(process.env.RUBATO_HOME ?? path.join(os.homedir(), ".rubato"));
 }
 
 function getProjectBaseDir(projectHash: string): string {
@@ -70,16 +55,10 @@ function atomicWriteJson(filePath: string, data: unknown): void {
 
 export class SessionManager {
   readonly projectHash: string;
-  private readonly legacyProjectHashes: string[];
   private index: SessionRecord[] | null = null;
 
   constructor(projectDir: string) {
     this.projectHash = hashProjectDir(projectDir);
-    this.legacyProjectHashes = [
-      legacyTruncatedProjectMemoryId(projectDir),
-      legacyProjectDirId(projectDir),
-    ].filter((id, index, values) =>
-      id !== this.projectHash && values.indexOf(id) === index);
   }
 
   // ---- Index management ----
@@ -91,15 +70,8 @@ export class SessionManager {
   private loadIndex(): SessionRecord[] {
     if (this.index !== null) return this.index;
     this.ensureDir();
-    const canonicalIndexExists = fs.existsSync(getIndexPath(this.projectHash));
-    const legacy = canonicalIndexExists
-      ? []
-      : this.legacyProjectHashes.flatMap((id) => this.readIndex(id));
     const current = this.readIndex(this.projectHash);
-    const merged = new Map<string, SessionRecord>();
-    for (const record of legacy) merged.set(record.id, record);
-    for (const record of current) merged.set(record.id, record);
-    this.index = [...merged.values()];
+    this.index = current;
     return this.index;
   }
 
@@ -179,17 +151,11 @@ export class SessionManager {
     this.index = sessions.filter((s) => s.id !== id);
     this.saveIndex();
 
-    // Remove canonical and legacy transcripts when present.
-    for (const projectHash of new Set([
-      this.projectHash,
-      ...this.legacyProjectHashes,
-    ])) {
-      const sessionPath = path.join(getSessionsDir(projectHash), `${id}.jsonl`);
-      try {
-        if (fs.existsSync(sessionPath)) fs.unlinkSync(sessionPath);
-      } catch (error) {
-        warnRecoverable(`sessions:${projectHash}:remove-transcript`, error);
-      }
+    const sessionPath = path.join(getSessionsDir(this.projectHash), `${id}.jsonl`);
+    try {
+      if (fs.existsSync(sessionPath)) fs.unlinkSync(sessionPath);
+    } catch (error) {
+      warnRecoverable(`sessions:${this.projectHash}:remove-transcript`, error);
     }
   }
 
@@ -249,13 +215,7 @@ export class SessionManager {
   // ---- Paths ----
 
   getSessionPath(sessionId: string): string {
-    const canonical = path.join(getSessionsDir(this.projectHash), `${sessionId}.jsonl`);
-    if (fs.existsSync(canonical)) return canonical;
-    for (const projectHash of this.legacyProjectHashes) {
-      const legacy = path.join(getSessionsDir(projectHash), `${sessionId}.jsonl`);
-      if (fs.existsSync(legacy)) return legacy;
-    }
-    return canonical;
+    return path.join(getSessionsDir(this.projectHash), `${sessionId}.jsonl`);
   }
 
   getProjectHash(): string {
@@ -274,11 +234,4 @@ export class SessionManager {
     return hashProjectDir(workdir);
   }
 
-  static resolveLegacyProjectHash(workdir: string): string {
-    return legacyProjectDirId(workdir);
-  }
-
-  static resolveTruncatedProjectHash(workdir: string): string {
-    return legacyTruncatedProjectMemoryId(workdir);
-  }
 }

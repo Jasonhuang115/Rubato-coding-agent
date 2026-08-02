@@ -59,12 +59,6 @@ export interface DreamTriggerPolicy {
   observation_age_hours: number;
 }
 
-const TERMINAL: ReadonlySet<DreamRunStatus> = new Set([
-  "published",
-  "needs_review",
-  "rejected",
-]);
-
 const TRANSITIONS: Readonly<Record<DreamRunStatus, DreamRunStatus[]>> = {
   queued: ["leased", "rejected"],
   leased: ["running", "queued", "needs_review", "rejected"],
@@ -306,10 +300,6 @@ export function recoverExpiredDreams(
     recovered.push(failDream(dreamsDir, run.run_id, "lease_expired"));
   }
   return recovered;
-}
-
-export function isTerminalDream(run: DreamRun): boolean {
-  return TERMINAL.has(run.status);
 }
 
 function updateDreamRun(
