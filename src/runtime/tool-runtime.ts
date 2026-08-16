@@ -93,9 +93,9 @@ export class ToolRuntime {
   ): Promise<ToolRuntimeResult> {
     if (ctx.mode === "plan") {
       const allowed = new Set([
-        "Read", "Grep", "Glob", "WebFetch", "WebSearch", "Agent", "Task", "SubmitPlan",
+        "Read", "Grep", "Glob", "WebFetch", "WebSearch", "Subagent", "Task", "SubmitPlan",
       ]);
-      if (!allowed.has(toolName) && !(toolName === "CompleteTask" && ctx.taskRuntime)) {
+      if (!allowed.has(toolName)) {
         return {
           content: `Plan mode blocked tool "${toolName}". Only read-only exploration and SubmitPlan are allowed.`,
           isError: true,
@@ -120,9 +120,7 @@ export class ToolRuntime {
       };
     }
 
-    // CompleteTask is a runtime control protocol, not a project action. It
-    // bypasses ordinary permission policy but remains scoped to subagents.
-    if ((toolName === "CompleteTask" || toolName === "SubmitPlan") && scopedTool) {
+    if (toolName === "SubmitPlan" && scopedTool) {
       return this.fromToolResult(await scopedTool.handler(input, ctx));
     }
 

@@ -29,7 +29,8 @@ ${writable
   : "- You must not modify project files, run shell commands, or perform Git operations."}
 - Work only on the task in the current user message; no parent conversation history is available.
 - Ground conclusions in evidence paths and explicitly state uncertainty.
-- When finished, you MUST call CompleteTask exactly once with a self-contained Markdown report. Do not merely end with ordinary text.`,
+- Your visible assistant text is appended to report.md while you work. Record evidence, decisions, corrections, modifications, and remaining work progressively instead of waiting for a final answer.
+- End naturally once the task is complete. The report may remain partial if execution is interrupted.`,
     behaviorGuidelines(),
   ].join("\n\n");
 }

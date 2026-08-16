@@ -1,29 +1,22 @@
 // Managed subagent definitions and capability helpers.
 
-import fs from "fs";
 import type {
-  AgentConfig,
-  AgentContext,
   SubagentDefinition,
-  SubagentResult,
   ToolDefinition,
 } from "../shared/core-types.js";
 import { getTool } from "../tools/registry.js";
-import { completeTaskTool } from "../tools/complete-task.js";
-import { processSubagentRegistry } from "./subagents/registry.js";
 
 const BASIC_READ_TOOLS = ["Read", "Grep", "Glob"];
 const WORKER_TOOLS = [...BASIC_READ_TOOLS, "Write", "Edit", "Bash"];
 
-const COMPLETION_RULES = [
+const REPORTING_RULES = [
   "",
-  "## Completion protocol",
+  "## Durable report",
   "- You are read-only. Never modify files, invoke a shell, or perform Git operations.",
-  "- Finish by calling CompleteTask exactly once.",
-  "- The report must include evidence paths, conclusions, uncertainty, and recommended next steps.",
-  "- For blocked status, state the exact missing information and the question the parent should ask.",
-  "- Use partial when useful evidence exists but the full assignment could not be completed.",
-  "- For exhaustive/every-line assignments, begin with Glob(path=<exact scope root>, pattern=\"**/*\", include_hidden=true) for each scope root. Inspect every discovered source file in full (using ranged Reads when needed), declare justified file exclusions, and include coverage.exhaustive=true plus exact scope_roots in CompleteTask. Treat any Glob incomplete/skipped-path diagnostic as a real coverage gap.",
+  "- Every visible assistant text delta is appended to a durable Markdown report.",
+  "- Record useful evidence, decisions, corrections, and remaining work as you proceed; do not wait until the end to start reporting.",
+  "- Choose headings that fit the task. Avoid filler narration and do not rely on a final message to carry the result.",
+  "- For exhaustive/every-line assignments, begin with Glob(path=<exact scope root>, pattern=\"**/*\", include_hidden=true) for each scope root and inspect every discovered source file in full.",
   "- Never claim exhaustive completion while any discovered file is unread, partially read, failed, or outside a closed discovery root.",
   "- Do not paste large raw tool outputs into the report.",
 ].join("\n");
@@ -34,11 +27,10 @@ export const EXPLORE_DEF: SubagentDefinition = {
   systemPrompt: [
     "You are a code exploration subagent. Search the project broadly and report grounded findings.",
     "Locate relevant files, symbols, call paths, conventions, and risks.",
-    COMPLETION_RULES,
+    REPORTING_RULES,
   ].join("\n"),
   tools: BASIC_READ_TOOLS,
   readonly: true,
-  canSpawn: false,
 };
 
 export const RESEARCH_DEF: SubagentDefinition = {
@@ -47,11 +39,10 @@ export const RESEARCH_DEF: SubagentDefinition = {
   systemPrompt: [
     "You are a research subagent. Collect and reconcile evidence from project files and readonly web sources.",
     "Distinguish sourced facts, project-local observations, and inference.",
-    COMPLETION_RULES,
+    REPORTING_RULES,
   ].join("\n"),
   tools: [...BASIC_READ_TOOLS, "WebFetch", "WebSearch"],
   readonly: true,
-  canSpawn: false,
 };
 
 export const VERIFY_DEF: SubagentDefinition = {
@@ -60,26 +51,21 @@ export const VERIFY_DEF: SubagentDefinition = {
   systemPrompt: [
     "You are a verification subagent. Critically inspect code and claims without executing tests.",
     "Identify unsupported claims, edge cases, test gaps, and evidence with file paths and line references.",
-    COMPLETION_RULES,
+    REPORTING_RULES,
   ].join("\n"),
   tools: BASIC_READ_TOOLS,
   readonly: true,
-  canSpawn: false,
 };
 
 export const GENERAL_DEF: SubagentDefinition = {
   name: "general",
-  description: "Complex read-only analysis, decomposition, and recursive coordination.",
+  description: "Complex read-only analysis and synthesis.",
   systemPrompt: [
     "You are a general read-only analysis subagent.",
-    "You may delegate only genuinely independent evidence gathering, specialist analysis, or verification.",
-    "Do not delegate simple reads, strongly sequential steps, or work you can complete quickly yourself.",
-    "Never delegate code modification. Nested tasks must be required and return evidence, conclusions, uncertainty, and next steps.",
-    COMPLETION_RULES,
+    REPORTING_RULES,
   ].join("\n"),
-  tools: [...BASIC_READ_TOOLS, "Agent"],
+  tools: BASIC_READ_TOOLS,
   readonly: true,
-  canSpawn: true,
 };
 
 export const WORKER_DEF: SubagentDefinition = {
@@ -89,19 +75,18 @@ export const WORKER_DEF: SubagentDefinition = {
     "You are an implementation worker in an isolated Git worktree.",
     "Work only in the current working directory. Do not switch to another checkout or worktree.",
     "Inspect the assigned scope, implement the requested change, and run the required tests.",
-    "Before CompleteTask, stage and commit every deliverable with a descriptive commit message.",
-    "CompleteTask must report tests, the commit hash, changed files, and any scope deviation.",
+    "Commit every deliverable with a descriptive commit message before ending.",
+    "Record tests, the commit hash, changed files, and any scope deviation in the durable report as you work.",
     "Do not push or open a pull request unless the task explicitly asks for it.",
     "",
-    "## Completion protocol",
+    "## Durable report",
     "- Run git status --porcelain before finishing; it must be empty.",
-    "- Finish by calling CompleteTask exactly once with a self-contained Markdown report.",
-    "- Use partial when changes remain uncommitted or verification is incomplete.",
+    "- Every visible assistant text delta is appended to report.md; record progress and evidence continuously.",
+    "- If verification is incomplete, state the exact gap before ending.",
   ].join("\n"),
   tools: WORKER_TOOLS,
   readonly: false,
   isolation: "worktree",
-  canSpawn: false,
 };
 
 const BUILTIN_DEFS: Record<string, SubagentDefinition> = {
@@ -129,8 +114,6 @@ export function getBuiltinDefinition(name: string): SubagentDefinition {
  */
 export function resolveSubagentTools(
   definition: SubagentDefinition,
-  depth: number,
-  maxDepth = 3,
   worktreeReady = definition.isolation === "worktree",
 ): ToolDefinition[] {
   if (definition.name === "compact") return [];
@@ -141,63 +124,12 @@ export function resolveSubagentTools(
   const safeNames = new Set([
     ...BASIC_READ_TOOLS,
     ...(definition.name === "research" || isCustom ? ["WebFetch", "WebSearch"] : []),
-    ...(definition.name === "general" && definition.canSpawn && depth < maxDepth ? ["Agent"] : []),
     ...(definition.isolation === "worktree" && worktreeReady
       ? ["Write", "Edit", "Bash"]
       : []),
   ]);
-  const tools = requested
+  return requested
     .filter((name) => safeNames.has(name))
     .map((name) => getTool(name))
     .filter((tool): tool is ToolDefinition => tool !== undefined);
-  tools.push(completeTaskTool);
-  return tools;
-}
-
-export async function spawnSubagent(
-  definition: SubagentDefinition,
-  task: string,
-  parentCtx: AgentContext,
-  parentConfig: AgentConfig,
-): Promise<SubagentResult> {
-  const rootSessionId = parentCtx.taskRuntime?.rootSessionId ?? parentCtx.sessionId;
-  const runtime = processSubagentRegistry.getOrCreate(
-    rootSessionId,
-    parentCtx.workingDir,
-    parentConfig,
-  );
-  const depth = (parentCtx.taskRuntime?.depth ?? parentCtx.depth ?? 0) + 1;
-  const submitted = runtime.submit({
-    description: `${definition.name} subagent`,
-    prompt: task,
-    subagent_type: definition.name,
-    dependency: "required",
-    model: definition.model,
-  }, parentCtx, definition, resolveSubagentTools(definition, depth, runtime.limits.maxDepth));
-  const result = await submitted.result;
-  return {
-    status: result.status,
-    agentId: result.agentId,
-    taskId: result.taskId,
-    output: readReportPreview(result.reportPath),
-    summary: result.summary,
-    usage: result.usage,
-    resultPath: result.reportPath,
-    transcriptPath: result.transcriptPath,
-    coveragePath: result.coveragePath,
-    reportPath: result.reportPath,
-    resultJsonPath: result.resultPath,
-    filesChanged: result.workspace?.filesChanged ?? [],
-    workspace: result.workspace ?? null,
-    patch: result.workspace?.patchPath ?? null,
-  };
-}
-
-function readReportPreview(reportPath: string): string {
-  try {
-    // Avoid a default full report injection into the parent context.
-    return fs.readFileSync(reportPath, "utf8").slice(0, 4_000);
-  } catch {
-    return "";
-  }
 }

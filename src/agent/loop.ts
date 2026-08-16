@@ -15,7 +15,6 @@ import type {
   StreamRenderer,
   ToolDefinition,
   ConfirmDecision,
-  CompleteTaskInput,
   PlanReadyControl,
   SubagentRuntimeContext,
 } from "../shared/core-types.js";
@@ -73,8 +72,6 @@ export type AgentEvent =
   | { type: "done"; reason: string }
   | { type: "compacting"; reason: string }
   | { type: "waiting_for_input" }
-  | { type: "completion_retry"; attempt: number }
-  | { type: "task_completion"; completion: CompleteTaskInput }
   | { type: "plan_ready"; plan: PlanReadyControl };
 
 // ---- Abort mechanism (delegates to StepExecutor) ----
@@ -110,8 +107,6 @@ export interface AgentLoopOptions {
   contextProfile?: "root" | "subagent" | "compact";
   abortSignal?: AbortSignal;
   taskRuntime?: SubagentRuntimeContext;
-  /** Extra model turns reserved solely for submitting CompleteTask. */
-  completionRetryTurns?: number;
   /** Root CLI session mode; omitted contexts always use default mode. */
   modeController?: AgentModeController;
 }
@@ -230,18 +225,10 @@ export async function* agentLoop(
   // ---- Main turn loop ----
   const configuredMaxTurns = options.maxTurns ??
     (options.contextProfile === "subagent" ? Number.POSITIVE_INFINITY : DEFAULT_MAX_TURNS);
-  const completionRetryTurns = options.taskRuntime
-    ? Math.max(0, options.completionRetryTurns ?? 1)
-    : 0;
-  const maxTurns = Number.isFinite(configuredMaxTurns)
-    ? configuredMaxTurns + completionRetryTurns
-    : configuredMaxTurns;
   let doneReason: string | null = null;
-  let forcingCompletion = false;
-  let completionRetryCount = 0;
   let assembledMode = ctx.mode;
 
-  for (let turn = 0; turn < maxTurns && !doneReason; turn++) {
+  for (let turn = 0; turn < configuredMaxTurns && !doneReason; turn++) {
     if (options.abortSignal?.aborted) {
       doneReason = "cancelled";
       break;
@@ -330,15 +317,13 @@ export async function* agentLoop(
     let turnResult;
     const preTurnMessageCount = messages.length;
     try {
-      const turnTools = forcingCompletion
-        ? tools.filter((tool) => tool.name === "CompleteTask")
-        : tools;
+      const runtimeStatus = isRootProfile ? formatSubagentStatus(rootRuntime) : "";
       turnResult = yield* executeTurn({
         provider,
         model: config.model.model,
-        systemPrompt,
+        systemPrompt: runtimeStatus ? `${systemPrompt}\n\n${runtimeStatus}` : systemPrompt,
         messages,
-        tools: turnTools,
+        tools,
         renderer,
         workingDir,
         ctx,
@@ -376,6 +361,37 @@ export async function* agentLoop(
           reason: "user_interrupt",
         });
         yield { type: "warning", message: "Interrupted (Ctrl+C)" };
+        if (options.getNextUserMessage) {
+          yield { type: "waiting_for_input" };
+          const runtime = processSubagentRegistry.get(sessionId);
+          let nextMessage: string | null = null;
+          if (runtime?.hasPendingTasks()) {
+            const waitController = new AbortController();
+            const next = await Promise.race([
+              options.getNextUserMessage(waitController.signal)
+                .then((message) => ({ kind: "user" as const, message })),
+              runtime.inbox.wait(waitController.signal)
+                .then((event) => ({ kind: "inbox" as const, event })),
+            ]);
+            waitController.abort();
+            if (next.kind === "inbox") {
+              messages.push({ role: "user", content: formatInboxEvents([next.event]) });
+              continue;
+            }
+            nextMessage = next.message;
+          } else {
+            nextMessage = await options.getNextUserMessage();
+          }
+          if (nextMessage?.trim()) {
+            const rawMessage = nextMessage.trim();
+            const transformed = modeController.transformUserInput(rawMessage);
+            ctx.mode = modeController.mode;
+            delegationGate?.observeUserMessage(rawMessage);
+            messages.push({ role: "user", content: transformed.modelMessage });
+            if (persistConversation) sessionStore.writeMessage({ role: "user", content: rawMessage });
+            continue;
+          }
+        }
         doneReason = "user_interrupt";
         break;
       }
@@ -464,11 +480,6 @@ export async function* agentLoop(
       usage: usage ? { input: usage.input, output: usage.output } : undefined,
     };
 
-    if (control?.type === "task_completion") {
-      yield { type: "task_completion", completion: control.completion };
-      doneReason = "task_completion";
-      break;
-    }
     if (control?.type === "plan_ready") {
       modeController.markReady(control);
       rootRuntime?.trace.append({
@@ -513,48 +524,8 @@ export async function* agentLoop(
       continue;
     }
 
-    if (
-      options.taskRuntime &&
-      !options.taskRuntime.completionSubmitted &&
-      !forcingCompletion &&
-      Number.isFinite(configuredMaxTurns) &&
-      turn + 1 >= configuredMaxTurns &&
-      completionRetryCount < completionRetryTurns
-    ) {
-      completionRetryCount++;
-      forcingCompletion = true;
-      messages.push({
-        role: "user",
-        content: buildForcedCompletionMessage(options.taskRuntime),
-      });
-      yield { type: "completion_retry", attempt: completionRetryCount };
-      continue;
-    }
-
-    if (forcingCompletion) {
-      // A forced turn is deliberately bounded. If it did not successfully
-      // submit CompleteTask, TaskRunner will recover a readable partial from
-      // all observable text and tool activity.
-      doneReason = "missing_task_completion";
-      break;
-    }
-
     // ---- End turn? ----
     if (stopReason === "end_turn" || toolUses.length === 0) {
-      if (
-        options.taskRuntime &&
-        !options.taskRuntime.completionSubmitted &&
-        completionRetryCount < completionRetryTurns
-      ) {
-        completionRetryCount++;
-        forcingCompletion = true;
-        messages.push({
-          role: "user",
-          content: buildForcedCompletionMessage(options.taskRuntime),
-        });
-        yield { type: "completion_retry", attempt: completionRetryCount };
-        continue;
-      }
       const runtime = options.contextProfile === "subagent"
         ? undefined
         : processSubagentRegistry.get(sessionId);
@@ -580,7 +551,7 @@ export async function* agentLoop(
       if (options.getNextUserMessage) {
         yield { type: "waiting_for_input" };
         let nextMessage: string | null;
-        if (runtime?.hasPendingAdvisory()) {
+        if (runtime?.hasPendingTasks()) {
           const waitController = new AbortController();
           const next = await Promise.race([
             options.getNextUserMessage(waitController.signal)
@@ -653,6 +624,7 @@ export async function* agentLoop(
 
     // ---- Tool denied → interactive wait ----
     if (toolDenied) {
+      if (options.taskRuntime) continue;
       yield { type: "warning", message: "Tool denied — stopping for your input." };
       if (options.getNextUserMessage) {
         yield { type: "waiting_for_input" };
@@ -685,23 +657,6 @@ export async function* agentLoop(
       break;
     }
 
-    // Preserve maxTurns as the research-turn budget. A finite limit gets one
-    // reserved completion-only turn rather than losing all accumulated work.
-    if (
-      options.taskRuntime &&
-      !options.taskRuntime.completionSubmitted &&
-      Number.isFinite(configuredMaxTurns) &&
-      turn + 1 >= configuredMaxTurns &&
-      completionRetryCount < completionRetryTurns
-    ) {
-      completionRetryCount++;
-      forcingCompletion = true;
-      messages.push({
-        role: "user",
-        content: buildForcedCompletionMessage(options.taskRuntime),
-      });
-      yield { type: "completion_retry", attempt: completionRetryCount };
-    }
   }
 
   if (!doneReason) {
@@ -790,49 +745,34 @@ export async function* agentLoop(
 
 function formatInboxEvents(events: TaskInboxEvent[]): string {
   return [
-    "[Runtime notification: advisory subagent results are now available.]",
+    "[Runtime notification: Subagent task state changed.]",
     ...events.flatMap((event) => event.results.map((result) => [
-      `Task completed: ${result.summary}`,
       `Task ID: ${result.taskId}`,
       `Status: ${result.status}`,
       `Report: ${result.reportPath}`,
-      `Result: ${result.resultPath}`,
-      `Coverage: ${result.coveragePath}`,
-      ...(result.workspace
-        ? [
-            `Worktree: ${result.workspace.path}`,
-            `Branch: ${result.workspace.branch}`,
-            `Base commit: ${result.workspace.baseCommit}`,
-            `Head commit: ${result.workspace.headCommit}`,
-            `Commits: ${result.workspace.commits.join(", ") || "(none)"}`,
-            `Changed files: ${result.workspace.filesChanged.join(", ") || "(none)"}`,
-            `Dirty: ${result.workspace.dirty}`,
-            `Patch: ${result.workspace.patchPath}`,
-          ]
-        : []),
-      "Read the report if needed, then supplement or revise the earlier response.",
+      ...(result.error ? [`Error: ${result.error.slice(0, 240)}`] : []),
+      "Use Grep or Read on the report only if it is relevant to the current conversation.",
     ].join("\n"))),
   ].join("\n\n");
 }
 
-function buildForcedCompletionMessage(runtime: SubagentRuntimeContext): string {
-  const coverage = runtime.coverage?.snapshot();
-  const coverageLine = coverage
-    ? [
-        `Observable coverage: discovered=${coverage.discovered}`,
-        `inspected=${coverage.inspected}`,
-        `excluded=${coverage.excluded}`,
-        `failed=${coverage.failed}`,
-        `discovery_complete=${coverage.discovery_complete}`,
-      ].join(", ")
-    : "Observable coverage is unavailable.";
+export function formatSubagentStatus(
+  runtime: ReturnType<typeof processSubagentRegistry.get>,
+): string {
+  const tasks = runtime?.list() ?? [];
+  if (tasks.length === 0) return "";
   return [
-    "[Runtime completion required]",
-    "You ended without successfully submitting CompleteTask.",
-    "Do not perform more investigation. Use the evidence already present in this conversation.",
-    "Now call CompleteTask exactly once with a self-contained, readable Markdown report.",
-    "If evidence or exhaustive coverage is incomplete, use status=partial and state the precise gaps; never claim full coverage.",
-    coverageLine,
+    "## Current Subagent tasks",
+    "This is an ephemeral runtime snapshot. Reports are not loaded automatically.",
+    ...tasks.map((task) => [
+      `- task_id: ${task.taskId}`,
+      `  description: ${task.description.replace(/\s+/g, " ").slice(0, 200)}`,
+      `  status: ${task.status}`,
+      `  report: ${task.artifacts.report}`,
+      ...(task.failureKind ? [`  failure_kind: ${task.failureKind}`] : []),
+      ...(task.error ? [`  error: ${task.error.replace(/\s+/g, " ").slice(0, 240)}`] : []),
+    ].join("\n")),
+    "Use Grep first and then a targeted Read when a report is relevant. Do not infer its contents from status or path.",
   ].join("\n");
 }
 

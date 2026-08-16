@@ -119,6 +119,7 @@ export async function processStream(
   },
   renderer: StreamRenderer,
   onActivity?: (activity: string, toolName?: string) => void,
+  onTextDelta?: (text: string) => void,
 ): Promise<StreamResult> {
   let text = "";
   const toolUses: ToolUseBlock[] = [];
@@ -132,6 +133,7 @@ export async function processStream(
     switch (event.type) {
       case "text_delta":
         text += event.text;
+        onTextDelta?.(event.text);
         renderer.renderAssistantMessage(event.text);
         break;
 
@@ -221,6 +223,7 @@ export async function* executeTurn(
         { model, system: systemPrompt, messages, tools, maxTokens: DEFAULT_MAX_TOKENS, signal: abortController.signal },
         renderer,
         ctx.taskRuntime?.onActivity,
+        ctx.taskRuntime?.onTextDelta,
       );
 
       clearTimeout(timeout);
@@ -272,6 +275,7 @@ export async function* executeTurn(
   }
 
   const { text, toolUses, usage, stopReason } = streamResult;
+  ctx.taskRuntime?.onTextFlush?.();
 
   // Add assistant message to conversation
   const assistantBlocks: import("../shared/core-types.js").ContentBlock[] = [];
@@ -295,9 +299,7 @@ export async function* executeTurn(
   let toolDenied = false;
   let control: AgentControl | undefined;
   const toolExecutions: TurnResult["toolExecutions"] = [];
-  const completionIndex = toolUses.findIndex((toolUse) =>
-    toolUse.name === "CompleteTask" || toolUse.name === "SubmitPlan"
-  );
+  const completionIndex = toolUses.findIndex((toolUse) => toolUse.name === "SubmitPlan");
   const executableToolUses = completionIndex >= 0
     ? toolUses.slice(0, completionIndex + 1)
     : toolUses;
@@ -401,7 +403,6 @@ export async function* executeTurn(
     );
     if (result.denied) toolDenied = true;
     if (result.control) control = result.control;
-    if (result.control?.type === "task_completion") break;
     toolExecutions.push({
       id: tu.id,
       name: tu.name,

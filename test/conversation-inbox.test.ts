@@ -6,48 +6,33 @@ function result(taskId: string): TaskResult {
   return {
     taskId,
     agentId: `agent-${taskId}`,
-    status: "completed",
-    summary: `${taskId} complete`,
+    status: "finished",
     reportPath: `/tmp/${taskId}/report.md`,
     resultPath: `/tmp/${taskId}/result.json`,
     transcriptPath: `/tmp/${taskId}/transcript.jsonl`,
+    coveragePath: `/tmp/${taskId}/coverage.json`,
     usage: { inputTokens: 1, outputTokens: 1, toolCalls: 0 },
     endedAt: Date.now(),
   };
 }
 
-describe("ConversationInbox acknowledgement", () => {
-  it("suppresses a completion acknowledged before its delivery microtask flushes", async () => {
-    const inbox = new ConversationInbox("root");
-    expect(inbox.deliver(result("task-a"))).toBe(true);
-    expect(inbox.acknowledge(["task-a"])).toEqual(["task-a"]);
-
-    await Promise.resolve();
-
-    expect(inbox.drain()).toEqual([]);
-    expect(inbox.deliver(result("task-a"))).toBe(false);
-  });
-
-  it("removes only acknowledged tasks from a grouped completion event", async () => {
+describe("ConversationInbox terminal delivery", () => {
+  it("batches same-tick terminal changes with minimal payloads", async () => {
     const inbox = new ConversationInbox("root");
     inbox.deliver(result("task-a"));
     inbox.deliver(result("task-b"));
     await Promise.resolve();
-
-    inbox.acknowledge(["task-a"]);
-
-    const events = inbox.drain();
-    expect(events).toHaveLength(1);
-    expect(events[0].taskIds).toEqual(["task-b"]);
-    expect(events[0].results.map((item) => item.taskId)).toEqual(["task-b"]);
+    const [event] = inbox.drain();
+    expect(event.taskIds).toEqual(["task-a", "task-b"]);
+    expect(Object.keys(event.results[0]).sort()).toEqual([
+      "error", "reportPath", "status", "taskId",
+    ]);
   });
 
-  it("consumes a waited event exactly once", async () => {
+  it("delivers each task once and wait consumes one event", async () => {
     const inbox = new ConversationInbox("root");
-    inbox.deliver(result("task-a"));
-
+    expect(inbox.deliver(result("task-a"))).toBe(true);
     const event = await inbox.wait();
-
     expect(event.taskIds).toEqual(["task-a"]);
     expect(inbox.drain()).toEqual([]);
     expect(inbox.deliver(result("task-a"))).toBe(false);

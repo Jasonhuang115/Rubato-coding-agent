@@ -70,18 +70,30 @@ export class ArtifactStore {
 
   initializeTask(task: TaskDetail): void {
     fs.mkdirSync(task.artifacts.taskDir, { recursive: true });
+    if (!fs.existsSync(task.artifacts.report)) {
+      fs.writeFileSync(
+        task.artifacts.report,
+        redactText([
+          `# ${task.description}`,
+          "",
+          `- Task ID: \`${task.taskId}\``,
+          `- Subagent: \`${task.subagentType}\``,
+          `- Created: ${new Date(task.createdAt).toISOString()}`,
+          ...(task.scope?.length ? [`- Scope: ${task.scope.join(", ")}`] : []),
+          "",
+        ].join("\n")),
+        "utf8",
+      );
+    }
     writeJsonAtomic(task.artifacts.task, redactValue({
       taskId: task.taskId,
       agentId: task.agentId,
       rootSessionId: task.rootSessionId,
-      parentTaskId: task.parentTaskId,
       description: task.description,
       prompt: task.prompt,
       subagentType: task.subagentType,
-      dependency: task.dependency,
       scope: task.scope,
       workspace: task.workspace,
-      depth: task.depth,
       createdAt: task.createdAt,
     }));
   }
@@ -91,14 +103,11 @@ export class ArtifactStore {
       taskId: task.taskId,
       agentId: task.agentId,
       rootSessionId: task.rootSessionId,
-      parentTaskId: task.parentTaskId,
       description: task.description,
       prompt: task.prompt,
       subagentType: task.subagentType,
-      dependency: task.dependency,
       scope: task.scope,
       workspace: task.workspace,
-      depth: task.depth,
       createdAt: task.createdAt,
     }));
   }
@@ -106,11 +115,10 @@ export class ArtifactStore {
   finalizeTask(
     task: TaskDetail,
     result: TaskResult,
-    report: string,
     coverage: CoverageManifest = emptyCoverageManifest(false),
   ): void {
     fs.mkdirSync(task.artifacts.taskDir, { recursive: true });
-    fs.writeFileSync(task.artifacts.report, redactText(report), "utf8");
+    if (!fs.existsSync(task.artifacts.report)) fs.writeFileSync(task.artifacts.report, "", "utf8");
     writeJsonAtomic(task.artifacts.coverage, redactValue(coverage));
     writeJsonAtomic(task.artifacts.result, redactValue({
       ...result,
@@ -118,6 +126,13 @@ export class ArtifactStore {
       coverage: result.coverage ?? coverageSummary(coverage),
     }));
     this.deriveTranscript(task.taskId, task.artifacts.transcript);
+  }
+
+  appendReport(taskId: string, content: string): void {
+    if (!content) return;
+    const paths = this.paths(taskId);
+    fs.mkdirSync(paths.taskDir, { recursive: true });
+    fs.appendFileSync(paths.report, redactText(content), "utf8");
   }
 
   writeBlob(taskId: string, content: string): {
@@ -246,8 +261,8 @@ export class ArtifactStore {
         const result: TaskResult = {
           taskId,
           agentId: task.agentId,
-          status: "orphaned",
-          summary: "Task was running when the previous Rubato process exited.",
+          status: "failed",
+          failureKind: "interrupted",
           reportPath: paths.report,
           resultPath: paths.result,
           transcriptPath: paths.transcript,
@@ -267,18 +282,20 @@ export class ArtifactStore {
             description: "",
             prompt: "",
             subagentType: "",
-            dependency: "required",
-            status: "orphaned",
-            depth: 1,
+            status: "failed",
             createdAt: task.createdAt ?? endedAt,
             endedAt,
             lastActivityAt: endedAt,
-            childCount: 0,
+            failureKind: "interrupted",
+            error: "Recovered without a live task process.",
             workspace: task.workspace,
             artifacts: paths,
           },
           result,
-          "# Orphaned task\n\nThe prior Rubato process exited before this task reached a terminal state.",
+        );
+        this.appendReport(
+          taskId,
+          "\n\nThe prior Rubato process exited before this task reached a terminal state.\n",
         );
         recovered.push(result);
       } catch {

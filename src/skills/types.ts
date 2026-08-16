@@ -34,14 +34,6 @@ export interface SkillDefinition {
    *  Fork-mode skills are exposed as a callable tool; inline skills live in system prompt. */
   allowModelInvocation?: boolean;
 
-  /** Max turns for fork-mode subagent (default 15) */
-  maxTurns?: number;
-
-  /** Tools to pre-authorize during this skill's execution (fork mode).
-   *  Format: ["Bash(git add *)", "Bash(git commit *)"] or "Bash(git add *), Bash(git commit *)"
-   *  Grant clears after the skill's turn completes. */
-  allowedTools?: string[];
-
   /** File path this skill was loaded from (set by loader) */
   sourcePath?: string;
 

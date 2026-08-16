@@ -48,10 +48,6 @@ function parseAgentFile(filePath: string): SubagentDefinition | null {
   if (requestsWrite && isolation !== "worktree") {
     throw new Error("Write, Edit, and Bash require `isolation: worktree`.");
   }
-  if (requestsWrite && fm.canSpawn === true) {
-    console.warn(`Custom writer "${fName}" cannot spawn subagents; canSpawn was disabled.`);
-  }
-
   return {
     name: fName,
     description: fDesc,
@@ -60,8 +56,6 @@ function parseAgentFile(filePath: string): SubagentDefinition | null {
     model: (fm.model as string) ?? "inherit",
     readonly: !requestsWrite,
     isolation,
-    canSpawn: requestsWrite ? false : fm.canSpawn === true,
-    maxTurns: (fm.maxTurns as number) || undefined,
   };
 }
 

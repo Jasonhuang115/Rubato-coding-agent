@@ -162,8 +162,6 @@ export function scanSkillsDir(dir: string): SkillDefinition[] {
  *   tools: Read, Grep, Glob, Bash
  *   model: inherit
  *   context: inline           # inline (default) | fork
- *   maxTurns: 15              # fork-mode only
- *   allowed-tools: Bash(git add *) Bash(git commit *)
  *   disable-model-invocation: false
  *   ---
  *   System prompt body...
@@ -194,9 +192,6 @@ export function parseSkillFile(filePath: string): SkillDefinition | null {
       allowModelInvocation: fm["disable-model-invocation"] !== undefined
         ? !(fm["disable-model-invocation"] as boolean)
         : true,
-      maxTurns:
-        fm.maxTurns !== undefined ? (fm.maxTurns as number) : undefined,
-      allowedTools: parseAllowedTools(fm["allowed-tools"]),
     };
   } catch (error) {
     warnRecoverable(`skills:${filePath}:parse`, error);
@@ -228,32 +223,6 @@ function parseContextField(val: unknown): "inline" | "fork" | undefined {
   const s = String(val).trim().toLowerCase();
   if (s === "inline") return "inline";
   if (s === "fork") return "fork";
-  return undefined;
-}
-
-/**
- * Parse allowed-tools field. Supports two formats:
- *   - YAML list: ["Bash(git add *)", "Bash(git commit *)"]
- *   - YAML string: "Bash(git add *), Bash(git commit *)"
- *   - Single string: "Bash(git add *)"
- * Returns undefined if not specified.
- */
-function parseAllowedTools(val: unknown): string[] | undefined {
-  if (val === undefined || val === null) return undefined;
-  if (Array.isArray(val)) {
-    const rules = val.map((s) => String(s).trim()).filter((s) => s.length > 0);
-    return rules.length > 0 ? rules : undefined;
-  }
-  if (typeof val === "string") {
-    const trimmed = val.trim();
-    if (!trimmed) return undefined;
-    // Could be comma-separated
-    const rules = trimmed
-      .split(",")
-      .map((s) => s.trim())
-      .filter((s) => s.length > 0);
-    return rules.length > 0 ? rules : undefined;
-  }
   return undefined;
 }
 

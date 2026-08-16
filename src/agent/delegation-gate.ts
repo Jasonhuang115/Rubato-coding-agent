@@ -27,16 +27,12 @@ export class RootDelegationGate {
     input: Record<string, unknown>;
   }>): void {
     this.readDelegationPlanned = this.required &&
-      toolCalls.some((call) => isAdvisoryAgentCall(call.name, call.input));
+      toolCalls.some((call) => call.name === "Subagent");
   }
 
-  check(toolName: string, input: Record<string, unknown> = {}): string | null {
+  check(toolName: string, _input: Record<string, unknown> = {}): string | null {
     if (!this.required || this.delegated) return null;
-    if (toolName === "Agent") {
-      return isAdvisoryAgentCall(toolName, input)
-        ? null
-        : "Runtime delegation gate requires dependency=\"advisory\" for the first parallel subagent.";
-    }
+    if (toolName === "Subagent") return null;
     if (toolName === "TodoWrite" || toolName === "Plan") {
       return null;
     }
@@ -51,13 +47,13 @@ export class RootDelegationGate {
     return [
       "Runtime delegation gate blocked this tool call.",
       "The user explicitly requested parallel work across multiple scopes.",
-      "First call Agent with a concrete non-overlapping scope and dependency=\"advisory\".",
+      "First call Subagent with a concrete non-overlapping scope.",
       "Retain a different meaningful scope for the root Agent, then continue both in parallel.",
     ].join(" ");
   }
 
   recordToolResult(toolName: string, succeeded: boolean): void {
-    if (toolName === "Agent" && succeeded) this.delegated = true;
+    if (toolName === "Subagent" && succeeded) this.delegated = true;
   }
 
   get isRequired(): boolean {
@@ -72,11 +68,4 @@ export function requiresParallelDelegation(message: string): boolean {
     /(?:所有|全部|各个|每个|多个|多项|all|every|multiple)\s*(?:的\s*)?(?:项目|仓库|目录|模块|子系统|projects?|repositor(?:y|ies)|directories|modules?|subsystems?)/i
       .test(message);
   return explicitParallel && multipleScopes;
-}
-
-function isAdvisoryAgentCall(
-  toolName: string,
-  input: Record<string, unknown>,
-): boolean {
-  return toolName === "Agent" && input.dependency === "advisory";
 }

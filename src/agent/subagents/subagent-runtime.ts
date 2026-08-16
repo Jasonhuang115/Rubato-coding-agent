@@ -4,6 +4,7 @@ import type {
   AgentContext,
   AgentTaskInput,
   SubagentDefinition,
+  SubagentFailureKind,
   SubagentLimits,
   SubagentTaskStatus,
   TaskDetail,
@@ -11,23 +12,20 @@ import type {
   TaskService,
   TaskSummary,
   ToolDefinition,
+  WorkspaceResult,
 } from "../../shared/core-types.js";
+import { WorktreeManager } from "../worktrees/worktree-manager.js";
 import { ArtifactStore } from "./artifact-store.js";
 import { ConversationInbox } from "./conversation-inbox.js";
+import { coverageSummary, emptyCoverageManifest } from "./coverage.js";
 import { TaskRunner, type TaskRunnerOutput } from "./task-runner.js";
 import { TaskScheduler } from "./task-scheduler.js";
 import { TraceSink } from "./trace-sink.js";
-import { coverageSummary, emptyCoverageManifest } from "./coverage.js";
-import { WorktreeManager } from "../worktrees/worktree-manager.js";
 
 export const DEFAULT_SUBAGENT_LIMITS: SubagentLimits = {
   maxConcurrent: 4,
   maxWriteConcurrent: 2,
   maxTasksPerSession: 32,
-  maxDepth: 3,
-  stallTimeoutMs: 15 * 60_000,
-  hardTimeoutMs: 2 * 60 * 60_000,
-  maxTurns: undefined,
   artifactTtlDays: 30,
   artifactSoftLimitBytes: 2 * 1024 * 1024 * 1024,
 };
@@ -35,17 +33,13 @@ export const DEFAULT_SUBAGENT_LIMITS: SubagentLimits = {
 interface TaskRecord {
   detail: TaskDetail;
   controller: AbortController;
-  resolve: (result: TaskResult) => void;
-  promise: Promise<TaskResult>;
-  forcedStatus?: "timed_out" | "cancelled";
-  children: Set<string>;
-  onConfirmTool?: AgentContext["onConfirmTool"];
   writer: boolean;
+  forcedFailureKind?: SubagentFailureKind;
+  terminalDelivered: boolean;
 }
 
 export interface SubmittedTask {
   task: TaskDetail;
-  result: Promise<TaskResult>;
 }
 
 export type TaskStatusListener = (task: TaskSummary) => void;
@@ -60,10 +54,10 @@ export class SubagentRuntime implements TaskService {
   private readonly runner: Pick<TaskRunner, "run">;
   private readonly tasks = new Map<string, TaskRecord>();
   private readonly listeners = new Set<TaskStatusListener>();
-  private confirmationTail: Promise<void> = Promise.resolve();
   private writeActive = 0;
   private readonly writeWaiters: Array<{
     resolve: () => void;
+    reject: (error: unknown) => void;
     signal: AbortSignal;
     onAbort: () => void;
   }> = [];
@@ -84,8 +78,7 @@ export class SubagentRuntime implements TaskService {
     this.trace.append({ type: "subagent_runtime_created", sessionId: rootSessionId });
     const worktrees = WorktreeManager.tryCreate(workingDir, config);
     if (worktrees) {
-      const cutoff = Date.now() -
-        config.session.cleanupPeriodDays * 24 * 60 * 60_000;
+      const cutoff = Date.now() - config.session.cleanupPeriodDays * 24 * 60 * 60_000;
       for (const removedPath of worktrees.sweepMergedWorktrees(cutoff)) {
         this.trace.append({
           type: "worktree_removed",
@@ -97,7 +90,7 @@ export class SubagentRuntime implements TaskService {
     }
     for (const result of this.artifacts.recoverOrphaned()) {
       this.trace.append({
-        type: "task_recovered_orphaned",
+        type: "task_recovered_interrupted",
         sessionId: rootSessionId,
         taskId: result.taskId,
         agentId: result.agentId,
@@ -105,16 +98,7 @@ export class SubagentRuntime implements TaskService {
       });
       this.artifacts.refreshTranscript(result.taskId);
     }
-    const startupPrune = this.pruneArtifacts();
-    if (startupPrune.remainingBytes > this.limits.artifactSoftLimitBytes) {
-      this.trace.append({
-        type: "artifact_space_pressure",
-        sessionId: rootSessionId,
-        remainingBytes: startupPrune.remainingBytes,
-        softLimitBytes: this.limits.artifactSoftLimitBytes,
-        reason: "Only pinned, active, or otherwise protected artifacts remain.",
-      });
-    }
+    this.pruneArtifacts();
   }
 
   submit(
@@ -123,148 +107,51 @@ export class SubagentRuntime implements TaskService {
     definition: SubagentDefinition,
     tools: ToolDefinition[],
   ): SubmittedTask {
-    const parentTaskId = parentCtx.taskRuntime?.taskId;
-    const depth = (parentCtx.taskRuntime?.depth ?? parentCtx.depth ?? 0) + 1;
-    const dependency = parentTaskId ? "required" : (input.dependency ?? "required");
+    if (parentCtx.taskRuntime) {
+      return this.rejectedTask(input, definition, "Only the root agent may dispatch Subagents.");
+    }
     const writer = definition.isolation === "worktree" &&
       definition.tools.some((name) => ["Write", "Edit", "Bash", "*"].includes(name));
-
-    if (depth > this.limits.maxDepth) {
-      return this.rejectedTask(input, definition, parentTaskId, depth, "Maximum subagent recursion depth exceeded.");
+    if (!Number.isFinite(input.timeout_ms) || input.timeout_ms <= 0) {
+      return this.rejectedTask(input, definition, "timeout_ms must be a positive number.");
     }
     if (writer && !input.scope?.length) {
-      return this.rejectedTask(
-        input,
-        definition,
-        parentTaskId,
-        depth,
-        "Worktree writers require an explicit non-overlapping scope.",
-      );
+      return this.rejectedTask(input, definition, "Worktree writers require an explicit scope.");
     }
     if (writer) {
       const overlap = [...this.tasks.values()].find((candidate) =>
-        candidate.writer &&
-        !isTerminal(candidate.detail.status) &&
+        candidate.writer && !isTerminal(candidate.detail.status) &&
         scopesOverlap(input.scope!, candidate.detail.scope ?? []));
       if (overlap) {
         return this.rejectedTask(
           input,
           definition,
-          parentTaskId,
-          depth,
           `Writer scope overlaps active task ${overlap.detail.taskId}.`,
         );
       }
     }
     if (this.createdTaskCount >= this.limits.maxTasksPerSession) {
-      return this.rejectedTask(input, definition, parentTaskId, depth, "Root session subagent task budget exceeded.");
+      return this.rejectedTask(input, definition, "Session subagent task limit exceeded.");
     }
     this.createdTaskCount++;
 
-    const taskId = `task-${randomUUID()}`;
-    const agentId = `${this.rootSessionId}-sub-${randomUUID().slice(0, 8)}`;
-    const createdAt = Date.now();
-    const artifacts = this.artifacts.paths(taskId);
-    const detail: TaskDetail = {
-      taskId,
-      agentId,
-      rootSessionId: this.rootSessionId,
-      parentTaskId,
-      description: input.description,
-      prompt: input.prompt,
-      subagentType: definition.name,
-      dependency,
-      status: "queued",
-      depth,
-      createdAt,
-      lastActivityAt: createdAt,
-      currentActivity: "queued",
-      childCount: 0,
-      scope: input.scope,
-      artifacts,
-    };
-
-    let resolveResult!: (result: TaskResult) => void;
-    const promise = new Promise<TaskResult>((resolve) => {
-      resolveResult = resolve;
-    });
-    const record: TaskRecord = {
-      detail,
-      controller: new AbortController(),
-      resolve: resolveResult,
-      promise,
-      children: new Set(),
-      onConfirmTool: parentCtx.onConfirmTool
-        ? (toolName, toolInput) =>
-            this.requestConfirmation(parentCtx.onConfirmTool!, toolName, toolInput)
-        : undefined,
-      writer,
-    };
-    this.tasks.set(taskId, record);
-    this.artifacts.initializeTask(detail);
+    const record = this.createRecord(input, definition, writer);
+    this.tasks.set(record.detail.taskId, record);
+    this.artifacts.initializeTask(record.detail);
     this.trace.append({
       type: "task_queued",
       sessionId: this.rootSessionId,
-      taskId,
-      agentId,
-      parentTaskId,
-      dependency,
-      depth,
+      taskId: record.detail.taskId,
+      agentId: record.detail.agentId,
       description: input.description,
-    });
-
-    let parentSuspended = false;
-    if (parentTaskId) {
-      const parent = this.tasks.get(parentTaskId);
-      if (parent) {
-        parent.children.add(taskId);
-        parent.detail.childCount = parent.children.size;
-        parent.detail.status = "waiting_child";
-        parent.detail.currentActivity = `waiting for ${taskId}`;
-        parentSuspended = this.scheduler.suspendForChild(parentTaskId);
-        this.emit(parent);
-        this.trace.append({
-          type: "task_waiting_child",
-          sessionId: this.rootSessionId,
-          taskId: parentTaskId,
-          agentId: parent.detail.agentId,
-          childTaskId: taskId,
-          releasedSlot: parentSuspended,
-        });
-      }
-    }
-
-    this.scheduler.enqueue({
-      taskId,
-      dependency,
-      depth,
-      createdAt,
-      run: () => this.runRecord(record, input, definition, tools),
+      reportPath: record.detail.artifacts.report,
     });
     this.emit(record);
-
-    const outward = parentTaskId && parentSuspended
-      ? promise.then(async (result) => {
-          await this.scheduler.reacquireAfterChild(parentTaskId);
-          const parent = this.tasks.get(parentTaskId);
-          if (parent && !isTerminal(parent.detail.status)) {
-            parent.detail.status = "running";
-            parent.detail.currentActivity = `resumed after ${taskId}`;
-            parent.detail.lastActivityAt = Date.now();
-            this.emit(parent);
-            this.trace.append({
-              type: "task_resumed",
-              sessionId: this.rootSessionId,
-              taskId: parentTaskId,
-              agentId: parent.detail.agentId,
-              childTaskId: taskId,
-            });
-          }
-          return result;
-        })
-      : promise;
-
-    return { task: detail, result: outward };
+    this.scheduler.enqueue({
+      taskId: record.detail.taskId,
+      run: () => this.runRecord(record, input, definition, tools),
+    });
+    return { task: { ...record.detail } };
   }
 
   list(filter?: { status?: SubagentTaskStatus }): TaskSummary[] {
@@ -275,126 +162,51 @@ export class SubagentRuntime implements TaskService {
   }
 
   get(taskId: string): TaskDetail | undefined {
-    const record = this.tasks.get(taskId);
-    if (!record) return undefined;
-    if (isTerminal(record.detail.status)) {
-      this.acknowledgeCompletion(record, "get");
-    }
-    return { ...record.detail, artifacts: { ...record.detail.artifacts } };
+    const detail = this.tasks.get(taskId)?.detail;
+    return detail ? { ...detail, artifacts: { ...detail.artifacts } } : undefined;
   }
 
-  async wait(taskId: string, timeoutMs?: number): Promise<TaskResult> {
-    const waitSpanId = randomUUID();
-    const startedAt = Date.now();
-    const record = this.tasks.get(taskId);
-    this.trace.append({
-      type: "task_wait_started",
-      sessionId: this.rootSessionId,
-      taskId,
-      agentId: record?.detail.agentId,
-      spanId: waitSpanId,
-      timeoutMs,
-    });
-    try {
-      if (!record) throw new Error(`Unknown task: ${taskId}`);
-      const result = timeoutMs && timeoutMs > 0
-        ? await this.waitWithTimeout(record, timeoutMs)
-        : await record.promise;
-      this.acknowledgeCompletion(record, "wait");
-      this.trace.append({
-        type: "task_wait_completed",
-        sessionId: this.rootSessionId,
-        taskId,
-        agentId: record.detail.agentId,
-        parentSpanId: waitSpanId,
-        outcome: "result",
-        status: result.status,
-        durationMs: Date.now() - startedAt,
-      });
-      return result;
-    } catch (error) {
-      this.trace.append({
-        type: "task_wait_completed",
-        sessionId: this.rootSessionId,
-        taskId,
-        agentId: record?.detail.agentId,
-        parentSpanId: waitSpanId,
-        outcome: "error",
-        error: error instanceof Error ? error.message : String(error),
-        durationMs: Date.now() - startedAt,
-      });
-      throw error;
-    }
-  }
-
-  async cancel(taskId: string, cascade = true): Promise<void> {
+  async cancel(taskId: string): Promise<void> {
     const record = this.tasks.get(taskId);
     if (!record || isTerminal(record.detail.status)) return;
-    record.forcedStatus = "cancelled";
-    record.controller.abort(new Error("Task cancelled"));
-    record.detail.currentActivity = "cancelling";
+    record.forcedFailureKind = "cancelled";
     this.trace.append({
       type: "task_cancel_requested",
       sessionId: this.rootSessionId,
       taskId,
       agentId: record.detail.agentId,
-      cascade,
     });
-    this.emit(record);
     if (record.detail.status === "queued" && this.scheduler.cancelQueued(taskId)) {
-      this.finalizeWithoutRun(record, "cancelled", "Task was cancelled before it started.");
+      this.finishWithoutRun(record, "cancelled", "Task was cancelled before it started.");
+      return;
     }
-    if (cascade) {
-      await Promise.all([...record.children].map((childId) => this.cancel(childId, true)));
-    }
+    record.detail.currentActivity = "cancelling";
+    this.emit(record);
+    record.controller.abort(new Error("Task cancelled"));
   }
 
   async cleanup(taskId: string): Promise<void> {
     const record = this.tasks.get(taskId);
     if (!record) return;
-    if (!isTerminal(record.detail.status)) {
-      throw new Error(`Cannot cleanup non-terminal task ${taskId}`);
-    }
+    if (!isTerminal(record.detail.status)) throw new Error(`Cannot cleanup active task ${taskId}`);
     if (record.detail.workspace) {
       const manager = new WorktreeManager(record.detail.workspace.repoRoot, this.config);
       if (!manager.cleanupIfSafe(record.detail.workspace, record.detail.result?.workspace)) {
-        throw new Error(
-          `Worktree ${record.detail.workspace.path} contains uncommitted or unmerged work; ` +
-          "merge/cherry-pick the branch before cleanup.",
-        );
+        throw new Error(`Worktree ${record.detail.workspace.path} is not safe to remove.`);
       }
-      this.trace.append({
-        type: "worktree_removed",
-        sessionId: this.rootSessionId,
-        taskId,
-        agentId: record.detail.agentId,
-        reason: "task cleanup after integration",
-      });
     }
     this.artifacts.removeTask(taskId);
     this.tasks.delete(taskId);
-    this.trace.append({
-      type: "task_cleaned",
-      sessionId: this.rootSessionId,
-      taskId,
-      agentId: record.detail.agentId,
-    });
   }
 
   pin(taskId: string, pinned = true): void {
     const record = this.tasks.get(taskId);
-    if (!record && !this.artifacts.hasTask(taskId)) {
-      throw new Error(`Unknown task: ${taskId}`);
-    }
+    if (!record && !this.artifacts.hasTask(taskId)) throw new Error(`Unknown task: ${taskId}`);
     this.artifacts.setPinned(taskId, pinned);
-    if (record) record.detail.pinned = pinned;
-    this.trace.append({
-      type: pinned ? "task_pinned" : "task_unpinned",
-      sessionId: this.rootSessionId,
-      taskId,
-      agentId: record?.detail.agentId,
-    });
-    if (record) this.emit(record);
+    if (record) {
+      record.detail.pinned = pinned;
+      this.emit(record);
+    }
   }
 
   artifactStats(): { taskCount: number; pinnedCount: number; totalBytes: number } {
@@ -413,13 +225,6 @@ export class SubagentRuntime implements TaskService {
       protectedTaskIds,
     });
     for (const taskId of result.removed) this.tasks.delete(taskId);
-    this.trace.append({
-      type: "artifact_pruned",
-      sessionId: this.rootSessionId,
-      removedTaskIds: result.removed,
-      freedBytes: result.freedBytes,
-      remainingBytes: result.remainingBytes,
-    });
     return result;
   }
 
@@ -428,23 +233,49 @@ export class SubagentRuntime implements TaskService {
     return () => this.listeners.delete(listener);
   }
 
-  hasPendingAdvisory(): boolean {
-    return [...this.tasks.values()].some((record) =>
-      record.detail.dependency === "advisory" && !isTerminal(record.detail.status),
-    );
+  hasPendingTasks(): boolean {
+    return [...this.tasks.values()].some((record) => !isTerminal(record.detail.status));
   }
 
   markRunningTasksOrphaned(): void {
     for (const record of this.tasks.values()) {
-      if (!isTerminal(record.detail.status)) {
-        record.forcedStatus = "cancelled";
+      if (isTerminal(record.detail.status)) continue;
+      record.forcedFailureKind = "interrupted";
+      if (record.detail.status === "queued" && this.scheduler.cancelQueued(record.detail.taskId)) {
+        this.finishWithoutRun(record, "interrupted", "Runtime stopped before task start.");
+      } else {
         record.controller.abort(new Error("Runtime stopped"));
-        record.detail.status = "orphaned";
-        record.detail.endedAt = Date.now();
-        record.detail.currentActivity = "orphaned after runtime exit";
-        this.emit(record);
       }
     }
+  }
+
+  private createRecord(
+    input: AgentTaskInput,
+    definition: SubagentDefinition,
+    writer: boolean,
+  ): TaskRecord {
+    const taskId = `task-${randomUUID()}`;
+    const now = Date.now();
+    const detail: TaskDetail = {
+      taskId,
+      agentId: `${this.rootSessionId}-sub-${randomUUID().slice(0, 8)}`,
+      rootSessionId: this.rootSessionId,
+      description: input.description,
+      prompt: input.prompt,
+      subagentType: definition.name,
+      status: "queued",
+      createdAt: now,
+      lastActivityAt: now,
+      currentActivity: "queued",
+      scope: input.scope,
+      artifacts: this.artifacts.paths(taskId),
+    };
+    return {
+      detail,
+      controller: new AbortController(),
+      writer,
+      terminalDelivered: false,
+    };
   }
 
   private async runRecord(
@@ -453,23 +284,19 @@ export class SubagentRuntime implements TaskService {
     definition: SubagentDefinition,
     tools: ToolDefinition[],
   ): Promise<void> {
-    const isWriter = definition.isolation === "worktree" &&
-      definition.tools.some((name) => ["Write", "Edit", "Bash", "*"].includes(name));
     let releaseWriteSlot = () => {};
     try {
-      if (isWriter) {
-        try {
-          releaseWriteSlot = await this.acquireWriteSlot(record.controller.signal);
-        } catch {
-          this.finalizeWithoutRun(
-            record,
-            "cancelled",
-            "Task was cancelled while waiting for an isolated writer slot.",
-          );
-          return;
-        }
-      }
+      if (record.writer) releaseWriteSlot = await this.acquireWriteSlot(record.controller.signal);
+      if (isTerminal(record.detail.status)) return;
       await this.executeRecord(record, input, definition, tools);
+    } catch (error) {
+      if (!isTerminal(record.detail.status)) {
+        this.finishWithoutRun(
+          record,
+          record.forcedFailureKind ?? "runtime_error",
+          error instanceof Error ? error.message : String(error),
+        );
+      }
     } finally {
       releaseWriteSlot();
     }
@@ -481,115 +308,54 @@ export class SubagentRuntime implements TaskService {
     definition: SubagentDefinition,
     tools: ToolDefinition[],
   ): Promise<void> {
-    const detail = record.detail;
-    detail.status = "running";
-    detail.startedAt = Date.now();
-    detail.lastActivityAt = detail.startedAt;
-    detail.currentActivity = "starting";
-    this.emit(record);
-    this.trace.append({
-      type: "task_started",
-      sessionId: this.rootSessionId,
-      taskId: detail.taskId,
-      agentId: detail.agentId,
-    });
+    record.detail.startedAt = Date.now();
+    this.transition(record, "running", "starting");
+    let flushReport = () => {};
+    const timer = setTimeout(() => {
+      record.forcedFailureKind = "timed_out";
+      flushReport();
+      record.controller.abort(new Error("Subagent safety timeout reached"));
+    }, input.timeout_ms);
+    timer.unref?.();
 
-    const hardTimeoutMs = input.timeout_ms ?? this.limits.hardTimeoutMs;
-    const hardTimer = setTimeout(() => {
-      record.forcedStatus = "timed_out";
-      record.controller.abort(new Error("Task hard timeout"));
-    }, hardTimeoutMs);
-    hardTimer.unref?.();
-    let stallTimer: ReturnType<typeof setTimeout>;
-    const checkForStall = () => {
-      const inactiveForMs = Date.now() - detail.lastActivityAt;
-      const remainingMs = this.limits.stallTimeoutMs - inactiveForMs;
-      if (remainingMs <= 0) {
-        record.forcedStatus = "timed_out";
-        record.controller.abort(new Error("Task stalled"));
-        return;
-      }
-      stallTimer = setTimeout(checkForStall, remainingMs);
-      stallTimer.unref?.();
-    };
-    stallTimer = setTimeout(checkForStall, this.limits.stallTimeoutMs);
-    stallTimer.unref?.();
-
-    let lastEmittedActivityAt = 0;
-    let lastEmittedActivity = "";
+    let output: TaskRunnerOutput | undefined;
+    let workspaceResult: WorkspaceResult | undefined;
+    let manager: WorktreeManager | undefined;
+    let taskWorkingDir = this.workingDir;
     const onActivity = (activity: string, toolName?: string) => {
-      const now = Date.now();
-      detail.lastActivityAt = now;
-      detail.currentActivity = activity;
-      detail.currentTool = toolName;
-      const label = `${activity}:${toolName ?? ""}`;
-      if (label === lastEmittedActivity && now - lastEmittedActivityAt < 5_000) return;
-      lastEmittedActivityAt = now;
-      lastEmittedActivity = label;
+      record.detail.lastActivityAt = Date.now();
+      record.detail.currentActivity = activity;
+      record.detail.currentTool = toolName;
       this.emit(record);
     };
 
-    let output: TaskRunnerOutput | undefined;
-    let worktreeManager: WorktreeManager | undefined;
-    let taskWorkingDir = this.workingDir;
-    if (input.isolation === "worktree" || definition.isolation === "worktree") {
-      try {
-        worktreeManager = new WorktreeManager(this.workingDir, this.config);
-        detail.currentActivity = "creating worktree";
-        detail.workspace = worktreeManager.create(detail.taskId, this.rootSessionId);
-        taskWorkingDir = detail.workspace.path;
-        this.artifacts.updateTask(detail);
-        this.trace.append({
-          type: "worktree_created",
-          sessionId: this.rootSessionId,
-          taskId: detail.taskId,
-          agentId: detail.agentId,
-          path: detail.workspace.path,
-          branch: detail.workspace.branch,
-          baseCommit: detail.workspace.baseCommit,
-          sourceDirty: detail.workspace.sourceDirty,
-        });
-      } catch (error) {
-        output = {
-          status: "failed",
-          summary: "The isolated Git worktree could not be created.",
-          report: `# Worktree creation failed\n\n${error instanceof Error ? error.message : String(error)}`,
-          usage: { inputTokens: 0, outputTokens: 0, toolCalls: 0 },
-          error: error instanceof Error ? error.message : String(error),
-        };
-      }
-    }
     try {
-      output ??= await this.raceAbort(this.runner.run({
+      if (input.isolation === "worktree" || definition.isolation === "worktree") {
+        manager = new WorktreeManager(this.workingDir, this.config);
+        onActivity("creating worktree");
+        record.detail.workspace = manager.create(record.detail.taskId, this.rootSessionId);
+        taskWorkingDir = record.detail.workspace.path;
+        this.artifacts.updateTask(record.detail);
+      }
+      output = await this.raceAbort(this.runner.run({
         rootSessionId: this.rootSessionId,
-        parentSessionId: this.rootSessionId,
-        parentTaskId: detail.parentTaskId,
-        taskId: detail.taskId,
-        agentId: detail.agentId,
-        depth: detail.depth,
+        taskId: record.detail.taskId,
+        agentId: record.detail.agentId,
         prompt: [
-          `Task: ${detail.description}`,
+          `Task: ${record.detail.description}`,
           "",
           input.prompt,
-          ...(detail.scope?.length
-            ? ["", `Expected scope: ${detail.scope.join(", ")}`]
+          ...(record.detail.scope?.length
+            ? ["", `Expected scope: ${record.detail.scope.join(", ")}`]
             : []),
-          ...(detail.workspace
+          ...(record.detail.workspace
             ? [
                 "",
-                `Isolated worktree: ${detail.workspace.path}`,
-                `Branch: ${detail.workspace.branch}`,
-                `Base commit: ${detail.workspace.baseCommit}`,
-                detail.workspace.sourceDirty
-                  ? "Warning: the source checkout is dirty; its uncommitted changes are not present here."
-                  : "",
-              ].filter(Boolean)
+                `Isolated worktree: ${record.detail.workspace.path}`,
+                `Branch: ${record.detail.workspace.branch}`,
+                "Implement, verify, and commit useful changes in the worktree.",
+              ]
             : []),
-          "",
-          definition.isolation === "worktree"
-            ? "Implement, test, commit the deliverable, and report branch/commit evidence."
-            : "Return evidence, conclusions, uncertainty, and recommended next steps.",
-          "You must finish by calling CompleteTask with a self-contained Markdown report.",
         ].join("\n"),
         definition,
         config: {
@@ -602,148 +368,166 @@ export class SubagentRuntime implements TaskService {
         tools,
         coverageRequired: input.coverage === "exhaustive",
         abortSignal: record.controller.signal,
-        onConfirmTool: record.onConfirmTool,
         trace: this.trace,
+        appendReport: (content) => this.artifacts.appendReport(record.detail.taskId, content),
+        registerReportFlusher: (flush) => { flushReport = flush; },
         onActivity,
         mode: input.mode,
       }), record.controller.signal);
     } catch (error) {
       output = {
-        status: record.forcedStatus ?? "failed",
-        summary: record.forcedStatus === "timed_out"
-          ? "Task reached its runtime safety timeout."
-          : record.forcedStatus === "cancelled"
-            ? "Task was cancelled."
-            : "Task runner failed.",
-        report: `# Incomplete task\n\n${error instanceof Error ? error.message : String(error)}`,
+        status: "failed",
+        failureKind: record.forcedFailureKind ?? "runtime_error",
+        coverage: emptyCoverageManifest(input.coverage === "exhaustive"),
         usage: { inputTokens: 0, outputTokens: 0, toolCalls: 0 },
         error: error instanceof Error ? error.message : String(error),
       };
     } finally {
-      clearTimeout(hardTimer);
-      clearTimeout(stallTimer);
+      clearTimeout(timer);
     }
 
-    output ??= {
-      status: "failed",
-      summary: "Task ended without a runner result.",
-      report: "# Incomplete task\n\nNo runner result was produced.",
-      usage: { inputTokens: 0, outputTokens: 0, toolCalls: 0 },
-      error: "No runner result was produced.",
-    };
-    let status = record.forcedStatus ?? output.status;
-    let workspaceResult;
-    if (detail.workspace && worktreeManager) {
+    if (record.detail.workspace && manager) {
       try {
-        workspaceResult = worktreeManager.finalize(
-          detail.workspace,
-          detail.artifacts.patch,
-          detail.scope,
+        workspaceResult = manager.finalize(
+          record.detail.workspace,
+          record.detail.artifacts.patch,
+          record.detail.scope,
         );
-        if (workspaceResult.dirty && status === "completed") {
-          status = "partial";
-          output.summary =
-            `${output.summary} Worktree has uncommitted changes; resume the worker and commit before integration.`;
+        if (output.status === "finished" && (
+          workspaceResult.dirty ||
+          (record.writer && workspaceResult.commits.length === 0) ||
+          workspaceResult.scopeDeviations.length > 0
+        )) {
+          output.status = "failed";
+          output.failureKind = "worktree_invalid";
+          output.error = workspaceResult.dirty
+            ? "Worktree contains uncommitted changes."
+            : workspaceResult.scopeDeviations.length > 0
+              ? `Worktree changed files outside scope: ${workspaceResult.scopeDeviations.join(", ")}`
+              : "Writer produced no commit.";
         }
-        const noTaskCommits = workspaceResult.commits.length === 0;
-        const isWriter = definition.tools.some((name) =>
-          ["Write", "Edit", "Bash", "*"].includes(name));
-        if (isWriter && noTaskCommits && status === "completed") {
-          status = "partial";
-          output.summary =
-            `${output.summary} Worker produced no commit, so there is nothing to integrate.`;
+        if (!workspaceResult.dirty && workspaceResult.commits.length === 0) {
+          manager.cleanupIfSafe(record.detail.workspace, workspaceResult);
         }
-        if (!workspaceResult.dirty && noTaskCommits) {
-          const cleaned = worktreeManager.cleanupIfSafe(detail.workspace, workspaceResult);
-          if (cleaned) {
-            this.trace.append({
-              type: "worktree_removed",
-              sessionId: this.rootSessionId,
-              taskId: detail.taskId,
-              agentId: detail.agentId,
-              reason: "clean task with no commits",
-            });
-          }
-        }
-        this.trace.append({
-          type: "worktree_finalized",
-          sessionId: this.rootSessionId,
-          taskId: detail.taskId,
-          agentId: detail.agentId,
-          branch: workspaceResult.branch,
-          headCommit: workspaceResult.headCommit,
-          commits: workspaceResult.commits,
-          filesChanged: workspaceResult.filesChanged,
-          dirty: workspaceResult.dirty,
-          patchPath: workspaceResult.patchPath,
-          scopeDeviations: workspaceResult.scopeDeviations,
-        });
       } catch (error) {
-        status = "failed";
+        output.status = "failed";
+        output.failureKind = "worktree_invalid";
         output.error = error instanceof Error ? error.message : String(error);
-        output.summary = `${output.summary} Worktree finalization failed: ${output.error}`;
       }
     }
-    const finalCoverage = output.coverage ??
-      emptyCoverageManifest(input.coverage === "exhaustive");
-    detail.status = status;
-    detail.endedAt = Date.now();
-    detail.lastActivityAt = detail.endedAt;
-    detail.currentActivity = status;
-    detail.currentTool = undefined;
+
+    if (record.forcedFailureKind) {
+      output.status = "failed";
+      output.failureKind = record.forcedFailureKind;
+    }
+    flushReport();
+    this.finish(record, output, workspaceResult);
+  }
+
+  private finish(
+    record: TaskRecord,
+    output: TaskRunnerOutput,
+    workspace?: WorkspaceResult,
+  ): void {
+    if (isTerminal(record.detail.status)) return;
+    const endedAt = Date.now();
+    const status: SubagentTaskStatus = output.status === "finished" ? "finished" : "failed";
+    record.detail.failureKind = status === "failed" ? output.failureKind ?? "runtime_error" : undefined;
+    record.detail.error = status === "failed" ? output.error : undefined;
+    record.detail.endedAt = endedAt;
     const result: TaskResult = {
-      taskId: detail.taskId,
-      agentId: detail.agentId,
+      taskId: record.detail.taskId,
+      agentId: record.detail.agentId,
       status,
-      summary: output.summary,
-      reportPath: detail.artifacts.report,
-      resultPath: detail.artifacts.result,
-      transcriptPath: detail.artifacts.transcript,
-      coveragePath: detail.artifacts.coverage,
+      failureKind: record.detail.failureKind,
+      reportPath: record.detail.artifacts.report,
+      resultPath: record.detail.artifacts.result,
+      transcriptPath: record.detail.artifacts.transcript,
+      coveragePath: record.detail.artifacts.coverage,
       usage: output.usage,
-      error: output.error,
-      keyFiles: output.completion?.key_files,
-      artifacts: output.completion?.artifacts,
-      coverage: coverageSummary(finalCoverage),
-      workspace: workspaceResult,
-      startedAt: detail.startedAt,
-      endedAt: detail.endedAt,
+      error: record.detail.error,
+      coverage: coverageSummary(output.coverage),
+      workspace,
+      startedAt: record.detail.startedAt,
+      endedAt,
     };
-    detail.result = result;
+    record.detail.result = result;
+    this.transition(record, status, status, { result, coverage: output.coverage });
+  }
+
+  private finishWithoutRun(
+    record: TaskRecord,
+    failureKind: SubagentFailureKind,
+    error: string,
+  ): void {
+    this.finish(record, {
+      status: "failed",
+      failureKind,
+      coverage: emptyCoverageManifest(false),
+      usage: { inputTokens: 0, outputTokens: 0, toolCalls: 0 },
+      error,
+    });
+  }
+
+  private rejectedTask(
+    input: AgentTaskInput,
+    definition: SubagentDefinition,
+    reason: string,
+  ): SubmittedTask {
+    const record = this.createRecord(input, definition, false);
+    this.tasks.set(record.detail.taskId, record);
+    this.artifacts.initializeTask(record.detail);
+    this.artifacts.appendReport(record.detail.taskId, `\nTask rejected: ${reason}\n`);
+    this.finishWithoutRun(record, "runtime_error", reason);
+    return { task: { ...record.detail } };
+  }
+
+  private transition(
+    record: TaskRecord,
+    next: SubagentTaskStatus,
+    activity: string,
+    terminal?: { result: TaskResult; coverage: TaskRunnerOutput["coverage"] },
+  ): void {
+    const current = record.detail.status;
+    const valid = current === next ||
+      (current === "queued" && (next === "running" || next === "failed")) ||
+      (current === "running" && (next === "finished" || next === "failed"));
+    if (!valid) throw new Error(`Invalid subagent status transition: ${current} -> ${next}`);
+    record.detail.status = next;
+    record.detail.currentActivity = activity;
+    record.detail.currentTool = undefined;
+    record.detail.lastActivityAt = Date.now();
+    if (next === "running") {
+      this.trace.append({
+        type: "task_started",
+        sessionId: this.rootSessionId,
+        taskId: record.detail.taskId,
+        agentId: record.detail.agentId,
+      });
+      this.emit(record);
+      return;
+    }
+    if (!terminal) throw new Error(`Terminal transition ${next} requires result data.`);
+    const { result, coverage } = terminal;
+    this.artifacts.appendReport(
+      record.detail.taskId,
+      `\n\n<!-- Subagent ${next}${result.error ? `: ${result.error.replace(/-->/g, "--&gt;")}` : ""} -->\n`,
+    );
+    this.artifacts.finalizeTask(record.detail, result, coverage);
     this.trace.append({
       type: "task_terminal",
       sessionId: this.rootSessionId,
-      taskId: detail.taskId,
-      agentId: detail.agentId,
-      status,
-      summary: output.summary,
-      resultPath: result.resultPath,
+      taskId: result.taskId,
+      agentId: result.agentId,
+      status: next,
+      failureKind: result.failureKind,
+      error: result.error,
       reportPath: result.reportPath,
-      coveragePath: result.coveragePath,
     });
-    this.artifacts.finalizeTask(detail, result, output.report, finalCoverage);
     this.emit(record);
-    record.resolve(result);
-    if (detail.dependency === "advisory") {
-      if (this.inbox.deliver(result)) {
-        this.trace.append({
-          type: "background_notification_queued",
-          sessionId: this.rootSessionId,
-          taskId: detail.taskId,
-          agentId: detail.agentId,
-        });
-      }
+    if (!record.terminalDelivered && this.inbox.deliver(result)) {
+      record.terminalDelivered = true;
     }
-  }
-
-  private async requestConfirmation(
-    handler: NonNullable<AgentContext["onConfirmTool"]>,
-    toolName: string,
-    input: Record<string, unknown>,
-  ): Promise<Awaited<ReturnType<NonNullable<AgentContext["onConfirmTool"]>>>> {
-    const request = this.confirmationTail.then(() => handler(toolName, input));
-    this.confirmationTail = request.then(() => undefined, () => undefined);
-    return request;
   }
 
   private async acquireWriteSlot(signal: AbortSignal): Promise<() => void> {
@@ -752,6 +536,7 @@ export class SubagentRuntime implements TaskService {
       await new Promise<void>((resolve, reject) => {
         const waiter = {
           resolve,
+          reject,
           signal,
           onAbort: () => {
             const index = this.writeWaiters.indexOf(waiter);
@@ -778,101 +563,13 @@ export class SubagentRuntime implements TaskService {
     };
   }
 
-  private finalizeWithoutRun(
-    record: TaskRecord,
-    status: "cancelled" | "orphaned",
-    summary: string,
-  ): void {
-    const endedAt = Date.now();
-    record.detail.status = status;
-    record.detail.endedAt = endedAt;
-    record.detail.lastActivityAt = endedAt;
-    record.detail.currentActivity = status;
-    const result: TaskResult = {
-      taskId: record.detail.taskId,
-      agentId: record.detail.agentId,
-      status,
-      summary,
-      reportPath: record.detail.artifacts.report,
-      resultPath: record.detail.artifacts.result,
-      transcriptPath: record.detail.artifacts.transcript,
-      coveragePath: record.detail.artifacts.coverage,
-      usage: { inputTokens: 0, outputTokens: 0, toolCalls: 0 },
-      coverage: coverageSummary(emptyCoverageManifest(false)),
-      endedAt,
-    };
-    record.detail.result = result;
-    this.trace.append({
-      type: "task_terminal",
-      sessionId: this.rootSessionId,
-      taskId: result.taskId,
-      agentId: result.agentId,
-      status,
-      summary,
+  private raceAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+    if (signal.aborted) return Promise.reject(signal.reason ?? new Error("Task aborted"));
+    return new Promise<T>((resolve, reject) => {
+      const onAbort = () => reject(signal.reason ?? new Error("Task aborted"));
+      signal.addEventListener("abort", onAbort, { once: true });
+      promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
     });
-    this.artifacts.finalizeTask(record.detail, result, `# ${status}\n\n${summary}`);
-    this.emit(record);
-    record.resolve(result);
-  }
-
-  private rejectedTask(
-    input: AgentTaskInput,
-    definition: SubagentDefinition,
-    parentTaskId: string | undefined,
-    depth: number,
-    reason: string,
-  ): SubmittedTask {
-    const taskId = `task-${randomUUID()}`;
-    const agentId = `${this.rootSessionId}-sub-${randomUUID().slice(0, 8)}`;
-    const now = Date.now();
-    const detail: TaskDetail = {
-      taskId,
-      agentId,
-      rootSessionId: this.rootSessionId,
-      parentTaskId,
-      description: input.description,
-      prompt: input.prompt,
-      subagentType: definition.name,
-      dependency: parentTaskId ? "required" : (input.dependency ?? "required"),
-      status: "failed",
-      depth,
-      createdAt: now,
-      endedAt: now,
-      lastActivityAt: now,
-      currentActivity: reason,
-      childCount: 0,
-      artifacts: this.artifacts.paths(taskId),
-    };
-    const result: TaskResult = {
-      taskId,
-      agentId,
-      status: "failed",
-      summary: reason,
-      reportPath: detail.artifacts.report,
-      resultPath: detail.artifacts.result,
-      transcriptPath: detail.artifacts.transcript,
-      coveragePath: detail.artifacts.coverage,
-      usage: { inputTokens: 0, outputTokens: 0, toolCalls: 0 },
-      coverage: coverageSummary(emptyCoverageManifest(false)),
-      error: reason,
-      endedAt: now,
-    };
-    detail.result = result;
-    let resolve!: (value: TaskResult) => void;
-    const promise = new Promise<TaskResult>((done) => { resolve = done; });
-    const record: TaskRecord = {
-      detail,
-      controller: new AbortController(),
-      resolve,
-      promise,
-      children: new Set(),
-      writer: false,
-    };
-    this.tasks.set(taskId, record);
-    this.artifacts.initializeTask(detail);
-    this.artifacts.finalizeTask(detail, result, `# Task rejected\n\n${reason}`);
-    resolve(result);
-    return { task: detail, result: promise };
   }
 
   private summary(detail: TaskDetail): TaskSummary {
@@ -884,75 +581,10 @@ export class SubagentRuntime implements TaskService {
     const summary = this.summary(record.detail);
     for (const listener of this.listeners) listener(summary);
   }
-
-  private acknowledgeCompletion(record: TaskRecord, source: "get" | "wait"): void {
-    if (record.detail.dependency !== "advisory" || !record.detail.result) return;
-    const acknowledged = this.inbox.acknowledge([record.detail.taskId]);
-    if (acknowledged.length === 0) return;
-    this.trace.append({
-      type: "background_notification_acknowledged",
-      sessionId: this.rootSessionId,
-      taskId: record.detail.taskId,
-      agentId: record.detail.agentId,
-      source,
-    });
-  }
-
-  private waitWithTimeout(
-    record: TaskRecord,
-    timeoutMs: number,
-  ): Promise<TaskResult> {
-    return new Promise<TaskResult>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        const task = record.detail;
-        const elapsedMs = Date.now() - (task.startedAt ?? task.createdAt);
-        reject(new Error(
-          `Timed out waiting for task ${task.taskId}; task is still ${task.status}. ` +
-          `Elapsed ${formatElapsed(elapsedMs)}; activity=${task.currentActivity ?? "unknown"}; ` +
-          `tool=${task.currentTool ?? "none"}; children=${task.childCount}. ` +
-          "The task was not cancelled. Use Task get/watch or wait again.",
-        ));
-      }, timeoutMs);
-      timer.unref?.();
-      record.promise.then(
-        (result) => {
-          clearTimeout(timer);
-          resolve(result);
-        },
-        (error) => {
-          clearTimeout(timer);
-          reject(error);
-        },
-      );
-    });
-  }
-
-  private raceAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
-    if (signal.aborted) return Promise.reject(signal.reason ?? new Error("Task aborted"));
-    return new Promise<T>((resolve, reject) => {
-      const onAbort = () => {
-        signal.removeEventListener("abort", onAbort);
-        reject(signal.reason ?? new Error("Task aborted"));
-      };
-      signal.addEventListener("abort", onAbort, { once: true });
-      promise.then(
-        (value) => {
-          signal.removeEventListener("abort", onAbort);
-          resolve(value);
-        },
-        (error) => {
-          signal.removeEventListener("abort", onAbort);
-          reject(error);
-        },
-      );
-    });
-  }
 }
 
 export function isTerminal(status: SubagentTaskStatus): boolean {
-  return status === "completed" || status === "partial" || status === "blocked" ||
-    status === "failed" || status === "timed_out" || status === "cancelled" ||
-    status === "orphaned";
+  return status === "finished" || status === "failed";
 }
 
 function scopesOverlap(left: string[], right: string[]): boolean {
@@ -965,9 +597,4 @@ function scopesOverlap(left: string[], right: string[]): boolean {
 
 function normalizeScope(value: string): string {
   return value.trim().replace(/\\/g, "/").replace(/^\.?\//, "").replace(/\/$/, "");
-}
-
-function formatElapsed(ms: number): string {
-  const seconds = Math.max(0, Math.floor(ms / 1_000));
-  return `${Math.floor(seconds / 60)}m${String(seconds % 60).padStart(2, "0")}s`;
 }

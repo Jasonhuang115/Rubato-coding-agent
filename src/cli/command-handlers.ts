@@ -1,13 +1,11 @@
 import path from "path";
 import fs from "fs";
 import YAML from "yaml";
-import type { AgentConfig, AgentContext } from "../shared/core-types.js";
+import type { AgentConfig } from "../shared/core-types.js";
 import { handleFileMemoryCommand } from "./file-memory-commands.js";
 import { getGitState } from "../tools/git/advisor.js";
 import { getBranchHealth } from "../tools/git/branch-health.js";
 import { getSkillRegistry } from "../skills/registry.js";
-import { spawnSubagent } from "../agent/subagent.js";
-import { PolicyEngine } from "../security/policy/engine.js";
 import { SessionManager } from "../runtime/session/manager.js";
 import { processSubagentRegistry } from "../agent/subagents/registry.js";
 import { scrubPersistedData } from "../security/scrub.js";
@@ -195,46 +193,17 @@ export async function handleTasksCommand(input: string, rootSessionId: string): 
     console.log(JSON.stringify(runtime.pruneArtifacts(), null, 2));
     return;
   }
-  if (args[0] === "watch") {
-    const taskId = args[1];
-    const targets = taskId
-      ? [runtime.get(taskId)].filter((task): task is NonNullable<typeof task> => Boolean(task))
-      : runtime.list().filter((task) =>
-          task.status === "queued" || task.status === "running" || task.status === "waiting_child",
-        );
-    if (targets.length === 0) {
-      console.log(taskId ? `\n  Unknown or terminal task: ${taskId}` : "\n  No running tasks.");
-      return;
-    }
-    const targetIds = new Set(targets.map((task) => task.taskId));
-    const unsubscribe = runtime.subscribe((task) => {
-      if (targetIds.has(task.taskId)) {
-        console.log(
-          `  ${task.taskId} ${task.status} ${task.currentActivity ?? ""} ` +
-          `${task.currentTool ?? ""}`,
-        );
-      }
-    });
-    try {
-      await Promise.all(targets.map((task) => runtime.wait(task.taskId)));
-    } finally {
-      unsubscribe();
-    }
-    return;
-  }
-  const action = ["wait", "cancel", "cleanup", "pin", "unpin"].includes(args[0])
+  const action = ["cancel", "cleanup", "pin", "unpin"].includes(args[0])
     ? args[0]
     : "get";
   const taskId = action === "get" ? args[0] : args[1];
   if (!taskId) {
-    console.log("\n  Usage: /tasks [<id> | wait/watch/cancel/cleanup/pin/unpin <id> | stats | prune]");
+    console.log("\n  Usage: /tasks [<id> | cancel/cleanup/pin/unpin <id> | stats | prune]");
     return;
   }
   try {
-    if (action === "wait") {
-      console.log(JSON.stringify(await runtime.wait(taskId), null, 2));
-    } else if (action === "cancel") {
-      await runtime.cancel(taskId, true);
+    if (action === "cancel") {
+      await runtime.cancel(taskId);
       console.log(`\n  Cancellation requested for ${taskId}.`);
     } else if (action === "cleanup") {
       await runtime.cleanup(taskId);
@@ -305,7 +274,11 @@ function formatTaskDuration(ms: number): string {
   return `${Math.floor(seconds / 60)}m${String(seconds % 60).padStart(2, "0")}s`;
 }
 
-export async function handleSkillCommand(input: string, workdir: string, config: AgentConfig): Promise<string | null> {
+export async function handleSkillCommand(
+  input: string,
+  _workdir: string,
+  _config: AgentConfig,
+): Promise<string | null> {
   const parts = input.split(/\s+/);
   const cmdName = parts[0].slice(1);
   const args = parts.slice(1).join(" ");
@@ -316,39 +289,9 @@ export async function handleSkillCommand(input: string, workdir: string, config:
     return args || skill.name;
   }
 
-  console.log(`\n  🔧 Running skill "${skill.name}"...`);
-  const subagentDef = {
-    name: skill.name,
-    description: skill.description ?? `Run the "${skill.name}" skill`,
-    systemPrompt: skill.systemPrompt ?? `You are the "${skill.name}" skill. ${skill.description ?? ""}`,
-    tools: skill.tools ?? ["Read", "Grep", "Glob", "Bash"],
-    model: skill.model ?? "inherit",
-    readonly: true,
-    maxTurns: skill.maxTurns ?? 15,
-  };
-  const permissions = { ...config.permissions };
-  if (skill.allowedTools?.length) {
-    permissions.rules = [
-      ...(permissions.rules ?? []),
-      ...skill.allowedTools.map((pattern) => ({ tool: "*" as const, pattern, action: "allow" as const, reason: `Skill "${skill.name}" pre-authorization` })),
-    ];
-  }
-  const minimalCtx: AgentContext = {
-    workingDir: workdir,
-    sessionId: `skill-${cmdName}-${Date.now()}`,
-    readGuard: { hasRead: () => false, markAsRead: () => {}, serialize: () => ({ files: {} }) },
-    permissionManager: new PolicyEngine(permissions),
-    config: { ...config, permissions },
-    mode: "default",
-    depth: 0,
-  };
-  try {
-    const result = await spawnSubagent(subagentDef, args || `Run the "${skill.name}" skill`, minimalCtx, { ...config, permissions });
-    console.log(`\n  ── ${skill.name} output ──`);
-    console.log(result.output || "(no output)");
-    if (result.usage.toolCalls > 0) console.log(`  [${result.status}] ${result.usage.inputTokens} in / ${result.usage.outputTokens} out / ${result.usage.toolCalls} tools`);
-  } catch (error) {
-    console.warn(`\n  ✖ Skill "${skill.name}" failed: ${error instanceof Error ? error.message : String(error)}`);
-  }
-  return null;
+  return [
+    `Use the fork-mode Skill "${skill.name}" as a background task.`,
+    args ? `Arguments: ${args}` : "Follow its packaged instructions.",
+    "Choose a generous timeout_ms as a safety ceiling, not a work budget.",
+  ].join("\n");
 }

@@ -273,37 +273,32 @@ export interface SubagentDefinition {
   description: string;        // used for intent-matching
   systemPrompt: string;
   model?: string;             // "inherit" | specific model ID
-  tools: string[];            // allowlist, ["*"] = all except AgentTool
+  tools: string[];            // allowlist, ["*"] = the safe capability set
   /** Legacy compatibility hint. Tool access is enforced from tools + isolation. */
   readonly: boolean;
   isolation?: "worktree";
-  maxTurns?: number;          // optional — subagents run until completion by default
-  /** Whether subagents of this type can spawn further subagents. Default false. */
-  canSpawn?: boolean;
 }
-
-export type SubagentDependency = "advisory" | "required";
 
 export type SubagentTaskStatus =
   | "queued"
   | "running"
-  | "waiting_child"
-  | "completed"
-  | "partial"
-  | "blocked"
-  | "failed"
-  | "timed_out"
+  | "finished"
+  | "failed";
+
+export type SubagentFailureKind =
   | "cancelled"
-  | "orphaned";
+  | "timed_out"
+  | "model_error"
+  | "empty_report"
+  | "coverage_incomplete"
+  | "worktree_invalid"
+  | "runtime_error"
+  | "interrupted";
 
 export interface SubagentLimits {
   maxConcurrent: number;
   maxWriteConcurrent: number;
   maxTasksPerSession: number;
-  maxDepth: number;
-  stallTimeoutMs: number;
-  hardTimeoutMs: number;
-  maxTurns?: number;
   artifactTtlDays: number;
   artifactSoftLimitBytes: number;
 }
@@ -312,12 +307,11 @@ export interface AgentTaskInput {
   description: string;
   prompt: string;
   subagent_type?: string;
-  dependency?: SubagentDependency;
   model?: string;
-  timeout_ms?: number;
+  timeout_ms: number;
   isolation?: "worktree";
   scope?: string[];
-  /** Inherited runtime mode; used to keep nested Plan exploration read-only. */
+  /** Inherited runtime mode; used to keep Plan exploration read-only. */
   mode?: AgentMode;
   /**
    * `exhaustive` enables a runtime-enforced file/line coverage gate.
@@ -325,32 +319,6 @@ export interface AgentTaskInput {
    * exhaustive or every-line inspection.
    */
   coverage?: "auto" | "exhaustive";
-}
-
-export interface CompleteTaskInput {
-  status: "completed" | "partial" | "blocked";
-  summary: string;
-  report_markdown: string;
-  key_files?: string[];
-  artifacts?: Array<{
-    path: string;
-    description: string;
-  }>;
-  /**
-   * Optional declaration used when the assignment promises exhaustive
-   * coverage. The runtime, not the model, computes the actual coverage from
-   * observable Glob/Read/Grep tool activity.
-   */
-  coverage?: CompleteTaskCoverageDeclaration;
-}
-
-export interface CompleteTaskCoverageDeclaration {
-  exhaustive?: boolean;
-  scope_roots?: string[];
-  exclusions?: Array<{
-    path: string;
-    reason: string;
-  }>;
 }
 
 export type CoverageFileStatus = "discovered" | "inspected" | "excluded" | "failed";
@@ -384,13 +352,7 @@ export type CoverageSummary = Omit<CoverageManifest, "files" | "notes">;
 
 export interface SubagentCoverageTracker {
   readonly required: boolean;
-  applyDeclaration(declaration?: CompleteTaskCoverageDeclaration): string[];
   snapshot(): CoverageManifest;
-}
-
-export interface TaskCompletionControl {
-  type: "task_completion";
-  completion: CompleteTaskInput;
 }
 
 export interface PlanReadyControl {
@@ -400,16 +362,15 @@ export interface PlanReadyControl {
   path: string;
 }
 
-export type AgentControl = TaskCompletionControl | PlanReadyControl;
+export type AgentControl = PlanReadyControl;
 
 export interface SubagentRuntimeContext {
   rootSessionId: string;
   taskId: string;
   agentId: string;
-  parentTaskId?: string;
-  depth: number;
-  completionSubmitted: boolean;
   onActivity?: (activity: string, toolName?: string) => void;
+  onTextDelta?: (text: string) => void;
+  onTextFlush?: () => void;
   coverage?: SubagentCoverageTracker;
 }
 
@@ -446,19 +407,17 @@ export interface TaskSummary {
   taskId: string;
   agentId: string;
   rootSessionId: string;
-  parentTaskId?: string;
   description: string;
   subagentType: string;
-  dependency: SubagentDependency;
   status: SubagentTaskStatus;
-  depth: number;
   createdAt: number;
   startedAt?: number;
   endedAt?: number;
   lastActivityAt: number;
   currentActivity?: string;
   currentTool?: string;
-  childCount: number;
+  failureKind?: SubagentFailureKind;
+  error?: string;
   pinned?: boolean;
   scope?: string[];
   workspace?: TaskWorkspace;
@@ -469,15 +428,13 @@ export interface TaskResult {
   taskId: string;
   agentId: string;
   status: SubagentTaskStatus;
-  summary: string;
+  failureKind?: SubagentFailureKind;
   reportPath: string;
   resultPath: string;
   transcriptPath: string;
   coveragePath: string;
   usage: { inputTokens: number; outputTokens: number; toolCalls: number };
   error?: string;
-  keyFiles?: string[];
-  artifacts?: Array<{ path: string; description: string }>;
   coverage?: CoverageSummary;
   workspace?: WorkspaceResult;
   startedAt?: number;
@@ -496,29 +453,6 @@ export interface TaskFilter {
 export interface TaskService {
   list(filter?: TaskFilter): TaskSummary[];
   get(taskId: string): TaskDetail | undefined;
-  wait(taskId: string, timeoutMs?: number): Promise<TaskResult>;
-  cancel(taskId: string, cascade?: boolean): Promise<void>;
+  cancel(taskId: string): Promise<void>;
   cleanup(taskId: string): Promise<void>;
-}
-
-export interface SubagentResult {
-  status: SubagentTaskStatus | "timeout" | "budget_exceeded";
-  agentId: string;
-  taskId?: string;
-  output: string;
-  usage: { inputTokens: number; outputTokens: number; toolCalls: number };
-  /** Stable path containing the complete final report. */
-  resultPath?: string;
-  /** Stable path containing the multi-turn execution transcript. */
-  transcriptPath?: string;
-  /** Runtime-observed exhaustive coverage manifest. */
-  coveragePath?: string;
-  /** Machine-extractable summary (for parent agent to merge). */
-  summary?: string;
-  /** Files modified by this subagent. */
-  filesChanged?: string[];
-  reportPath?: string;
-  resultJsonPath?: string;
-  workspace?: WorkspaceResult | null;
-  patch?: string | null;
 }

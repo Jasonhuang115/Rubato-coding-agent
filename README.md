@@ -141,7 +141,6 @@ subagents:
   maxConcurrent: 4
   maxWriteConcurrent: 2
   maxTasksPerSession: 32
-  maxDepth: 3
 
 worktree:
   baseRef: fresh   # fresh | head
@@ -200,7 +199,7 @@ Rubato 注册 15 个核心工具：
 | Web | `WebFetch`、`WebSearch` | 读取网页，通过 Tavily 搜索 |
 | 任务组织 | `TodoWrite` | 管理 default mode 中的临时待办 |
 | 规划提交 | `SubmitPlan` | 提交 Plan Mode 生成的最终 Markdown |
-| 多 Agent | `Agent`、`Task` | 创建与管理 Subagent 任务 |
+| 多 Agent | `Subagent`、`Task` | 异步创建与查询 Subagent 任务 |
 | 扩展 | `Skill` | 调用已加载 Skill |
 | 记忆 | `MemoryFeedback`、`MemoryPropose` | 记录记忆效果，提交可审计候选 |
 
@@ -260,22 +259,22 @@ Subagent 用于把边界清晰、能够独立推进的工作从根 Agent 中拆�
 | `explore` | Read、Grep、Glob | 定位文件、符号、调用链和项目约定 |
 | `research` | 项目读取 + WebFetch/WebSearch | 综合仓库证据与外部资料 |
 | `verify` | 只读对抗检查 | 检查结论、边界条件、回归与测试缺口 |
-| `general` | 复杂只读分析，可继续委派只读任务 | 多范围分析和证据汇总 |
+| `general` | 复杂只读分析 | 多范围分析和证据汇总 |
 | `worker` | Read、Write、Edit、Bash，独立 worktree | 实现一个自包含改动并测试、提交 |
 
 项目可以在 `<workspace>/.rubato/agents/*.md` 定义自定义角色。需要 Write、Edit 或 Bash 的自定义 Agent 必须声明 `isolation: worktree`。
 
 ### 调度模型
 
-根 Agent 通过 `Agent` 工具提交任务，每个任务带有：
+根 Agent 通过 `Subagent` 工具提交后台任务，每个任务带有：
 
 - `description`：简短任务名；
 - `prompt`：目标、范围、约束、必要上下文和交付物；
 - `subagent_type`：角色；
-- `dependency`：`advisory` 或 `required`；
-- 可选的模型、超时、coverage、worktree isolation 和文件 scope。
+- 必填的 `timeout_ms`：仅用于防止永久卡死的宽松兜底，不是工作预算；
+- 可选的模型、coverage、worktree isolation 和文件 scope。
 
-`required` 表示根 Agent 的下一步依赖该结果，Runtime 会等待并持续显示紧凑进度；`advisory` 表示根 Agent 可以继续处理其他独立工作，结果完成后通过 session inbox 送回。
+所有任务都在后台异步运行，工具立即返回唯一 task ID、当前状态、任务目录和绝对报告路径。`maxConcurrent` 满时任务保持 `queued`，FIFO 获得运行槽后转为 `running`，最终只会成为 `finished` 或 `failed`。根 Agent 不等待任务；终态变化会唤醒同一 session 的下一次串行 root run。
 
 默认调度上限：
 
@@ -283,14 +282,11 @@ Subagent 用于把边界清晰、能够独立推进的工作从根 Agent 中拆�
 并发任务             4
 并发写任务           2
 每个根会话任务数     32
-最大嵌套深度         3
-stall timeout         15 分钟
-hard timeout          2 小时
 任务产物 TTL          30 天
 产物软上限            2 GiB
 ```
 
-`general` 可以在深度上限内继续创建只读子任务。writer 由根 Agent 创建，并在独立 worktree 中运行，避免嵌套 writer 和多任务工作区覆盖。
+v1 只允许根 Agent 派发任务。Subagent 不能递归派发；writer 在独立 worktree 中运行，避免多任务工作区覆盖。
 
 ### Writer 与 worktree
 
@@ -305,7 +301,7 @@ hard timeout          2 小时
   → 根 Agent 在主工作树逐个集成
 ```
 
-worker 完成时要求工作树干净，并通过 `CompleteTask` 返回测试结果、提交 hash、变更文件和 scope 偏差。根 Agent 根据结果决定 merge、cherry-pick、继续修复或保留分支。
+worker 运行时把可见文本持续追加到 `report.md`，并要求结束时工作树干净且已有提交。根 Agent 根据报告、结果和 diff 决定 merge、cherry-pick、继续修复或保留分支。
 
 ### 任务产物与管理
 
@@ -320,7 +316,6 @@ worker 完成时要求工作树干净，并通过 `CompleteTask` 返回测试结
 ```text
 /tasks                        列出任务
 /tasks <id>                   查看详情
-/tasks wait|watch <id>        等待或观察
 /tasks cancel <id>            取消任务
 /tasks cleanup <id>           清理任务状态和产物
 /tasks pin|unpin <id>         保留或解除保留
@@ -351,11 +346,11 @@ Plan Mode 先使用仓库证据回答能够从环境中确定的问题，再沿�
 ```text
 Read  Grep  Glob
 WebFetch  WebSearch
-Agent  Task
+Subagent  Task
 SubmitPlan
 ```
 
-其中 `Agent` 只可启动 `explore`、`research`、`general` 和 `verify` 类型的只读任务；`Task` 只可查询、等待和观察任务。Runtime 会在工具执行前再次校验当前模式，因此写文件、编辑、Shell、动态 MCP 工具和具有写权限的 Subagent 不会在 Plan Mode 中执行。
+其中 `Subagent` 只可启动 `explore`、`research`、`general` 和 `verify` 类型的只读后台任务；`Task` 只可查询任务。Runtime 会在工具执行前再次校验当前模式，因此写文件、编辑、Shell、动态 MCP 工具和具有写权限的 Subagent 不会在 Plan Mode 中执行。
 
 ### 提交、修订和批准
 

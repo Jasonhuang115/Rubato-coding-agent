@@ -14,7 +14,7 @@ export function buildPlanPrompt(ctx: AgentContext, tools: ToolDefinition[]): str
 - Do not implement, edit files, generate code into the workspace, or run commands that rewrite or build the project.
 - If the user asks you to implement while Plan mode is active, continue planning until a submitted plan is explicitly approved.
 - You may use only these tools: ${tools.map((tool) => tool.name).join(", ")}.
-- Agent delegates must be read-only exploration or research. Task may only inspect or wait for tasks.
+- Subagent tasks must be read-only exploration or research and always run in the background. Task may only inspect task state.
 
 ## Workflow
 

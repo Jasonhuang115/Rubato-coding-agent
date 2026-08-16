@@ -23,7 +23,7 @@ export function getAllTools(): ToolDefinition[] {
 }
 
 export const PLAN_TOOL_NAMES = new Set([
-  "Read", "Grep", "Glob", "WebFetch", "WebSearch", "Agent", "Task", "SubmitPlan",
+  "Read", "Grep", "Glob", "WebFetch", "WebSearch", "Subagent", "Task", "SubmitPlan",
 ]);
 
 export function getToolsForMode(mode: AgentMode): ToolDefinition[] {

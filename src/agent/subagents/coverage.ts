@@ -2,7 +2,6 @@ import fs from "fs";
 import path from "path";
 import { createHash } from "crypto";
 import type {
-  CompleteTaskCoverageDeclaration,
   CoverageFileEntry,
   CoverageManifest,
   SubagentCoverageTracker,
@@ -33,20 +32,8 @@ const EXHAUSTIVE_TASK_PATTERNS = [
   /完整(?:详细)?(?:地)?(?:探索|审查|检查|阅读|分析)/,
 ];
 
-const EXHAUSTIVE_CLAIM_PATTERNS = [
-  /\bevery\s+(?:line|source\s+file|code\s+file)\s+(?:was|has been|is)\s+(?:read|inspected|reviewed|covered)\b/i,
-  /\ball\s+(?:source|code)\s+files?\s+(?:were|have been|are)\s+(?:read|inspected|reviewed|covered)\b/i,
-  /\b(?:complete|full|100%)\s+(?:file|line|source|code)?\s*coverage\b/i,
-  /(?:已经|已)(?:逐行|完整)(?:阅读|检查|审查|覆盖)/,
-  /(?:所有|全部)(?:源代码|代码文件|源码文件)(?:均|都)?(?:已经|已)?(?:阅读|检查|审查|覆盖)/,
-];
-
 export function taskRequiresExhaustiveCoverage(prompt: string): boolean {
   return EXHAUSTIVE_TASK_PATTERNS.some((pattern) => pattern.test(prompt));
-}
-
-export function makesExhaustiveClaim(text: string): boolean {
-  return EXHAUSTIVE_CLAIM_PATTERNS.some((pattern) => pattern.test(text));
 }
 
 export function coverageSummary(manifest: CoverageManifest) {
@@ -75,9 +62,7 @@ export function emptyCoverageManifest(required = false): CoverageManifest {
 }
 
 /**
- * Builds a coverage manifest exclusively from observable tool activity. Model
- * declarations may narrow the intended roots and justify exclusions, but may
- * not invent inspected files or hashes.
+ * Builds a coverage manifest exclusively from observable tool activity.
  */
 export class ObservableCoverageTracker implements SubagentCoverageTracker {
   readonly required: boolean;
@@ -85,7 +70,6 @@ export class ObservableCoverageTracker implements SubagentCoverageTracker {
   private readonly files = new Map<string, MutableCoverageFile>();
   private readonly discoveryRuns: DiscoveryRun[] = [];
   private readonly notes: string[] = [];
-  private declaration?: CompleteTaskCoverageDeclaration;
 
   constructor(
     private readonly workingDir: string,
@@ -114,36 +98,6 @@ export class ObservableCoverageTracker implements SubagentCoverageTracker {
     }
   }
 
-  applyDeclaration(declaration?: CompleteTaskCoverageDeclaration): string[] {
-    const exclusions = (declaration?.exclusions ?? []).map((exclusion) => ({
-      ...exclusion,
-      target: this.resolve(exclusion.path),
-    }));
-    const unmatched = exclusions
-      .filter((exclusion) => !this.files.has(exclusion.target))
-      .map((exclusion) => exclusion.path);
-    if (unmatched.length > 0) return unmatched;
-
-    // A retry may replace an earlier declaration. Rebuild exclusion state from
-    // observable reads first so a rejected attempt cannot poison later gates.
-    for (const entry of this.files.values()) {
-      if (entry.status !== "excluded") continue;
-      const fullyRead = typeof entry.line_count === "number" &&
-        rangesCover(entry.inspected_ranges, entry.line_count);
-      entry.status = fullyRead ? "inspected" : "discovered";
-      entry.reason = fullyRead ? undefined : "Discovered but not fully inspected.";
-    }
-
-    this.declaration = declaration;
-    for (const exclusion of exclusions) {
-      const entry = this.files.get(exclusion.target);
-      if (!entry) continue;
-      entry.status = "excluded";
-      entry.reason = exclusion.reason.trim();
-    }
-    return [];
-  }
-
   snapshot(): CoverageManifest {
     const scopeRoots = this.scopeRoots();
     const scopedFiles = [...this.files.values()]
@@ -161,7 +115,7 @@ export class ObservableCoverageTracker implements SubagentCoverageTracker {
         (run.root === scopeRoot || isInside(scopeRoot, run.root)),
       ));
     const complete = discoveryComplete && failed === 0 && unresolved === 0;
-    const required = this.required || this.declaration?.exhaustive === true;
+    const required = this.required;
     const notes = [...this.notes];
     if (!discoveryComplete) {
       notes.push(
@@ -298,10 +252,6 @@ export class ObservableCoverageTracker implements SubagentCoverageTracker {
   }
 
   private scopeRoots(): string[] {
-    const declared = this.declaration?.scope_roots
-      ?.filter((value) => value.trim().length > 0)
-      .map((value) => this.resolve(value));
-    if (declared && declared.length > 0) return unique(declared);
     const inferred = this.discoveryRuns
       .filter((run) => run.broad && !run.failed)
       .map((run) => run.root);

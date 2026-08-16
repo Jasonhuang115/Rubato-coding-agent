@@ -3,17 +3,15 @@ import { processSubagentRegistry } from "../agent/subagents/registry.js";
 
 export const taskTool: ToolDefinition = {
   name: "Task",
-  description: "Inspect, wait for, cancel, or clean up managed subagent tasks in the current root session.",
+  description: "Inspect, cancel, or clean up background subagent tasks in the current root session.",
   inputSchema: {
     type: "object",
     properties: {
       action: {
         type: "string",
-        enum: ["list", "get", "wait", "watch", "cancel", "cleanup", "pin", "unpin", "stats", "prune"],
+        enum: ["list", "get", "cancel", "cleanup", "pin", "unpin", "stats", "prune"],
       },
       task_id: { type: "string" },
-      timeout_ms: { type: "number" },
-      cascade: { type: "boolean" },
     },
     required: ["action"],
   },
@@ -25,7 +23,7 @@ export const taskTool: ToolDefinition = {
     }
     const runtime = processSubagentRegistry.get(ctx.sessionId);
     const action = String(input.action ?? "");
-    if (ctx.mode === "plan" && !new Set(["list", "get", "wait", "watch", "stats"]).has(action)) {
+    if (ctx.mode === "plan" && !new Set(["list", "get", "stats"]).has(action)) {
       return { content: `Task action "${action}" is blocked in Plan mode.`, isError: true };
     }
     if (!runtime) {
@@ -47,20 +45,8 @@ export const taskTool: ToolDefinition = {
           ? { content: JSON.stringify(task, null, 2) }
           : { content: `Unknown task: ${taskId}`, isError: true };
       }
-      case "wait":
-      case "watch": {
-        try {
-          const result = await runtime.wait(
-            taskId,
-            typeof input.timeout_ms === "number" ? input.timeout_ms : undefined,
-          );
-          return { content: JSON.stringify(result, null, 2) };
-        } catch (error) {
-          return { content: error instanceof Error ? error.message : String(error), isError: true };
-        }
-      }
       case "cancel":
-        await runtime.cancel(taskId, input.cascade !== false);
+        await runtime.cancel(taskId);
         return { content: `Cancellation requested for ${taskId}.` };
       case "cleanup":
         try {

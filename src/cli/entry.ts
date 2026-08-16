@@ -36,7 +36,7 @@ import { globTool } from "../tools/glob.js";
 import { webFetchTool, webSearchTool } from "../tools/web.js";
 import { todoWriteTool } from "../tools/todo.js";
 import { submitPlanTool } from "../tools/submit-plan.js";
-import { agentTool } from "../tools/agent.js";
+import { subagentTool } from "../tools/subagent.js";
 import { skillTool } from "../tools/skill.js";
 import { taskTool } from "../tools/task.js";
 import { memoryFeedbackTool } from "../tools/memory-feedback.js";
@@ -67,7 +67,7 @@ register(webFetchTool);
 register(webSearchTool);
 register(todoWriteTool);
 register(submitPlanTool);
-register(agentTool);
+register(subagentTool);
 register(taskTool);
 register(skillTool);
 register(memoryFeedbackTool);
@@ -87,7 +87,7 @@ function getSlashCompletions(): string[] {
     "/profile pause-learning", "/profile resume-learning",
     "/model",
     "/sessions", "/sessions list", "/sessions resume",
-    "/tasks", "/tasks wait", "/tasks watch", "/tasks cancel", "/tasks cleanup",
+    "/tasks", "/tasks cancel", "/tasks cleanup",
     "/tasks pin", "/tasks unpin", "/tasks stats", "/tasks prune", "/trace",
     "/scrub", "/scrub --dry-run",
   ];
@@ -314,6 +314,7 @@ function createRepl(
           console.log("  /profile show     — Show verified user profile");
           console.log("  /model            — List / switch models");
           console.log("  /sessions         — List project sessions | /sessions resume <#>");
+          console.log("  /tasks            — Inspect background Subagent state and report paths");
           console.log("  /scrub --dry-run [path] — Audit persisted data without changing files");
           console.log("  /scrub [path]     — Redact persisted trace/session/artifact files in place");
           console.log("  /help             — Show this help");
@@ -374,51 +375,6 @@ function createRepl(
         } else {
           return trimmed || null;
         }
-  };
-}
-
-function createRequiredTaskCommandRouter(
-  rl: readline.Interface,
-  rootSessionId: string,
-): () => void {
-  const runtime = processSubagentRegistry.get(rootSessionId);
-  if (!runtime) return () => {};
-  let listening = false;
-
-  const onLine = (raw: string) => {
-    const input = raw.trim();
-    if (input.startsWith("/tasks")) {
-      void handleTasksCommand(input, rootSessionId);
-    } else if (input.startsWith("/trace")) {
-      handleTraceCommand(input, rootSessionId);
-    } else if (input) {
-      console.log(
-        "\n  A required subagent is still running. " +
-        "Available commands: /tasks, /tasks cancel <id>, /trace, or Ctrl+C.",
-      );
-    }
-  };
-
-  const refresh = () => {
-    const hasRequired = runtime.list().some((task) =>
-      task.dependency === "required" &&
-      (task.status === "queued" || task.status === "running" || task.status === "waiting_child"),
-    );
-    if (hasRequired && !listening) {
-      listening = true;
-      rl.on("line", onLine);
-      console.log("\n  Required subagent running — /tasks and /trace remain available.");
-    } else if (!hasRequired && listening) {
-      listening = false;
-      rl.removeListener("line", onLine);
-    }
-  };
-
-  const unsubscribe = runtime.subscribe(refresh);
-  refresh();
-  return () => {
-    unsubscribe();
-    if (listening) rl.removeListener("line", onLine);
   };
 }
 
@@ -650,25 +606,20 @@ async function main(): Promise<void> {
   // Ctrl+C handling: abort current request when processing, exit when idle
   const onSigInt = () => {
     if (processing) {
-      const runtime = processSubagentRegistry.get(activeSessionId);
-      const requiredTask = runtime?.list().slice().reverse().find((task) =>
-        task.dependency === "required" &&
-        (task.status === "queued" || task.status === "running" || task.status === "waiting_child"),
-      );
-      if (requiredTask) {
-        void runtime?.cancel(requiredTask.taskId, true);
-        console.log(`\n  ⏹ Cancelling required subagent ${requiredTask.taskId}...`);
-      } else {
-        abortCurrentRequest();
-        console.log("\n  ⏹ Interrupted — returning to prompt...");
-      }
+      abortCurrentRequest();
+      console.log("\n  ⏹ Interrupted current root run — background Subagents continue...");
     } else {
+      const runtime = processSubagentRegistry.get(activeSessionId);
+      if (runtime?.hasPendingTasks()) {
+        console.log("\n  Background Subagents are still active. Use /tasks to inspect or /exit to stop the process.");
+        return;
+      }
       console.log("\n  Exiting...");
       memoryMaintenance.cancel();
       for (const runtime of processSubagentRegistry.list()) {
         for (const task of runtime.list()) {
-          if (task.status === "queued" || task.status === "running" || task.status === "waiting_child") {
-            void runtime.cancel(task.taskId, true);
+          if (task.status === "queued" || task.status === "running") {
+            void runtime.cancel(task.taskId);
           }
         }
       }
@@ -698,9 +649,9 @@ async function main(): Promise<void> {
     const runtime = processSubagentRegistry.get(finalizedSessionId);
     if (runtime) {
       const pending = runtime.list().filter((task) =>
-        task.status === "queued" || task.status === "running" || task.status === "waiting_child",
+        task.status === "queued" || task.status === "running",
       );
-      void Promise.all(pending.map((task) => runtime.cancel(task.taskId, true)))
+      void Promise.all(pending.map((task) => runtime.cancel(task.taskId)))
         .finally(() => processSubagentRegistry.remove(finalizedSessionId));
     }
   };
@@ -712,8 +663,6 @@ async function main(): Promise<void> {
 
     const resumeSummary = loopState.resumeSummary ?? initialResumeSummary;
     initialResumeSummary = undefined; // only inject on first iteration
-    let stopRequiredTaskRouter: (() => void) | undefined;
-
     try {
       for await (const event of agentLoop({
         config,
@@ -733,9 +682,6 @@ async function main(): Promise<void> {
         switch (event.type) {
           case "turn_start":
             processing = true;
-            if (rl && !stopRequiredTaskRouter) {
-              stopRequiredTaskRouter = createRequiredTaskCommandRouter(rl, activeSessionId);
-            }
             break;
 
           case "text":
@@ -792,7 +738,7 @@ async function main(): Promise<void> {
       renderer.renderError(`Fatal: ${message}`);
       process.exit(1);
     } finally {
-      stopRequiredTaskRouter?.();
+      processing = false;
     }
 
     // Finalize session if it was active
@@ -818,8 +764,8 @@ async function main(): Promise<void> {
   memoryMaintenance.cancel();
   for (const runtime of processSubagentRegistry.list()) {
     for (const task of runtime.list()) {
-      if (task.status === "queued" || task.status === "running" || task.status === "waiting_child") {
-        await runtime.cancel(task.taskId, true);
+      if (task.status === "queued" || task.status === "running") {
+        await runtime.cancel(task.taskId);
       }
     }
   }

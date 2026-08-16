@@ -62,7 +62,7 @@ class SkillRegistryImpl implements SkillRegistryInterface {
     this.skills.set(skill.name, skill);
 
     // If the skill defines tools + systemPrompt, create a SubagentDefinition
-    // so it can be spawned via spawnSubagent (fork mode)
+    // so it can be dispatched as a background task (fork mode)
     if (skill.systemPrompt || skill.tools) {
       const subagentDef = skillToSubagentDef(skill);
       // Avoid duplicates in the shared list
@@ -205,7 +205,6 @@ function skillToSubagentDef(skill: SkillDefinition): SubagentDefinition {
     tools: skill.tools ?? ["Read", "Grep", "Glob", "Bash"],
     model: skill.model ?? "inherit",
     readonly: skill.context === "fork",   // fork-mode subagents are read-only
-    maxTurns: skill.maxTurns ?? 15,
   };
 }
 

@@ -3,8 +3,8 @@
 
 import type { ToolDefinition, AgentContext } from "../shared/core-types.js";
 import { getSkillRegistry } from "../skills/registry.js";
-import { spawnSubagent } from "../agent/subagent.js";
-import { PolicyEngine } from "../security/policy/engine.js";
+import { resolveSubagentTools } from "../agent/subagent.js";
+import { processSubagentRegistry } from "../agent/subagents/registry.js";
 
 export const skillTool: ToolDefinition = {
   name: "Skill",
@@ -23,8 +23,12 @@ export const skillTool: ToolDefinition = {
         type: "string",
         description: "Optional arguments to pass to the skill (e.g., a file path or task description)",
       },
+      timeout_ms: {
+        type: "number",
+        description: "Generous safety ceiling in milliseconds; not a work budget.",
+      },
     },
-    required: ["skill"],
+    required: ["skill", "timeout_ms"],
   },
   type: "write",
   requiresApproval: false, // skill is pre-authorized by definition
@@ -36,6 +40,13 @@ export const skillTool: ToolDefinition = {
   ) => {
     const skillName = input.skill as string;
     const args = (input.args as string) ?? "";
+    const timeoutMs = input.timeout_ms;
+    if (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      return { content: "Fork-mode Skill requires a positive timeout_ms safety ceiling.", isError: true };
+    }
+    if (ctx.taskRuntime) {
+      return { content: "Only the root agent can dispatch fork-mode Skills.", isError: true };
+    }
 
     const registry = getSkillRegistry();
     const skill = registry.getSkill(skillName);
@@ -72,42 +83,24 @@ export const skillTool: ToolDefinition = {
       tools: skill.tools ?? ["Read", "Grep", "Glob", "Bash"],
       model: skill.model ?? "inherit",
       readonly: true,
-      maxTurns: skill.maxTurns ?? 15,
-    };
-
-    // Apply allowed-tools
-    let permissions = ctx.config.permissions;
-    if (skill.allowedTools && skill.allowedTools.length > 0) {
-      const allowRules = skill.allowedTools.map((pattern) => ({
-        tool: "*" as const,
-        pattern,
-        action: "allow" as const,
-        reason: `Skill "${skill.name}" pre-authorization`,
-      }));
-      permissions = {
-        ...permissions,
-        rules: [...(permissions.rules ?? []), ...allowRules],
-      };
-    }
-
-    const subCtx: AgentContext = {
-      ...ctx,
-      sessionId: `${ctx.sessionId}-skill-${skillName}`,
-      permissionManager: new PolicyEngine(permissions),
-      config: { ...ctx.config, permissions },
     };
 
     const task = args || `Run the "${skill.name}" skill`;
-
     try {
-      const result = await spawnSubagent(subagentDef, task, subCtx, {
-        ...ctx.config,
-        permissions,
-      });
-
+      const runtime = processSubagentRegistry.getOrCreate(ctx.sessionId, ctx.workingDir, ctx.config);
+      const submitted = runtime.submit({
+        description: `${skill.name} skill`,
+        prompt: task,
+        subagent_type: skill.name,
+        model: skill.model,
+        timeout_ms: timeoutMs,
+      }, ctx, subagentDef, resolveSubagentTools(subagentDef));
       return {
-        content: result.output || `Skill "${skillName}" completed with no output.`,
-        isError: result.status !== "completed",
+        content: [
+          `Background Skill queued: ${submitted.task.taskId}`,
+          `Status: ${submitted.task.status}`,
+          `Report: ${submitted.task.artifacts.report}`,
+        ].join("\n"),
       };
     } catch (err) {
       return {

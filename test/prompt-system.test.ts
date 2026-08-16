@@ -1,8 +1,7 @@
-// PromptAssembler tests — the prompt path used by ContextAssembler.
-import { describe, it, expect } from "vitest";
+import { describe, expect, it } from "vitest";
 import { PromptAssembler, getPromptAssembler } from "../src/prompt/assembler.js";
-import { assembleContext } from "../src/runtime/context-assembler.js";
 import { buildCapabilityPrompt } from "../src/prompt/capability.js";
+import { assembleContext } from "../src/runtime/context-assembler.js";
 
 const ctx = {
   workingDir: "/test",
@@ -28,32 +27,25 @@ describe("PromptAssembler", () => {
   });
 
   it("keeps one production singleton", () => {
-    const first = getPromptAssembler();
-    expect(getPromptAssembler()).toBe(first);
+    expect(getPromptAssembler()).toBe(getPromptAssembler());
   });
 
-  it("keeps root ownership and makes advisory the normal delegation mode", () => {
+  it("describes the asynchronous report and timeout contract", () => {
     const prompt = buildCapabilityPrompt([{
-      name: "Agent",
+      name: "Subagent",
       type: "read",
-      description: "Delegate analysis",
+      description: "Background analysis",
       inputSchema: { type: "object", properties: {} },
     } as any]);
-
-    expect(prompt).toContain("Mandatory delegation checkpoint");
-    expect(prompt).toContain("Before creating a TodoWrite plan or starting broad reads");
-    expect(prompt).toContain("two or more genuinely independent substantial scopes");
-    expect(prompt).toContain("you MUST partition the work");
-    expect(prompt).toContain("Never hand the entire user request to a subagent");
-    expect(prompt).toContain("retain a meaningful, non-overlapping part");
-    expect(prompt).toContain("non-blocking now");
-    expect(prompt).toContain("optional forever");
-    expect(prompt).toContain("immediate decision gate");
-    expect(prompt).toContain("final join point");
-    expect(prompt).toContain("Always pass `dependency` explicitly");
+    expect(prompt).toContain("always dispatches");
+    expect(prompt).toContain("returns immediately");
+    expect(prompt).toContain("not a work budget");
+    expect(prompt).toContain("Never wait, watch, join, acknowledge, or poll");
+    expect(prompt).toContain("Grep its exposed path first");
+    expect(prompt).toContain("Subagents cannot dispatch Subagents");
   });
 
-  it("replaces root identity for a fresh subagent profile", async () => {
+  it("replaces root identity and requires progressive reporting", async () => {
     const result = await assembleContext({
       workingDir: "/tmp",
       prompt: "inspect one thing",
@@ -62,10 +54,9 @@ describe("PromptAssembler", () => {
       roleSystemPrompt: "You are the dedicated architecture verifier.",
       contextProfile: "subagent",
     });
-
     expect(result.systemPrompt).toContain("dedicated architecture verifier");
-    expect(result.systemPrompt).toContain("MUST call CompleteTask");
+    expect(result.systemPrompt).toContain("appended to report.md while you work");
+    expect(result.systemPrompt).toContain("End naturally");
     expect(result.systemPrompt).not.toContain("You are Rubato (rubato)");
-    expect(result.systemPrompt).not.toContain("Previous Session Context");
   });
 });
