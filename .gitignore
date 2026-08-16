@@ -7,3 +7,10 @@ dist/
 .env
 .env.local
 /.rubato/worktrees/
+
+# Rubato-generated local state
+/.agent/workflow-profile.json
+/.agent/plans/
+
+# Benchmark output
+/predictions.json
