@@ -126,11 +126,9 @@ REPL Commands:
   /paste               Send the full clipboard as one prompt
   /clear               Start a fresh session (saves current)
   /plan on|off|status  Switch or inspect Plan mode
-  /remember <text>     Record explicit user-authored memory evidence
-  /memory stats        Show verified file-memory status
-  /memory search <q>   Search the verified memory catalog
-  /profile show        Show the bounded user profile
-  /profile why <key>   Explain a memory's evidence and revision
+  /remember <text>     Ask the Agent to retain useful information
+  /memory status       Show project and user memory status
+  /memory paths        Show agent-managed memory directories
   /sessions            List project sessions
   /sessions resume <n> Resume a past session
   /scrub --dry-run     Audit persisted traces/sessions/artifacts for secrets

@@ -21,7 +21,7 @@ export const taskTool: ToolDefinition = {
     if (ctx.taskRuntime) {
       return { content: "Task management is available only to the root Agent.", isError: true };
     }
-    const runtime = processSubagentRegistry.get(ctx.sessionId);
+    const runtime = processSubagentRegistry.get(ctx.conversationId ?? ctx.sessionId);
     const action = String(input.action ?? "");
     if (ctx.mode === "plan" && !new Set(["list", "get", "stats"]).has(action)) {
       return { content: `Task action "${action}" is blocked in Plan mode.`, isError: true };

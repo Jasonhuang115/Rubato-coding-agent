@@ -27,11 +27,6 @@ import { SessionStore } from "../runtime/session/storage.js";
 import { createSessionMeta, finalizeSessionMeta } from "../runtime/session/meta.js";
 import type { SessionManager } from "../runtime/session/manager.js";
 import { AgentModeController } from "./mode.js";
-import {
-  learnFromStoredSessionRecords,
-  type FileMemoryLearningResult,
-} from "../memory-files/runtime.js";
-import { scheduleDreams } from "../memory-files/scheduler.js";
 import { sessionEndHook } from "../tools/git/hooks.js";
 import { assembleContext } from "../runtime/context-assembler.js";
 import { checkAndCompact, runMicroCompact } from "../runtime/compaction-controller.js";
@@ -45,7 +40,8 @@ import {
 import { processSubagentRegistry } from "./subagents/registry.js";
 import type { TaskInboxEvent } from "./subagents/conversation-inbox.js";
 import { RootDelegationGate } from "./delegation-gate.js";
-import { projectMemoryId } from "../memory-files/paths.js";
+import { projectMemoryId } from "../shared/project-id.js";
+import { AssistantDraftWriter } from "../runtime/assistant-draft.js";
 
 // ---- Configuration ----
 
@@ -94,6 +90,9 @@ export interface AgentLoopOptions {
   prompt: string;
   renderer: StreamRenderer;
   sessionId?: string;
+  /** Stable logical conversation ID; defaults to the current run ID. */
+  conversationId?: string;
+  runTrigger?: "user_message" | "subagent_terminal" | "resume";
   tools?: ToolDefinition[];
   getNextUserMessage?: (signal?: AbortSignal) => Promise<string | null>;
   forceCompaction?: boolean;
@@ -120,19 +119,25 @@ export async function* agentLoop(
 
   // ---- Setup ----
   const sessionId = options.sessionId ?? randomUUID();
+  const conversationId = options.conversationId ?? sessionId;
   let provider = createProvider(config.model);
   const registeredTools = options.tools ?? getAllTools();
   const modeController = options.modeController ?? new AgentModeController();
   let tools = options.tools ?? getToolsForMode(modeController.mode);
   const isRootProfile = (options.contextProfile ?? "root") === "root";
   const rootRuntime = isRootProfile
-    ? processSubagentRegistry.getOrCreate(sessionId, workingDir, config)
+    ? processSubagentRegistry.getOrCreate(conversationId, workingDir, config, sessionId)
     : undefined;
+  if (rootRuntime && options.runTrigger === "resume") {
+    await rootRuntime.resumePersistedTasks();
+  }
   rootRuntime?.trace.append({
     type: "root_session_started",
     sessionId,
     agentId: sessionId,
     prompt,
+    provider: config.model.provider,
+    model: config.model.model,
   });
 
   // Security + Tool runtime
@@ -151,25 +156,51 @@ export async function* agentLoop(
   const projectHash = options.sessionManager?.getProjectHash() ?? projectMemoryId(workingDir);
   const sessionStore = new SessionStore(sessionId, projectHash);
   const persistConversation = (options.contextProfile ?? "root") === "root";
+  const assistantDraft = persistConversation
+    ? new AssistantDraftWriter(projectHash, sessionId)
+    : undefined;
+  let rootLeaseHeartbeat: ReturnType<typeof setInterval> | undefined;
+  const recordUserMessage = (content: string): void => {
+    const stored = sessionStore.writeMessage({ role: "user", content });
+    if (stored && rootRuntime) {
+      rootRuntime.controlPlane.createUserMessageEvent(
+        conversationId,
+        stored.event_id,
+        sessionId,
+        stored.timestamp,
+      );
+    }
+  };
   if (persistConversation) {
     sessionStore.init();
-    sessionStore.writeMessage({ role: "user", content: prompt });
+    recordUserMessage(prompt);
+    rootRuntime?.controlPlane.createRun({
+      runId: sessionId,
+      conversationId,
+      kind: "root",
+      trigger: options.runTrigger ?? (options.resumeSummary ? "resume" : "user_message"),
+      provider: config.model.provider,
+      model: config.model.model,
+      sessionPath: sessionStore.getFilePath(),
+      tracePath: rootRuntime.trace.path,
+      draftPath: assistantDraft?.filePath,
+    });
+    if (rootRuntime) {
+      rootLeaseHeartbeat = setInterval(() => {
+        rootRuntime.controlPlane.heartbeatRun(sessionId);
+      }, 5_000);
+      rootLeaseHeartbeat.unref();
+    }
   }
-  const initialMemoryLearning = persistConversation
-    ? learnLatestUserMemory(
-        sessionStore,
-        workingDir,
-        config,
-        sessionId,
-      )
-    : null;
-
   let sessionMeta = createSessionMeta(
     sessionId,
     `${config.model.provider}/${config.model.model}`,
     undefined,
     { firstMessage: prompt.slice(0, 200) },
   );
+  let rootInputTokens = 0;
+  let rootOutputTokens = 0;
+  let rootToolCalls = 0;
 
   const delegationGate = isRootProfile
     ? new RootDelegationGate(prompt)
@@ -178,6 +209,9 @@ export async function* agentLoop(
   // Agent context
   const ctx: AgentContext = {
     workingDir,
+    projectId: projectHash,
+    conversationId,
+    runId: sessionId,
     sessionId,
     readGuard,
     permissionManager,
@@ -214,10 +248,6 @@ export async function* agentLoop(
   const messages: Message[] = [
     { role: "user", content: prompt },
   ];
-  for (const warning of memoryLearningNotices(initialMemoryLearning)) {
-    yield { type: "warning", message: warning };
-  }
-
   // ---- Compaction tracking ----
   let consecutiveCompactionFailures = 0;
   let skipAutoCompact = options.skipCompaction ?? false;
@@ -348,11 +378,14 @@ export async function* agentLoop(
                 startedAt: event.startedAt,
                 durationMs: event.durationMs,
               });
-            }
+          }
           : undefined,
+        onTextDelta: assistantDraft ? (text) => assistantDraft.append(text) : undefined,
+        onTextFlush: assistantDraft ? () => assistantDraft.flush() : undefined,
       });
     } catch (err) {
       if (err instanceof UserInterruptError) {
+        assistantDraft?.boundary("interrupted");
         rootRuntime?.trace.append({
           type: "root_turn_failed",
           sessionId,
@@ -363,7 +396,7 @@ export async function* agentLoop(
         yield { type: "warning", message: "Interrupted (Ctrl+C)" };
         if (options.getNextUserMessage) {
           yield { type: "waiting_for_input" };
-          const runtime = processSubagentRegistry.get(sessionId);
+          const runtime = processSubagentRegistry.get(conversationId);
           let nextMessage: string | null = null;
           if (runtime?.hasPendingTasks()) {
             const waitController = new AbortController();
@@ -388,7 +421,7 @@ export async function* agentLoop(
             ctx.mode = modeController.mode;
             delegationGate?.observeUserMessage(rawMessage);
             messages.push({ role: "user", content: transformed.modelMessage });
-            if (persistConversation) sessionStore.writeMessage({ role: "user", content: rawMessage });
+            if (persistConversation) recordUserMessage(rawMessage);
             continue;
           }
         }
@@ -468,11 +501,15 @@ export async function* agentLoop(
     if (persistConversation) {
       persistTurnMessages(sessionStore, messages.slice(preTurnMessageCount));
     }
+    assistantDraft?.boundary("turn_complete");
 
     sessionMeta.messageCount = (sessionMeta.messageCount ?? 0) + 1;
     if (usage) {
       sessionMeta.totalTokens += usage.input + usage.output;
+      rootInputTokens += usage.input;
+      rootOutputTokens += usage.output;
     }
+    rootToolCalls += toolExecutions.length;
 
     yield {
       type: "turn_end",
@@ -508,7 +545,7 @@ export async function* agentLoop(
       ctx.mode = modeController.mode;
       messages.push({ role: "user", content: transformed.modelMessage });
       if (persistConversation) {
-        sessionStore.writeMessage({ role: "user", content: raw });
+        recordUserMessage(raw);
         sessionStore.writeToolEvent({
           type: transformed.event === "approved" ? "plan_approved" : "plan_revision_requested",
           path: control.path,
@@ -528,7 +565,7 @@ export async function* agentLoop(
     if (stopReason === "end_turn" || toolUses.length === 0) {
       const runtime = options.contextProfile === "subagent"
         ? undefined
-        : processSubagentRegistry.get(sessionId);
+        : processSubagentRegistry.get(conversationId);
       const completedTasks = runtime?.inbox.drain() ?? [];
       if (completedTasks.length > 0) {
         runtime?.trace.append({
@@ -604,16 +641,7 @@ export async function* agentLoop(
         }
         messages.push({ role: "user", content: transformed.modelMessage });
         if (persistConversation) {
-          sessionStore.writeMessage({ role: "user", content: rawMessage });
-          const learned = learnLatestUserMemory(
-            sessionStore,
-            workingDir,
-            config,
-            sessionId,
-          );
-          for (const warning of memoryLearningNotices(learned)) {
-            yield { type: "warning", message: warning };
-          }
+          recordUserMessage(rawMessage);
         }
         sessionMeta.messageCount = (sessionMeta.messageCount ?? 0) + 1;
         continue;
@@ -639,16 +667,7 @@ export async function* agentLoop(
         delegationGate?.observeUserMessage(rawMessage);
         messages.push({ role: "user", content: transformed.modelMessage });
         if (persistConversation) {
-          sessionStore.writeMessage({ role: "user", content: rawMessage });
-          const learned = learnLatestUserMemory(
-            sessionStore,
-            workingDir,
-            config,
-            sessionId,
-          );
-          for (const warning of memoryLearningNotices(learned)) {
-            yield { type: "warning", message: warning };
-          }
+          recordUserMessage(rawMessage);
         }
         sessionMeta.messageCount = (sessionMeta.messageCount ?? 0) + 1;
         continue;
@@ -696,43 +715,6 @@ export async function* agentLoop(
     sessionStore.close();
   }
 
-  // Root-session fast extraction is deterministic and idempotent. Processing
-  // the closed transcript catches any user evidence not handled immediately.
-  const finalLearning = learnAllSessionMemory(
-    sessionStore,
-    workingDir,
-    config,
-    sessionId,
-  );
-  for (const warning of memoryLearningNotices(finalLearning)) {
-    yield { type: "warning", message: warning };
-  }
-  try {
-    const scheduled = scheduleDreams({
-      workingDir,
-      enabled:
-        config.memory?.enabled !== false &&
-        config.memory?.learningEnabled !== false,
-      ...(config.memory ? {
-        policy: {
-          closed_sessions: config.memory.dreamSessionThreshold,
-          pending_candidates: config.memory.dreamCandidateThreshold,
-          observation_age_hours: config.memory.dreamMaxAgeHours,
-        },
-      } : {}),
-    });
-    if (scheduled.queued.length > 0) {
-      yield {
-        type: "warning",
-        message:
-          `🌙 已持久化排队 ${scheduled.queued.length} 个 Dream；` +
-          "它们只会生成结构化候选，不能自行删除或直接改写 verified memory。",
-      };
-    }
-  } catch {
-    // A scheduler failure cannot invalidate the closed session or final answer.
-  }
-
   rootRuntime?.trace.append({
     type: "root_session_ended",
     sessionId,
@@ -740,6 +722,22 @@ export async function* agentLoop(
     reason: doneReason,
     usage: { totalTokens: sessionMeta.totalTokens },
   });
+  assistantDraft?.flush();
+  if (rootLeaseHeartbeat) clearInterval(rootLeaseHeartbeat);
+  rootRuntime?.controlPlane.finishRun(
+    sessionId,
+    new Set(["circuit_breaker", "max_retries", "stream_failed", "user_interrupt"])
+      .has(doneReason ?? "")
+      ? "failed"
+      : "finished",
+    {
+      failureKind: doneReason ?? undefined,
+      inputTokens: rootInputTokens,
+      outputTokens: rootOutputTokens,
+      toolCalls: rootToolCalls,
+    },
+  );
+  await rootRuntime?.trace.flush();
   yield { type: "done", reason: doneReason };
 }
 
@@ -759,7 +757,7 @@ function formatInboxEvents(events: TaskInboxEvent[]): string {
 export function formatSubagentStatus(
   runtime: ReturnType<typeof processSubagentRegistry.get>,
 ): string {
-  const tasks = runtime?.list() ?? [];
+  const tasks = runtime?.statusSnapshot() ?? [];
   if (tasks.length === 0) return "";
   return [
     "## Current Subagent tasks",
@@ -768,9 +766,8 @@ export function formatSubagentStatus(
       `- task_id: ${task.taskId}`,
       `  description: ${task.description.replace(/\s+/g, " ").slice(0, 200)}`,
       `  status: ${task.status}`,
-      `  report: ${task.artifacts.report}`,
+      `  report: ${task.reportPath}`,
       ...(task.failureKind ? [`  failure_kind: ${task.failureKind}`] : []),
-      ...(task.error ? [`  error: ${task.error.replace(/\s+/g, " ").slice(0, 240)}`] : []),
     ].join("\n")),
     "Use Grep first and then a targeted Read when a report is relevant. Do not infer its contents from status or path.",
   ].join("\n");
@@ -790,67 +787,4 @@ function persistTurnMessages(store: SessionStore, messages: Message[]): void {
       }
     }
   }
-}
-
-function learnLatestUserMemory(
-  store: SessionStore,
-  workingDir: string,
-  config: AgentConfig,
-  sessionId: string,
-): FileMemoryLearningResult | null {
-  const latest = store.getRecords().at(-1);
-  if (!latest || latest.type !== "message") return null;
-  try {
-    return learnFromStoredSessionRecords([latest], {
-      workingDir,
-      sessionId,
-      enabled:
-        config.memory?.enabled !== false &&
-        config.memory?.learningEnabled !== false,
-      autoPublishExplicitLowRisk:
-        config.memory?.autoPublishExplicitLowRisk !== false,
-    });
-  } catch {
-    return null;
-  }
-}
-
-function learnAllSessionMemory(
-  store: SessionStore,
-  workingDir: string,
-  config: AgentConfig,
-  sessionId: string,
-): FileMemoryLearningResult | null {
-  try {
-    return learnFromStoredSessionRecords(store.getRecords(), {
-      workingDir,
-      sessionId,
-      enabled:
-        config.memory?.enabled !== false &&
-        config.memory?.learningEnabled !== false,
-      autoPublishExplicitLowRisk:
-        config.memory?.autoPublishExplicitLowRisk !== false,
-    });
-  } catch {
-    return null;
-  }
-}
-
-function memoryLearningNotices(
-  result: FileMemoryLearningResult | null,
-): string[] {
-  if (!result) return [];
-  const notices: string[] = [];
-  if (result.publishedReleaseIds.length > 0) {
-    notices.push(
-      `🧠 已根据你的明确表达更新 ${result.publishedReleaseIds.length} 个文件记忆 release；` +
-      "可用 /profile why <key> 查看依据。",
-    );
-  }
-  if (result.needsReview > 0) {
-    notices.push(
-      `🧠 ${result.needsReview} 个记忆变化因冲突或风险进入 review，未自动生效。`,
-    );
-  }
-  return notices;
 }

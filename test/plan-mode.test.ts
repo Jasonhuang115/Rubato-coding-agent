@@ -73,13 +73,13 @@ describe("Plan mode state and prompt", () => {
 
   it("defines the asynchronous public Plan allowlist", () => {
     expect([...PLAN_TOOL_NAMES].sort()).toEqual([
-      "Glob", "Grep", "Read", "Subagent", "SubmitPlan", "Task", "WebFetch", "WebSearch",
+      "Glob", "Grep", "Memory", "Read", "Subagent", "SubmitPlan", "Task", "WebFetch", "WebSearch",
     ]);
   });
 });
 
 describe("Plan mode runtime enforcement", () => {
-  it.each(["Write", "Edit", "Bash", "TodoWrite", "Skill", "MemoryPropose", "McpDynamic"])(
+  it.each(["Write", "Edit", "Bash", "TodoWrite", "Skill", "McpDynamic"])(
     "blocks a forged %s call before its handler runs",
     async (name) => {
       let ran = false;

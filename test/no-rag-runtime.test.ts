@@ -21,30 +21,31 @@ interface RuntimeGraph {
   unresolvedRelativeSpecifiers: string[];
 }
 
-describe("normal runtime has no legacy RAG/database dependency", () => {
-  it("keeps CLI, context and agent-loop dependency graphs file-only", () => {
+describe("normal runtime has only agent-managed file memory", () => {
+  it("keeps legacy RAG and verified-memory machinery out", () => {
     const graph = buildRuntimeGraph(RUNTIME_ROOTS);
     const relativeFiles = [...graph.files]
       .map((filePath) => path.relative(PROJECT_ROOT, filePath))
       .sort();
 
     expect(graph.unresolvedRelativeSpecifiers).toEqual([]);
+    expect(relativeFiles).toContain("src/memory/store.ts");
     expect(relativeFiles.some((filePath) =>
-      filePath.startsWith("src/memory/"))).toBe(false);
+      filePath.startsWith("src/memory-files/"))).toBe(false);
     expect(relativeFiles).not.toContain("src/context/memory-md.ts");
     expect(relativeFiles).not.toContain("src/context/mnemosyne-source.ts");
-    expect(relativeFiles).not.toContain("src/memory-files/migration.ts");
-    expect(graph.externalSpecifiers.has("better-sqlite3")).toBe(false);
+    expect(relativeFiles).not.toContain("src/context/file-memory.ts");
+    expect(graph.externalSpecifiers.has("better-sqlite3")).toBe(true);
   });
 
-  it("contains no SQLite driver or migration bridge", () => {
+  it("loads SQLite only through the control-plane store", () => {
     const sqliteImports = allTypeScriptFiles(SRC_ROOT)
       .filter((filePath) =>
         /(?:from|import|require)\s*\(?\s*["']better-sqlite3["']/
           .test(fs.readFileSync(filePath, "utf8")))
       .map((filePath) => path.relative(PROJECT_ROOT, filePath))
       .sort();
-    expect(sqliteImports).toEqual([]);
+    expect(sqliteImports).toEqual(["src/runtime/control-plane/store.ts"]);
 
     const packageJson = JSON.parse(
       fs.readFileSync(path.join(PROJECT_ROOT, "package.json"), "utf8"),
@@ -52,9 +53,10 @@ describe("normal runtime has no legacy RAG/database dependency", () => {
       dependencies?: Record<string, string>;
       optionalDependencies?: Record<string, string>;
     };
-    expect(packageJson.dependencies?.["better-sqlite3"]).toBeUndefined();
+    expect(packageJson.dependencies?.["better-sqlite3"]).toBeDefined();
     expect(packageJson.optionalDependencies?.["better-sqlite3"]).toBeUndefined();
-    expect(fs.existsSync(path.join(SRC_ROOT, "memory-files", "migration.ts")))
+    expect(allTypeScriptFiles(SRC_ROOT).some((filePath) =>
+      filePath.includes(`${path.sep}memory-files${path.sep}`)))
       .toBe(false);
   });
 });

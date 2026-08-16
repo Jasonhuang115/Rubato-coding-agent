@@ -129,7 +129,12 @@ export const subagentTool: ToolDefinition = {
       scope,
       mode: ctx.mode,
     };
-    const runtime = processSubagentRegistry.getOrCreate(ctx.sessionId, ctx.workingDir, ctx.config);
+    const runtime = processSubagentRegistry.getOrCreate(
+      ctx.conversationId ?? ctx.sessionId,
+      ctx.workingDir,
+      ctx.config,
+      ctx.runId ?? ctx.sessionId,
+    );
     const effectiveDefinition = isolation === definition.isolation
       ? definition
       : { ...definition, isolation };

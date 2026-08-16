@@ -8,7 +8,6 @@ import { loadConfig, loadEnvFiles } from "./config-loader.js";
 import { parseArgs, loadMcpConfigs } from "./options.js";
 import {
   handleGitCommand,
-  handleJournalCommand,
   handleModelCommand,
   handleSessionsCommand,
   handleSkillCommand,
@@ -17,9 +16,9 @@ import {
   handleScrubCommand,
 } from "./command-handlers.js";
 import {
-  handleFileMemoryCommand,
-  handleProfileCommand,
-} from "./file-memory-commands.js";
+  handleLegacyMemoryCommand,
+  handleMemoryCommand,
+} from "./memory-commands.js";
 import { AnsiStreamRenderer } from "./stream-renderer.js";
 import { agentLoop, abortCurrentRequest } from "../agent/loop.js";
 import {
@@ -39,8 +38,7 @@ import { submitPlanTool } from "../tools/submit-plan.js";
 import { subagentTool } from "../tools/subagent.js";
 import { skillTool } from "../tools/skill.js";
 import { taskTool } from "../tools/task.js";
-import { memoryFeedbackTool } from "../tools/memory-feedback.js";
-import { memoryProposeTool } from "../tools/memory-propose.js";
+import { memoryTool } from "../tools/memory.js";
 import { AgentModeController } from "../agent/mode.js";
 import { handlePlanModeCommand } from "./plan-mode-command.js";
 import { initCustomDefinitions } from "../agent/agent-defs.js";
@@ -54,7 +52,7 @@ import type { AgentConfig } from "../shared/core-types.js";
 import { warnRecoverable } from "../shared/diagnostics.js";
 import { SessionManager } from "../runtime/session/manager.js";
 import { processSubagentRegistry } from "../agent/subagents/registry.js";
-import { startMemoryMaintenance } from "./memory-maintenance.js";
+import { migrateLegacyMemoryData } from "../memory/store.js";
 
 // Register all tools
 register(readTool);
@@ -70,8 +68,7 @@ register(submitPlanTool);
 register(subagentTool);
 register(taskTool);
 register(skillTool);
-register(memoryFeedbackTool);
-register(memoryProposeTool);
+register(memoryTool);
 
 // ---- Tab completion & / menu ----
 
@@ -80,11 +77,9 @@ function getSlashCompletions(): string[] {
     "/exit", "/quit", "/compact", "/clear", "/help", "/paste",
     "/plan", "/plan on", "/plan off", "/plan status",
     "/git", "/git health",
-    "/journal", "/journal recent", "/journal search", "/journal stats",
     "/remember",
-    "/memory", "/memory stats", "/memory search", "/memory list", "/memory dream",
-    "/profile", "/profile show", "/profile why", "/profile export",
-    "/profile pause-learning", "/profile resume-learning",
+    "/memory", "/memory status", "/memory paths", "/memory on", "/memory off",
+    "/memory project on", "/memory project off", "/memory user on", "/memory user off",
     "/model",
     "/sessions", "/sessions list", "/sessions resume",
     "/tasks", "/tasks cancel", "/tasks cleanup",
@@ -126,10 +121,8 @@ function showSlashMenu(): void {
   console.log("  /compact            Compact context");
   console.log("  /plan               Show Plan mode status | /plan on | /plan off");
   console.log("  /git                Git status | /git health");
-  console.log("  /journal            Legacy alias for file-memory list/search");
-  console.log("  /remember <text>    Send a traceable explicit memory statement");
-  console.log("  /memory             File-memory stats/search/list/dream");
-  console.log("  /profile            Show/why/export/pause/resume user profile");
+  console.log("  /remember <text>    Ask the Agent to retain useful information");
+  console.log("  /memory             Agent-managed project/user memory status and settings");
   console.log("  /model              Switch model | /model <name>");
   console.log("  /sessions           List sessions | /sessions resume <#>");
   console.log("  /tasks              List/inspect/wait/cancel/cleanup subagent tasks");
@@ -153,6 +146,7 @@ function showSlashMenu(): void {
 interface LoopState {
   shouldRestart: boolean;
   newSessionId?: string;
+  conversationId?: string;
   resumeSummary?: string;
 }
 
@@ -163,6 +157,7 @@ async function getFirstMessage(
   modeController: AgentModeController,
   workdir: string,
   config: AgentConfig,
+  projectId: string,
 ): Promise<string> {
   // eslint-disable-next-line no-constant-condition
   while (true) {
@@ -189,9 +184,11 @@ async function getFirstMessage(
       if (remembered) return remembered;
       continue;
     }
-    if (trimmed.startsWith("/journal")) { await handleJournalCommand(trimmed, workdir, config); continue; }
-    if (trimmed.startsWith("/memory")) { await handleFileMemoryCommand(trimmed, workdir, config); continue; }
-    if (trimmed.startsWith("/profile")) { await handleProfileCommand(trimmed, workdir, config); continue; }
+    if (trimmed.startsWith("/memory")) { handleMemoryCommand(trimmed, projectId, config); continue; }
+    if (trimmed.startsWith("/journal") || trimmed.startsWith("/profile")) {
+      handleLegacyMemoryCommand(trimmed);
+      continue;
+    }
     if (trimmed.startsWith("/model")) { handleModelCommand(trimmed, config); continue; }
 
     // Not a slash command — send to agent
@@ -204,10 +201,8 @@ function showHelp(): void {
   console.log("  /plan on|off|status Switch or inspect Plan mode");
   console.log("  /git                Show current git status");
   console.log("  /git health         Show branch health summary");
-  console.log("  /journal search <q> Legacy alias for file-memory search");
-  console.log("  /remember <text>    Record an explicit, traceable user memory");
-  console.log("  /memory             File-memory stats/search/list/dream");
-  console.log("  /profile            Show/why/export/pause/resume profile");
+  console.log("  /remember <text>    Ask the Agent to retain useful information");
+  console.log("  /memory             Show or configure project/user memory");
   console.log("  /model              List / switch models");
   console.log("  /help               Show this help");
   console.log("  /paste              Send the full clipboard as one prompt");
@@ -272,6 +267,7 @@ function createRepl(
           onSessionFinalize();
           loopState.shouldRestart = true;
           loopState.newSessionId = randomUUID();
+          loopState.conversationId = loopState.newSessionId;
           modeController.clearPending();
           console.log("\n  ✨ Session saved. Starting fresh...");
           return null;
@@ -284,9 +280,10 @@ function createRepl(
           if (result.restartLoop && result.resumeId) {
             onSessionFinalize();
             try {
-              const { summary } = sessionManager.resumeSession(result.resumeId);
+              const { record, summary } = sessionManager.resumeSession(result.resumeId);
               loopState.shouldRestart = true;
               loopState.newSessionId = randomUUID();
+              loopState.conversationId = sessionManager.conversationIdFor(record);
               loopState.resumeSummary = summary;
               console.log(`\n  📋 Resuming session ${result.resumeId.slice(0, 8)}...`);
             } catch (err) {
@@ -308,10 +305,9 @@ function createRepl(
           console.log("  /plan status      — Show mode, phase, and latest plan path");
           console.log("  /git              — Show current git status");
           console.log("  /git health       — Show branch health summary");
-          console.log("  /journal search <q> — Legacy file-memory search alias");
-          console.log("  /remember <text>  — Record an explicit user memory");
-          console.log("  /memory stats     — Show file-memory status (no RAG)");
-          console.log("  /profile show     — Show verified user profile");
+          console.log("  /remember <text>  — Ask the Agent to retain useful information");
+          console.log("  /memory status    — Show project and user memory status");
+          console.log("  /memory paths     — Show agent-managed memory directories");
           console.log("  /model            — List / switch models");
           console.log("  /sessions         — List project sessions | /sessions resume <#>");
           console.log("  /tasks            — Inspect background Subagent state and report paths");
@@ -338,14 +334,11 @@ function createRepl(
         } else if (trimmed.startsWith("/remember")) {
           const remembered = rememberCommandAsMessage(trimmed);
           return remembered ?? promptAgain();
-        } else if (trimmed.startsWith("/journal")) {
-          await handleJournalCommand(trimmed, workdir, config);
-          return promptAgain();
         } else if (trimmed.startsWith("/memory")) {
-          await handleFileMemoryCommand(trimmed, workdir, config);
+          handleMemoryCommand(trimmed, sessionManager.getProjectHash(), config);
           return promptAgain();
-        } else if (trimmed.startsWith("/profile")) {
-          await handleProfileCommand(trimmed, workdir, config);
+        } else if (trimmed.startsWith("/journal") || trimmed.startsWith("/profile")) {
+          handleLegacyMemoryCommand(trimmed);
           return promptAgain();
         } else if (trimmed.startsWith("/model")) {
           handleModelCommand(trimmed, config);
@@ -442,23 +435,6 @@ async function main(): Promise<void> {
 
   const config = loadConfig(workdir);
 
-  const recoveredOrphans = processSubagentRegistry.recoverProjectOrphans(workdir);
-  if (recoveredOrphans.length > 0) {
-    console.warn(
-      `Recovered ${recoveredOrphans.length} interrupted subagent task(s) as orphaned. ` +
-      "Use /trace or inspect their result.json files for details.",
-    );
-    for (const result of recoveredOrphans) {
-      console.warn(
-        result.workspace
-          ? `  ${result.taskId}: branch=${result.workspace.branch} ` +
-            `worktree=${result.workspace.path} dirty=${result.workspace.dirty} ` +
-            `result=${result.resultPath}`
-          : `  ${result.taskId}: result=${result.resultPath}`,
-      );
-    }
-  }
-
   // CLI overrides
   if (model) config.model.model = model;
   if (provider) config.model.provider = provider;
@@ -480,9 +456,12 @@ async function main(): Promise<void> {
 
   const modeController = new AgentModeController();
 
-  // Repository facts and queued Dreams are refreshed in the background so the
-  // first turn is never delayed by a project scan or a model-backed Dream.
-  const memoryMaintenance = startMemoryMaintenance({ workingDir: workdir, config });
+  const memoryMigration = migrateLegacyMemoryData();
+  if (memoryMigration.error) {
+    warnRecoverable("memory-v2:migration", memoryMigration.error);
+  } else if (memoryMigration.removed) {
+    console.log("Legacy memory data removed; agent-managed memory starts empty.");
+  }
 
   // ---- MCP Server Startup ----
   const mcpConfigs = loadMcpConfigs(workdir);
@@ -505,13 +484,15 @@ async function main(): Promise<void> {
   // ---- Handle --continue / --resume ----
   let effectivePrompt = prompt || (interactive ? "" : "Hello! What would you like to work on?");
   let initialResumeSummary: string | undefined;
+  let initialConversationId: string | undefined;
 
   if (continueSession) {
     const recent = SessionManager.findMostRecent(workdir);
     if (recent) {
       try {
-        const { summary } = sessionManager.resumeSession(recent.id);
+        const { record, summary } = sessionManager.resumeSession(recent.id);
         initialResumeSummary = summary;
+        initialConversationId = sessionManager.conversationIdFor(record);
         console.log(`\n  📋 Resuming session: ${recent.id.slice(0, 8)}...`);
         if (recent.firstMessage) {
           console.log(`  "${recent.firstMessage.slice(0, 80)}"`);
@@ -548,8 +529,9 @@ async function main(): Promise<void> {
         console.log("\n  Invalid selection.");
         process.exit(1);
       }
-      const { summary } = sessionManager.resumeSession(sessions[idx].id);
+      const { record, summary } = sessionManager.resumeSession(sessions[idx].id);
       initialResumeSummary = summary;
+      initialConversationId = sessionManager.conversationIdFor(record);
     } else {
       // Resume specific session by ID/prefix
       const sessions = sessionManager.listSessions();
@@ -564,8 +546,9 @@ async function main(): Promise<void> {
         process.exit(1);
       }
       try {
-        const { summary } = sessionManager.resumeSession(matches[0].id);
+        const { record, summary } = sessionManager.resumeSession(matches[0].id);
         initialResumeSummary = summary;
+        initialConversationId = sessionManager.conversationIdFor(record);
         console.log(`\n  📋 Resuming session: ${matches[0].id.slice(0, 8)}...`);
       } catch (error) { warnRecoverable(`session:${matches[0].id}:resume`, error); }
     }
@@ -582,7 +565,13 @@ async function main(): Promise<void> {
 
   // In interactive mode with no initial prompt, wait for the user's first real message
   if (interactive && !prompt && !continueSession && !resumeSession) {
-    effectivePrompt = await getFirstMessage(rl!, modeController, workdir, config);
+    effectivePrompt = await getFirstMessage(
+      rl!,
+      modeController,
+      workdir,
+      config,
+      sessionManager.getProjectHash(),
+    );
     if (effectivePrompt === "/exit") {
       console.log("Exiting...");
       if (rl) rl.close();
@@ -609,19 +598,9 @@ async function main(): Promise<void> {
       abortCurrentRequest();
       console.log("\n  ⏹ Interrupted current root run — background Subagents continue...");
     } else {
-      const runtime = processSubagentRegistry.get(activeSessionId);
-      if (runtime?.hasPendingTasks()) {
-        console.log("\n  Background Subagents are still active. Use /tasks to inspect or /exit to stop the process.");
-        return;
-      }
-      console.log("\n  Exiting...");
-      memoryMaintenance.cancel();
+      console.log("\n  Exiting; background Subagents will be paused for resume...");
       for (const runtime of processSubagentRegistry.list()) {
-        for (const task of runtime.list()) {
-          if (task.status === "queued" || task.status === "running") {
-            void runtime.cancel(task.taskId);
-          }
-        }
+        runtime.pauseAll();
       }
       if (rl) rl.close();
       process.exit(0);
@@ -633,9 +612,10 @@ async function main(): Promise<void> {
   let loopState: LoopState = { shouldRestart: false };
   let sessionTokens = 0;
   let activeSessionId = "";
+  let activeConversationId = "";
 
   // Mutable getter for current session ID (for REPL handlers)
-  const getSessionId = () => activeSessionId;
+  const getSessionId = () => activeConversationId || activeSessionId;
 
   // Called by REPL before restarting/exiting to save session state
   const onSessionFinalize = () => {
@@ -646,23 +626,28 @@ async function main(): Promise<void> {
         status: "ended",
       });
     }
-    const runtime = processSubagentRegistry.get(finalizedSessionId);
+    const runtime = processSubagentRegistry.get(activeConversationId);
     if (runtime) {
-      const pending = runtime.list().filter((task) =>
-        task.status === "queued" || task.status === "running",
-      );
-      void Promise.all(pending.map((task) => runtime.cancel(task.taskId)))
-        .finally(() => processSubagentRegistry.remove(finalizedSessionId));
+      runtime.pauseAll();
+      processSubagentRegistry.remove(activeConversationId);
     }
   };
 
   do {
+    const requestedLoop = loopState;
     loopState = { shouldRestart: false };
-    activeSessionId = loopState.newSessionId ?? randomUUID();
+    activeSessionId = requestedLoop.newSessionId ?? randomUUID();
+    activeConversationId = requestedLoop.conversationId ?? initialConversationId ?? activeSessionId;
     sessionTokens = 0;
 
-    const resumeSummary = loopState.resumeSummary ?? initialResumeSummary;
+    const resumeSummary = requestedLoop.resumeSummary ?? initialResumeSummary;
     initialResumeSummary = undefined; // only inject on first iteration
+    initialConversationId = undefined;
+    sessionManager.createSession(
+      effectivePrompt,
+      `${config.model.provider}/${config.model.model}`,
+      { id: activeSessionId, conversationId: activeConversationId },
+    );
     try {
       for await (const event of agentLoop({
         config,
@@ -670,6 +655,8 @@ async function main(): Promise<void> {
         prompt: effectivePrompt,
         renderer,
         sessionId: activeSessionId,
+        conversationId: activeConversationId,
+        runTrigger: resumeSummary ? "resume" : "user_message",
         sessionManager,
         resumeSummary,
         getNextUserMessage: rl
@@ -761,13 +748,9 @@ async function main(): Promise<void> {
   } while (loopState.shouldRestart);
 
   process.off("SIGINT", onSigInt);
-  memoryMaintenance.cancel();
   for (const runtime of processSubagentRegistry.list()) {
-    for (const task of runtime.list()) {
-      if (task.status === "queued" || task.status === "running") {
-        await runtime.cancel(task.taskId);
-      }
-    }
+    runtime.pauseAll();
+    await runtime.trace.flush();
   }
   if (rl) rl.close();
   for (const cfg of mcpConfigs) {

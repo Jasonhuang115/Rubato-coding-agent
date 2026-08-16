@@ -131,11 +131,8 @@ permissions:
 
 memory:
   enabled: true
-  learningEnabled: true
-  profileMaxTokens: 1000
-  bootstrapEnabled: true
-  dreamAutoRun: true
-  dreamMaxRunsPerStart: 2
+  projectEnabled: true
+  userEnabled: true
 
 subagents:
   maxConcurrent: 4
@@ -201,7 +198,7 @@ Rubato 注册 15 个核心工具：
 | 规划提交 | `SubmitPlan` | 提交 Plan Mode 生成的最终 Markdown |
 | 多 Agent | `Subagent`、`Task` | 异步创建与查询 Subagent 任务 |
 | 扩展 | `Skill` | 调用已加载 Skill |
-| 记忆 | `MemoryFeedback`、`MemoryPropose` | 记录记忆效果，提交可审计候选 |
+| 记忆 | `Memory` | 由根 Agent 自主管理项目中期记忆与用户长期记忆 |
 
 MCP server 提供的工具会动态追加，并以 `mcp:<server>:<tool>` 命名。
 
@@ -210,6 +207,20 @@ MCP server 提供的工具会动态追加，并以 `mcp:<server>:<tool>` 命名�
 当前进程中的用户消息、Assistant 回复、工具结果、模式状态和最近文件构成 Agent 的工作上下文。当上下文接近模型窗口时，Runtime 会先整理陈旧工具结果，再把较早对话压缩为摘要，同时保留近期消息和最近访问的文件路径。`/compact` 可以手动触发同一流程。
 
 session 事件以 JSONL 追加，并通过 `seq`、`prev_hash`、`hash` 形成 hash chain。`-c`、`-r` 和 `/sessions resume` 从会话摘要、目标和关键事件组装紧凑恢复上下文。
+
+### 轻量 SQLite 控制面
+
+Rubato 在每个项目的 `~/.rubato/projects/<project-sha256>/state.sqlite3` 保存轻量 Runtime 控制状态。SQLite 只索引 conversation、Root/Subagent run、任务 lease、timeout、状态和终态唤醒事件，不保存 prompt、回答、thinking、tool input/output 或报告正文。
+
+内容仍按用途留在文件系统：根会话写入 hash-chained session JSONL，正在生成的根回复写入 run 目录的 `assistant-draft.md`，Subagent 增量工作日志写入各自的 `report.md`，任务规格与终态结果写入 JSON artifact。进程重启后，Runtime 使用 SQLite lease 防止重复 claim，并以 `task.json + report.md + worktree` 创建新 attempt；已消耗的实际运行时间会从 timeout 中扣除。
+
+启动 reconcile 会补齐“文件已终态但数据库未更新”或“终态事件尚未投递”的状态。若数据库引用的必要 artifact 缺失，任务会明确转为 `failed/runtime_error`；session JSONL 最后的未完成半行会在恢复时丢弃，之前通过 hash chain 验证的记录保留。
+
+### Opik Trace（可选）
+
+本地 `trace.jsonl` 始终是 trace 的耐久来源。设置 `OPIK_ENABLED=true` 后，Rubato 额外把每个 Root run 和 Subagent attempt 映射为 Opik trace，把模型轮次和工具调用映射为 span；`conversation_id` 用作 Opik thread ID。远端上报不会包含 thinking/private reasoning，大文本只发送 hash、长度和短 preview，Opik 不可达也不会改变 Agent 或任务状态。
+
+可在 `.env` 配置 `OPIK_API_KEY`、`OPIK_WORKSPACE`、`OPIK_PROJECT_NAME`，自托管实例另设 `OPIK_URL_OVERRIDE`。每次 flush 的导出 sequence 只作为 SQLite 索引；重启时会从本地 trace JSONL 重放尚未导出的事件。
 
 ### Skill 与 MCP 扩展
 
@@ -375,9 +386,9 @@ SubmitPlan
 
 计划批准代表可以开始实现；Git commit、push、PR 和其他外部操作仍遵循各自的正常授权规则。
 
-## 5. 记忆系统：短期与长期记忆
+## 5. 三层记忆系统
 
-Rubato 的记忆由短期会话上下文和长期文件记忆组成。短期层保证当前任务连续性，长期层负责跨会话保留稳定的用户偏好、约束和项目事实。
+Rubato 区分短期、中期和长期记忆。短期记忆属于上下文工程；中期和长期记忆由 Agent 通过普通 Markdown 自主管理，不经过 RAG、规则打分、候选复核或用户确认。
 
 ### 短期记忆
 
@@ -392,95 +403,38 @@ Rubato 的记忆由短期会话上下文和长期文件记忆组成。短期层�
 
 每个事件同时进入项目级 hash-chained session JSONL。恢复会话时，Rubato 使用目标、摘要和关键事件建立紧凑上下文。
 
-### 长期记忆
+### 中期记忆：Project Memory
 
-长期记忆存放在 `~/.rubato/memory`，由 Markdown、TSV、YAML 和 JSONL 文件组成：
+项目记忆位于 `~/.rubato/projects/<project-sha256>/memory/`。它跨窗口保存代码无法直接解释的项目历史，例如非显然技术决策、舍弃方案、当时约束、架构边界、已知陷阱和重新评估条件。
 
-- `PROFILE.md`：有 token 预算上限的常驻用户画像；
-- `catalog.tsv`：可精确 Grep 的记忆目录；
-- `cards/<id>.md`：带 scope、证据、置信度和 revision 的详细记忆；
-- observation、candidate 和 Dream 文件：学习与发布过程；
-- immutable release、manifest 和 `CURRENT`：经过验证的读取面。
+`MEMORY.md` 是每次根会话加载的简洁索引；详细理由由 Agent 放进自行组织的主题 Markdown。不同项目严格隔离，Subagent 不直接写共享记忆。
 
-新 Agent 上下文会验证 `CURRENT`、manifest、文件 hash 和 purge epoch，然后注入全局画像和项目事实索引。需要详细信息时，Agent 先 Grep `catalog.tsv`，再 Read 指向的 card。
+### 长期记忆：User Memory
 
-### 学习与发布
+用户记忆位于 `~/.rubato/user-memory/`，保存跨无关项目仍然成立的编码、测试、审查、沟通和工具偏好。项目事实不能写入这一层。
 
-```text
-用户消息
-  → fast extractor / 会话收尾 extractor
-  → observation（回指 session seq 与 hash）
-  → reducer operation
-  → candidate / review
-  → deterministic publisher
-  → immutable release
-  → 原子切换 CURRENT
-```
+分类原则是：只在当前会话有效则不保存；换项目仍成立则写用户记忆；只解释当前项目则写项目记忆。
 
-明确的“请记住”“以后默认”“我更正一下”等表达进入快速路径；正常关闭根会话时，完整 transcript 会再次被幂等处理。用户本人写下的消息是画像证据来源；API key、token、密码、私钥和策略中的敏感类别在学习入口过滤。
+### Agent 自主管理
 
-同一会话的重复表达只保留最强证据。明确偏好、约束、目标和纠正优先，推断性习惯通过跨会话证据积累。冲突进入 review，并通过 revision 与 supersede 关系保留来历。
+根 Agent 使用无需批准的 `Memory` 工具执行 `view`、`create`、`str_replace`、`insert`、`rename` 和 `delete`。模型自行决定是否值得保存、如何分文件、何时合并、修订或删除。Runtime 不运行会话结束提取器，也不会自动生成项目事实。
 
-一条偏好发布后，当前会话继续通过原始用户消息生效；下一次创建 Agent 上下文时，最新 release 成为跨会话长期记忆。
+当前请求和仓库真实状态始终优先于记忆。记忆作为不可信、可能过时的上下文注入；发现冲突时由 Agent 更新或删除旧笔记。
 
-### 用户画像与项目事实
-
-- **用户画像**记录用户偏好、约束、目标和纠正，主要进入全局 `PROFILE.md` 和对应 card；
-- **项目事实**由确定性扫描器从 `package.json`、目录结构、`tsconfig` 和 Git 历史生成，以 `authority: repository` card 和 reference index 提供给 Agent。
-
-项目事实使用 checkout content hash，只在仓库状态变化时更新。当前工作树是项目事实的最高优先级来源；当前请求和系统规则优先于所有历史记忆。
-
-### Dreaming
-
-Dream 是异步的记忆归纳与复核流程：
-
-```text
-Extractor → Critic → Reconciler → structured candidate
-                                  ↓
-                         deterministic publisher
-```
-
-默认满足任一条件时排队：
-
-- 新增 5 个已关闭且 hash 校验通过的根会话；
-- 有 20 个 pending/review candidate；
-- 最老的 observation 已等待 24 小时。
-
-Dream 队列和租约写入文件，进程重启后可以继续。`/memory dream` 创建任务，`/memory dream --run` 立即处理；启动维护最多处理 `dreamMaxRunsPerStart` 个任务。Dream worker 产出结构化 candidate，publisher 负责最终发布、复核和 `CURRENT` 切换。
-
-### 纠正与生命周期
-
-- `/profile correct` 发布新 revision，并 supersede 先前值；
-- `/memory retire` 停止使用一条记忆，保留审计历史；
-- `/memory undo` 通过新 release 回到指定历史状态；
-- `/profile forget` 执行 hard purge，并写入防复活 ledger。
-
-`retire` 是可逆生命周期操作，`forget` 用于隐私删除。可先执行 `/profile forget <key> --dry-run` 查看影响范围。
+两个 `MEMORY.md` 分别最多预载 200 行或 25KB，主题文件按需读取。Runtime 只维护 namespace 隔离、路径和符号链接安全、原子写入、并发 hash、容量限制与凭据过滤。
 
 ### 记忆命令
 
 ```text
 /remember <text>
-/memory stats
-/memory list
-/memory search <query>
-/memory bootstrap
-/memory bootstrap --check
-/memory dream
-/memory dream --run
-/memory retire <id-or-logical-key>
-/memory undo [target-release-id]
-
-/profile show
-/profile why <logical-key>
-/profile correct <key> <new-value>
-/profile forget <key> [--dry-run]
-/profile export [--include-secret]
-/profile pause-learning
-/profile resume-learning
+/memory status
+/memory paths
+/memory on|off
+/memory project on|off
+/memory user on|off
 ```
 
-`/remember` 会转换成当前会话里的明确用户陈述，并走完整证据链。`/journal recent/search/stats` 是同一套文件记忆命令的兼容入口。
+`/remember` 只把“请记住”作为正常用户消息交给 Agent；是否保存及保存在哪一层仍由模型判断。旧 `/profile` 和 `/journal` 命令只返回迁移提示。
 
 ### 数据目录
 
@@ -492,26 +446,13 @@ Dream 队列和租约写入文件，进程重启后可以继续。`/memory dream
 ├── .env / .env.local
 ├── mcp.json
 ├── skills/
-├── memory/
-│   ├── global/
-│   │   ├── CURRENT
-│   │   ├── POLICY.yml
-│   │   ├── releases/<release-id>/
-│   │   │   ├── manifest.json
-│   │   │   ├── manifest.sha256
-│   │   │   ├── PROFILE.md
-│   │   │   ├── INDEX.md
-│   │   │   ├── catalog.tsv
-│   │   │   └── cards/<memory-id>.md
-│   │   ├── observations/YYYY/MM/YYYY-MM-DD.jsonl
-│   │   ├── candidates/{pending,review,rejected,published}/
-│   │   └── dreams/<run-id>/
-│   ├── projects/<project-sha256>/
-│   ├── access.jsonl
-│   ├── outcomes.jsonl
-│   ├── control-events.jsonl
-│   └── purge-ledger.jsonl
+├── user-memory/
+│   ├── MEMORY.md
+│   └── <topic>.md
 └── projects/<project-sha256>/
+    ├── memory/
+    │   ├── MEMORY.md
+    │   └── <topic>.md
     ├── sessions/<session-id>.jsonl
     ├── sessions.json
     ├── session-catalog.tsv
@@ -521,7 +462,7 @@ Dream 队列和租约写入文件，进程重启后可以继续。`/memory dream
         └── tasks/<task-id>/...
 ```
 
-release 内容受 manifest hash 保护。校验通过的 `CURRENT` release 是 Agent 的长期记忆读取面；校验异常会停止该 scope 的记忆注入并报告错误。更底层的预算、敏感类别、Dream 租约和 utility 策略位于 `~/.rubato/memory/global/POLICY.yml`。
+升级时旧 `~/.rubato/memory/` 数据会直接清除，不迁移或总结；session、run、task、trace 和 control-plane 数据不受影响。
 
 ## 6. Git 相关操作
 

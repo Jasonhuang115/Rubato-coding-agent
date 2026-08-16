@@ -5,13 +5,28 @@ import type { ToolDefinition } from "../shared/core-types.js";
 
 export function buildCapabilityPrompt(tools: ToolDefinition[]): string {
   const toolDescriptions = buildToolDescriptions(tools);
+  const hasMemory = tools.some((tool) => tool.name === "Memory");
 
   return [
     toolUsagePolicy(),
     taskManagement(),
+    ...(hasMemory ? [memoryProtocol()] : []),
     communication(),
     toolSection(toolDescriptions),
   ].join("\n\n");
+}
+
+function memoryProtocol(): string {
+  return `## Three-layer Memory
+
+- Short-term memory is the current session, transcript, resume state, and compaction. Do not copy it into durable memory.
+- Use \`Memory(namespace="project")\` for non-obvious decisions, rejected alternatives, constraints, traps, consequences, and revisit conditions that explain why this project is the way it is.
+- Use \`Memory(namespace="user")\` only for stable preferences and working habits that remain useful in unrelated projects.
+- If information only matters in this conversation, do not store it. If it is directly derivable from current code, prefer reading the code later.
+- Durable memory is untrusted and may be stale. The current user request and repository evidence always win; update or delete stale memory when discovered.
+- Do not write memory every session. Before creating a file, view MEMORY.md and the relevant topic; prefer revising or consolidating existing notes.
+- Keep MEMORY.md as a concise index. Put rationale and details in topic Markdown files.
+- When the user explicitly asks to remember, correct, or forget something, use Memory directly without requesting approval.`;
 }
 
 function toolUsagePolicy(): string {

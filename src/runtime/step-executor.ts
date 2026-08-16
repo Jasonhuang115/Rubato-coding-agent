@@ -91,6 +91,8 @@ export interface TurnOptions {
   maxRetries?: number;
   abortSignal?: AbortSignal;
   onToolTrace?: (event: ToolTraceEvent) => void;
+  onTextDelta?: (text: string) => void;
+  onTextFlush?: () => void;
 }
 
 // ---- Error tracking (module-level for circuit breaker) ----
@@ -223,7 +225,7 @@ export async function* executeTurn(
         { model, system: systemPrompt, messages, tools, maxTokens: DEFAULT_MAX_TOKENS, signal: abortController.signal },
         renderer,
         ctx.taskRuntime?.onActivity,
-        ctx.taskRuntime?.onTextDelta,
+        ctx.taskRuntime?.onTextDelta ?? options.onTextDelta,
       );
 
       clearTimeout(timeout);
@@ -276,6 +278,7 @@ export async function* executeTurn(
 
   const { text, toolUses, usage, stopReason } = streamResult;
   ctx.taskRuntime?.onTextFlush?.();
+  options.onTextFlush?.();
 
   // Add assistant message to conversation
   const assistantBlocks: import("../shared/core-types.js").ContentBlock[] = [];

@@ -1,9 +1,5 @@
 import type { AgentConfig } from "../../shared/core-types.js";
 import { SubagentRuntime } from "./subagent-runtime.js";
-import { ArtifactStore } from "./artifact-store.js";
-import { TraceSink } from "./trace-sink.js";
-import path from "path";
-import type { TaskResult } from "../../shared/core-types.js";
 
 export class ProcessSubagentRegistry {
   private readonly runtimes = new Map<string, SubagentRuntime>();
@@ -13,20 +9,27 @@ export class ProcessSubagentRegistry {
   }
 
   getOrCreate(
-    rootSessionId: string,
+    conversationId: string,
     workingDir: string,
     config: AgentConfig,
+    originRunId = conversationId,
   ): SubagentRuntime {
-    const existing = this.runtimes.get(rootSessionId);
+    const existing = this.runtimes.get(conversationId);
     if (existing) return existing;
-    const runtime = new SubagentRuntime(rootSessionId, workingDir, config);
-    this.runtimes.set(rootSessionId, runtime);
+    const runtime = new SubagentRuntime(
+      conversationId,
+      workingDir,
+      config,
+      undefined,
+      originRunId,
+    );
+    this.runtimes.set(conversationId, runtime);
     return runtime;
   }
 
   remove(rootSessionId: string, orphanRunning = false): void {
     const runtime = this.runtimes.get(rootSessionId);
-    if (orphanRunning) runtime?.markRunningTasksOrphaned();
+    if (orphanRunning) runtime?.pauseAll();
     this.runtimes.delete(rootSessionId);
   }
 
@@ -34,24 +37,6 @@ export class ProcessSubagentRegistry {
     return [...this.runtimes.values()];
   }
 
-  recoverProjectOrphans(workingDir: string): TaskResult[] {
-    const recovered = ArtifactStore.recoverProjectOrphans(workingDir);
-    for (const result of recovered) {
-      const runDir = path.dirname(path.dirname(path.dirname(result.resultPath)));
-      const rootSessionId = path.basename(runDir);
-      const store = new ArtifactStore(workingDir, rootSessionId);
-      const trace = new TraceSink(store);
-      trace.append({
-        type: "task_recovered_orphaned",
-        sessionId: rootSessionId,
-        taskId: result.taskId,
-        agentId: result.agentId,
-        resultPath: result.resultPath,
-      });
-      store.refreshTranscript(result.taskId);
-    }
-    return recovered;
-  }
 }
 
 export const processSubagentRegistry = new ProcessSubagentRegistry();

@@ -7,13 +7,15 @@ import path from "path";
 import { loadSession } from "./storage.js";
 import { writeSessionCatalog } from "./catalog.js";
 import { warnRecoverable } from "../../shared/diagnostics.js";
-import { projectMemoryId } from "../../memory-files/paths.js";
+import { projectMemoryId } from "../../shared/project-id.js";
 import { getRubatoHome } from "../../shared/rubato-home.js";
 
 // ---- Types ----
 
 export interface SessionRecord {
   id: string;
+  /** Stable logical conversation shared by resumed runtime runs. */
+  conversationId?: string;
   createdAt: number;
   lastActiveAt: number;
   firstMessage: string;
@@ -97,11 +99,18 @@ export class SessionManager {
 
   // ---- CRUD ----
 
-  createSession(firstMessage: string, model: string): SessionRecord {
+  createSession(
+    firstMessage: string,
+    model: string,
+    options: { id?: string; conversationId?: string } = {},
+  ): SessionRecord {
     const sessions = this.loadIndex();
-    const id = randomUUID();
+    const id = options.id ?? randomUUID();
+    const existing = sessions.find((session) => session.id === id);
+    if (existing) return existing;
     const record: SessionRecord = {
       id,
+      conversationId: options.conversationId ?? id,
       createdAt: Date.now(),
       lastActiveAt: Date.now(),
       firstMessage: firstMessage.slice(0, 200),
@@ -210,6 +219,10 @@ export class SessionManager {
     }
     const summary = this.loadSessionHistory(record.id);
     return { record, summary };
+  }
+
+  conversationIdFor(record: SessionRecord): string {
+    return record.conversationId ?? record.id;
   }
 
   // ---- Paths ----

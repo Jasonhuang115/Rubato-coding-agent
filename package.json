@@ -1,8 +1,11 @@
 {
   "name": "rubato",
   "version": "0.2.0",
-  "description": "Rubato — a coding agent with verified file memory, Plan Mode, subagents, and auditable sessions",
+  "description": "Rubato — a coding agent with agent-managed project/user memory, Plan Mode, subagents, and auditable sessions",
   "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
   "main": "dist/cli/entry.js",
   "bin": {
     "rubato": "bin/rubato"
@@ -22,13 +25,15 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",
+    "better-sqlite3": "^13.0.3",
     "chalk": "^5.3.0",
-    "diff": "^7.0.0",
+    "diff": "^8.0.4",
     "openai": "^4.73.0",
+    "opik": "^2.2.29",
     "yaml": "^2.6.0"
   },
   "devDependencies": {
-    "@types/diff": "^6.0.0",
+    "@types/better-sqlite3": "^9.6.0",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0",
     "vitest": "^2.1.0"

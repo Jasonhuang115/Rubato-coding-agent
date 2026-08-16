@@ -59,6 +59,12 @@ export interface ToolResult {
 
 export interface AgentContext {
   workingDir: string;
+  /** Stable root project identity used for project-scoped state and memory. */
+  projectId?: string;
+  /** Stable across --continue/--resume. */
+  conversationId?: string;
+  /** Current agent-loop execution identifier. */
+  runId?: string;
   sessionId: string;
   readGuard: ReadGuardState;
   permissionManager: PermissionManager;
@@ -127,36 +133,12 @@ export interface AgentConfig {
     rules?: PermissionRule[];
   };
   memory?: {
-    /** Master switch for file-backed memory recall and learning. */
+    /** Master switch for agent-managed file memory. */
     enabled: boolean;
-    /** Can be paused independently without hiding already-published memories. */
-    learningEnabled: boolean;
-    /** Hard budget for the always-on PROFILE.md compilation artifact. */
-    profileMaxTokens: number;
-    /** Queue Dreaming after this many newly closed root sessions. */
-    dreamSessionThreshold: number;
-    /** Queue Dreaming after this many pending candidates. */
-    dreamCandidateThreshold: number;
-    /** Queue Dreaming when observations have waited this many hours. */
-    dreamMaxAgeHours: number;
-    /** Explicit, low-risk user preferences are authorization to publish. */
-    autoPublishExplicitLowRisk: boolean;
-    /**
-     * Runtime utility update rate; this never changes belief confidence.
-     * Left unset, POLICY.yml's `utility.alpha` applies.
-     */
-    utilityLearningRate?: number;
-    /**
-     * Utility cannot affect prioritization before this many applications.
-     * Left unset, POLICY.yml's `utility.minimum_uses` applies.
-     */
-    utilityMinUses?: number;
-    /** Scan code structure, config, and Git history into repository facts. */
-    bootstrapEnabled: boolean;
-    /** Drain the durable Dream queue in the background on startup. */
-    dreamAutoRun: boolean;
-    /** Model-calling Dreams processed per CLI start. */
-    dreamMaxRunsPerStart: number;
+    /** Mid-term technical decisions scoped to the current project. */
+    projectEnabled: boolean;
+    /** Long-term user preferences shared across projects. */
+    userEnabled: boolean;
   };
   session: {
     cleanupPeriodDays: number;

@@ -2,7 +2,6 @@ import path from "path";
 import fs from "fs";
 import YAML from "yaml";
 import type { AgentConfig } from "../shared/core-types.js";
-import { handleFileMemoryCommand } from "./file-memory-commands.js";
 import { getGitState } from "../tools/git/advisor.js";
 import { getBranchHealth } from "../tools/git/branch-health.js";
 import { getSkillRegistry } from "../skills/registry.js";
@@ -44,43 +43,6 @@ export async function handleGitCommand(input: string, workdir: string): Promise<
   }
 
   console.log("\n  用法：/git、/git status、/git health");
-}
-
-export async function handleJournalCommand(
-  input: string,
-  workdir: string,
-  config?: AgentConfig,
-): Promise<void> {
-  const args = input.split(/\s+/).slice(1);
-
-  if (input.startsWith("/remember")) {
-    const content = args.join(" ").trim();
-    console.log(
-      content
-        ? "\n  /remember 需要作为当前会话的用户消息进入证据链。请直接发送：" +
-          `\n  请记住：${content}`
-        : "\n  用法：/remember <内容>；CLI 会把它转成可追溯的“请记住”用户消息。",
-    );
-    return;
-  }
-
-  if (args[0] === "search") {
-    await handleFileMemoryCommand(
-      `/memory search ${args.slice(1).join(" ")}`,
-      workdir,
-      config,
-    );
-    return;
-  }
-
-  if (args[0] === "stats") {
-    await handleFileMemoryCommand("/memory stats", workdir, config);
-    return;
-  }
-
-  // `recent` was advertised by tab completion but never handled. The file-memory
-  // list is already ordered, so this is the honest equivalent of the old alias.
-  await handleFileMemoryCommand("/memory list", workdir, config);
 }
 
 export function saveModelPreference(provider: string, model: string): void {

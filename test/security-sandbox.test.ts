@@ -268,7 +268,7 @@ describe("FsSandbox path traversal", () => {
     }
   });
 
-  it("exposes only current memory releases and current-project redacted sessions to native readers", () => {
+  it("exposes current-project sessions but no private memory directories to native readers", () => {
     const previous = process.env.RUBATO_HOME;
     const temp = fs.mkdtempSync(path.join(os.tmpdir(), "rubato-fs-sandbox-"));
     const rubatoHome = path.join(temp, ".rubato");
@@ -279,35 +279,16 @@ describe("FsSandbox path traversal", () => {
     process.env.RUBATO_HOME = rubatoHome;
     fs.mkdirSync(workspace, { recursive: true });
 
-    const globalScope = path.join(rubatoHome, "memory", "global");
-    const globalCurrent = path.join(globalScope, "releases", "global-v2");
-    const globalOld = path.join(globalScope, "releases", "global-v1");
-    const projectScope = path.join(rubatoHome, "memory", "projects", projectHash);
-    const projectCurrent = path.join(projectScope, "releases", "project-v2");
     const sessions = path.join(rubatoHome, "projects", projectHash, "sessions");
+    const projectMemory = path.join(rubatoHome, "projects", projectHash, "memory");
+    const userMemory = path.join(rubatoHome, "user-memory");
     const otherSessions = path.join(rubatoHome, "projects", "other-project", "sessions");
-    fs.mkdirSync(globalCurrent, { recursive: true });
-    fs.mkdirSync(globalOld, { recursive: true });
-    fs.mkdirSync(projectCurrent, { recursive: true });
-    fs.mkdirSync(path.join(globalScope, "candidates", "candidate-1"), { recursive: true });
     fs.mkdirSync(sessions, { recursive: true });
+    fs.mkdirSync(projectMemory, { recursive: true });
+    fs.mkdirSync(userMemory, { recursive: true });
     fs.mkdirSync(otherSessions, { recursive: true });
-    fs.writeFileSync(path.join(globalScope, "CURRENT"), "global-v2\n", "utf8");
-    fs.writeFileSync(path.join(projectScope, "CURRENT"), "project-v2\n", "utf8");
-    fs.writeFileSync(path.join(globalCurrent, "PROFILE.md"), "current", "utf8");
-    fs.writeFileSync(path.join(globalCurrent, "INDEX.md"), "index", "utf8");
-    fs.writeFileSync(path.join(globalCurrent, "catalog.tsv"), "catalog", "utf8");
-    fs.writeFileSync(path.join(globalOld, "PROFILE.md"), "old", "utf8");
-    fs.writeFileSync(
-      path.join(globalScope, "candidates", "candidate-1", "proposal.md"),
-      "candidate",
-      "utf8",
-    );
-    fs.writeFileSync(path.join(projectCurrent, "INDEX.md"), "current project", "utf8");
-    fs.writeFileSync(path.join(projectCurrent, "PROFILE.md"), "profile", "utf8");
-    fs.writeFileSync(path.join(projectCurrent, "catalog.tsv"), "catalog", "utf8");
-    sealTestRelease(globalCurrent, "global-v2", "global");
-    sealTestRelease(projectCurrent, "project-v2", "project", projectHash);
+    fs.writeFileSync(path.join(projectMemory, "MEMORY.md"), "private project memory", "utf8");
+    fs.writeFileSync(path.join(userMemory, "MEMORY.md"), "private user memory", "utf8");
     fs.writeFileSync(path.join(sessions, "session-1.jsonl"), "{\"redacted\":true}\n", "utf8");
     const sessionCatalog = path.join(
       rubatoHome,
@@ -317,22 +298,9 @@ describe("FsSandbox path traversal", () => {
     );
     fs.writeFileSync(sessionCatalog, "session_id\tstatus\nsession-1\tended\n", "utf8");
     fs.writeFileSync(path.join(otherSessions, "session-2.jsonl"), "{}\n", "utf8");
-    fs.writeFileSync(path.join(rubatoHome, "purge-ledger.jsonl"), "{}\n", "utf8");
-    fs.symlinkSync(
-      globalCurrent,
-      path.join(globalScope, "candidates", "candidate-1", "current-link"),
-    );
-    const outsideSecret = path.join(temp, "outside-secret.txt");
-    fs.writeFileSync(outsideSecret, "secret", "utf8");
-
     try {
-      const globalProfile = path.join(globalCurrent, "PROFILE.md");
-      const projectIndex = path.join(projectCurrent, "INDEX.md");
       const session = path.join(sessions, "session-1.jsonl");
 
-      expect(sandbox.validate("Read", { file_path: globalProfile }, workspace).allowed).toBe(true);
-      expect(sandbox.validate("Grep", { pattern: "current", path: globalCurrent }, workspace).allowed).toBe(true);
-      expect(sandbox.validate("Glob", { pattern: "**/*.md", path: projectCurrent }, workspace).allowed).toBe(true);
       expect(sandbox.validate("Grep", { pattern: "redacted", path: sessions }, workspace).allowed).toBe(true);
       expect(sandbox.validate("Read", { file_path: session }, workspace).allowed).toBe(true);
       expect(sandbox.validate(
@@ -341,42 +309,11 @@ describe("FsSandbox path traversal", () => {
         workspace,
       ).allowed).toBe(true);
 
-      // Any unexpected file invalidates the whole verified release, and a
-      // symlink cannot be used to escape through an otherwise-current path.
-      fs.chmodSync(globalCurrent, 0o755);
-      fs.symlinkSync(outsideSecret, path.join(globalCurrent, "escape.txt"));
-
       expect(
-        sandbox.validate("Read", { file_path: path.join(globalOld, "PROFILE.md") }, workspace).allowed,
+        sandbox.validate("Read", { file_path: path.join(projectMemory, "MEMORY.md") }, workspace).allowed,
       ).toBe(false);
       expect(
-        sandbox.validate(
-          "Read",
-          { file_path: path.join(globalScope, "candidates", "candidate-1", "proposal.md") },
-          workspace,
-        ).allowed,
-      ).toBe(false);
-      expect(
-        sandbox.validate(
-          "Read",
-          {
-            file_path: path.join(
-              globalScope,
-              "candidates",
-              "candidate-1",
-              "current-link",
-              "PROFILE.md",
-            ),
-          },
-          workspace,
-        ).allowed,
-      ).toBe(false);
-      expect(
-        sandbox.validate(
-          "Read",
-          { file_path: path.join(globalCurrent, "escape.txt") },
-          workspace,
-        ).allowed,
+        sandbox.validate("Read", { file_path: path.join(userMemory, "MEMORY.md") }, workspace).allowed,
       ).toBe(false);
       expect(
         sandbox.validate(
@@ -386,18 +323,14 @@ describe("FsSandbox path traversal", () => {
         ).allowed,
       ).toBe(false);
       expect(
-        sandbox.validate(
-          "Read",
-          { file_path: path.join(rubatoHome, "purge-ledger.jsonl") },
-          workspace,
-        ).allowed,
+        sandbox.validate("Write", { file_path: path.join(projectMemory, "MEMORY.md") }, workspace).allowed,
       ).toBe(false);
-
-      expect(sandbox.validate("Write", { file_path: globalProfile }, workspace).allowed).toBe(false);
-      expect(sandbox.validate("Edit", { file_path: projectIndex }, workspace).allowed).toBe(false);
       const shell = new ShellSandbox();
-      expect(shell.validate("Bash", { command: `cat ${globalProfile}` }, workspace).allowed).toBe(false);
-      expect(shell.validate("Bash", { command: `rg current ${projectCurrent}` }, workspace).allowed).toBe(false);
+      expect(shell.validate(
+        "Bash",
+        { command: `cat ${path.join(projectMemory, "MEMORY.md")}` },
+        workspace,
+      ).allowed).toBe(false);
     } finally {
       if (previous === undefined) delete process.env.RUBATO_HOME;
       else process.env.RUBATO_HOME = previous;
@@ -673,40 +606,3 @@ describe("SecurityRuntime integration", () => {
     }
   });
 });
-
-function sealTestRelease(
-  releaseDir: string,
-  releaseId: string,
-  scope: "global" | "project",
-  projectId?: string,
-): void {
-  const fileHashes: Record<string, string> = {};
-  for (const entry of fs.readdirSync(releaseDir, { withFileTypes: true })) {
-    if (!entry.isFile()) continue;
-    fileHashes[entry.name] = createHash("sha256")
-      .update(fs.readFileSync(path.join(releaseDir, entry.name)))
-      .digest("hex");
-  }
-  const manifest = {
-    schemaVersion: 1,
-    releaseId,
-    parentReleaseId: null,
-    scope,
-    ...(projectId ? { projectId } : {}),
-    createdAt: "2026-07-31T00:00:00.000Z",
-    purgeEpoch: 0,
-    changes: [],
-    fileHashes,
-  };
-  const manifestText = `${JSON.stringify(manifest, null, 2)}\n`;
-  fs.writeFileSync(
-    path.join(releaseDir, "manifest.json"),
-    manifestText,
-    "utf8",
-  );
-  fs.writeFileSync(
-    path.join(releaseDir, "manifest.sha256"),
-    `${createHash("sha256").update(manifestText).digest("hex")}\n`,
-    "utf8",
-  );
-}

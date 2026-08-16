@@ -10,7 +10,7 @@ import type {
 import { redactText, redactValue } from "./redaction.js";
 import { coverageSummary, emptyCoverageManifest } from "./coverage.js";
 import { WorktreeManager } from "../worktrees/worktree-manager.js";
-import { projectMemoryId } from "../../memory-files/paths.js";
+import { projectMemoryId } from "../../shared/project-id.js";
 import { getRubatoHome } from "../../shared/rubato-home.js";
 
 export class ArtifactStore {
@@ -34,27 +34,6 @@ export class ArtifactStore {
     fs.mkdirSync(this.runDir, { recursive: true });
   }
 
-  static recoverProjectOrphans(
-    projectDir: string,
-    rubatoHome = getRubatoHome(),
-  ): TaskResult[] {
-    const projectHash = projectMemoryId(projectDir);
-    const runsDir = path.join(rubatoHome, "projects", projectHash, "runs");
-    if (!fs.existsSync(runsDir)) return [];
-    const recovered: TaskResult[] = [];
-    for (const entry of fs.readdirSync(runsDir, { withFileTypes: true })) {
-      if (!entry.isDirectory()) continue;
-      const store = new ArtifactStore(
-        projectDir,
-        entry.name,
-        rubatoHome,
-        projectHash,
-      );
-      recovered.push(...store.recoverOrphaned());
-    }
-    return recovered;
-  }
-
   paths(taskId: string): TaskArtifactPaths {
     const taskDir = path.join(this.runDir, "tasks", safeSegment(taskId));
     return {
@@ -68,7 +47,13 @@ export class ArtifactStore {
     };
   }
 
-  initializeTask(task: TaskDetail): void {
+  initializeTask(task: TaskDetail, recovery?: {
+    timeoutMs: number;
+    model?: string;
+    mode?: string;
+    coverage?: string;
+    isolation?: string;
+  }): void {
     fs.mkdirSync(task.artifacts.taskDir, { recursive: true });
     if (!fs.existsSync(task.artifacts.report)) {
       fs.writeFileSync(
@@ -95,11 +80,25 @@ export class ArtifactStore {
       scope: task.scope,
       workspace: task.workspace,
       createdAt: task.createdAt,
+      timeoutMs: recovery?.timeoutMs,
+      model: recovery?.model,
+      mode: recovery?.mode,
+      coverage: recovery?.coverage,
+      isolation: recovery?.isolation,
     }));
   }
 
   updateTask(task: TaskDetail): void {
+    let existing: Record<string, unknown> = {};
+    try {
+      if (fs.existsSync(task.artifacts.task)) {
+        existing = JSON.parse(fs.readFileSync(task.artifacts.task, "utf8")) as Record<string, unknown>;
+      }
+    } catch {
+      // Rebuild the recoverable task specification from the known fields below.
+    }
     writeJsonAtomic(task.artifacts.task, redactValue({
+      ...existing,
       taskId: task.taskId,
       agentId: task.agentId,
       rootSessionId: task.rootSessionId,
@@ -133,6 +132,12 @@ export class ArtifactStore {
     const paths = this.paths(taskId);
     fs.mkdirSync(paths.taskDir, { recursive: true });
     fs.appendFileSync(paths.report, redactText(content), "utf8");
+  }
+
+  appendReportAt(reportPath: string, content: string): void {
+    if (!content) return;
+    fs.mkdirSync(path.dirname(reportPath), { recursive: true });
+    fs.appendFileSync(reportPath, redactText(content), "utf8");
   }
 
   writeBlob(taskId: string, content: string): {
@@ -218,91 +223,6 @@ export class ArtifactStore {
       }
     }
     return { removed, freedBytes, remainingBytes };
-  }
-
-  recoverOrphaned(): TaskResult[] {
-    const tasksDir = path.join(this.runDir, "tasks");
-    if (!fs.existsSync(tasksDir)) return [];
-    const recovered: TaskResult[] = [];
-    for (const taskId of fs.readdirSync(tasksDir)) {
-      const paths = this.paths(taskId);
-      if (!fs.existsSync(paths.task) || fs.existsSync(paths.result)) continue;
-      try {
-        const task = JSON.parse(fs.readFileSync(paths.task, "utf8")) as {
-          agentId: string;
-          createdAt?: number;
-          workspace?: import("../../shared/core-types.js").TaskWorkspace;
-          scope?: string[];
-        };
-        const endedAt = Date.now();
-        let workspaceResult;
-        if (task.workspace && fs.existsSync(task.workspace.path)) {
-          try {
-            workspaceResult = new WorktreeManager(task.workspace.repoRoot, {}).finalize(
-              task.workspace,
-              paths.patch,
-              task.scope,
-            );
-          } catch {
-            // Preserve a conservative recovery record when Git inspection fails.
-          }
-        }
-        workspaceResult ??= task.workspace
-          ? {
-              ...task.workspace,
-              headCommit: task.workspace.baseCommit,
-              commits: [],
-              filesChanged: [],
-              dirty: fs.existsSync(task.workspace.path),
-              patchPath: paths.patch,
-              scopeDeviations: [],
-            }
-          : undefined;
-        const result: TaskResult = {
-          taskId,
-          agentId: task.agentId,
-          status: "failed",
-          failureKind: "interrupted",
-          reportPath: paths.report,
-          resultPath: paths.result,
-          transcriptPath: paths.transcript,
-          coveragePath: paths.coverage,
-          usage: { inputTokens: 0, outputTokens: 0, toolCalls: 0 },
-          coverage: coverageSummary(emptyCoverageManifest(false)),
-          error: "Recovered without a live task process.",
-          startedAt: task.createdAt,
-          endedAt,
-          workspace: workspaceResult,
-        };
-        this.finalizeTask(
-          {
-            taskId,
-            agentId: task.agentId,
-            rootSessionId: "",
-            description: "",
-            prompt: "",
-            subagentType: "",
-            status: "failed",
-            createdAt: task.createdAt ?? endedAt,
-            endedAt,
-            lastActivityAt: endedAt,
-            failureKind: "interrupted",
-            error: "Recovered without a live task process.",
-            workspace: task.workspace,
-            artifacts: paths,
-          },
-          result,
-        );
-        this.appendReport(
-          taskId,
-          "\n\nThe prior Rubato process exited before this task reached a terminal state.\n",
-        );
-        recovered.push(result);
-      } catch {
-        // A corrupt task record is left intact for manual inspection.
-      }
-    }
-    return recovered;
   }
 
   refreshTranscript(taskId: string): void {

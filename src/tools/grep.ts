@@ -2,7 +2,6 @@
 
 import { spawn } from "child_process";
 import type { ToolDefinition } from "../shared/core-types.js";
-import { recordMemoryFileAccess } from "../memory-files/access.js";
 import { resolveToolPath } from "./path-utils.js";
 
 const MAX_MATCHES = 500;
@@ -141,7 +140,6 @@ export const grepTool: ToolDefinition = {
               ctx.abortSignal?.removeEventListener("abort", onFallbackAbort);
               if (aborted) return;
               const lines = grepOut.trim().split("\n").filter(Boolean);
-              recordSearchAccess(searchPath, grepOut, ctx.sessionId);
               resolve({
                 content: formatResults(pattern, searchPath, lines, maxMatches),
               });
@@ -166,7 +164,6 @@ export const grepTool: ToolDefinition = {
         }
 
         const lines = stdout.trim().split("\n").filter(Boolean);
-        recordSearchAccess(searchPath, stdout, ctx.sessionId);
         resolve({
           content: formatResults(pattern, searchPath, lines, maxMatches),
         });
@@ -202,7 +199,6 @@ export const grepTool: ToolDefinition = {
           ctx.abortSignal?.removeEventListener("abort", onFallbackAbort);
           if (aborted) return;
           const lines = grepOut.trim().split("\n").filter(Boolean);
-          recordSearchAccess(searchPath, grepOut, ctx.sessionId);
           resolve({
             content: formatResults(pattern, searchPath, lines, maxMatches),
           });
@@ -249,21 +245,4 @@ function formatResults(
       "Do not treat this output as exhaustive; narrow or partition the search."
     : "";
   return header + formatted + warning;
-}
-
-function recordSearchAccess(
-  searchPath: string,
-  output: string,
-  sessionId: string,
-): void {
-  try {
-    recordMemoryFileAccess({
-      sessionId,
-      action: "search",
-      filePath: searchPath,
-      output,
-    });
-  } catch {
-    // Access telemetry must never break a successful grep.
-  }
 }

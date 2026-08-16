@@ -9,12 +9,6 @@ import {
   verifySession,
 } from "../src/runtime/session/storage.js";
 import { SessionManager } from "../src/runtime/session/manager.js";
-import {
-  purgeMemoriesWithinLock,
-  readCurrentReleaseId,
-  withMemoryScopeLock,
-} from "../src/memory-files/release.js";
-import { resolveMemoryScopePaths } from "../src/memory-files/paths.js";
 
 describe("hash-chained session storage", () => {
   const projectId = "a".repeat(64);
@@ -102,31 +96,24 @@ describe("hash-chained session storage", () => {
     );
   });
 
-  it("does not recreate a live session after a privacy tombstone", () => {
-    const projectId = "b".repeat(64);
-    const sessionId = "session-purged-live";
-    const store = new SessionStore(sessionId, projectId);
-    store.init();
-    store.writeMessage({ role: "user", content: "forget this value" });
-    const sessionPath = store.getFilePath();
-    expect(fs.existsSync(sessionPath)).toBe(true);
+  it("drops only an incomplete JSONL tail before resuming an open chain", () => {
+    const first = new SessionStore("session-tail", projectId);
+    first.init();
+    first.writeMessage({ role: "user", content: "valid" });
+    fs.appendFileSync(first.getFilePath(), '{"partial":', "utf8");
 
-    const paths = resolveMemoryScopePaths({
-      rootDir: process.env.RUBATO_HOME,
-      scope: "project",
-      projectId,
+    const resumed = new SessionStore("session-tail", projectId);
+    resumed.init();
+    resumed.writeMessage({ role: "assistant", content: "continued" });
+    resumed.close();
+
+    expect(verifySession("session-tail", path.dirname(resumed.getFilePath()))).toMatchObject({
+      valid: true,
+      closed: true,
+      recordCount: 3,
     });
-    withMemoryScopeLock(paths, () => purgeMemoriesWithinLock(paths, {
-        baseReleaseId: readCurrentReleaseId(paths),
-        sessionIds: [sessionId],
-      }));
-    fs.unlinkSync(sessionPath);
-
-    store.writeMessage({ role: "assistant", content: "late write" });
-    store.close();
-    expect(fs.existsSync(sessionPath)).toBe(false);
-    expect(store.getRecords()).toEqual([]);
   });
+
 });
 
 describe("SessionManager canonical project IDs", () => {

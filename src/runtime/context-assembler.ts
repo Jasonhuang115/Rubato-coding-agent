@@ -1,6 +1,6 @@
 // ContextAssembler — builds the full system prompt from context sources
 // Extracted from loop.ts. Handles:
-//   - ContextChain setup (Soul, ClaudeMd, verified FileMemory, GitStatus)
+//   - ContextChain setup (Soul, ClaudeMd, project/user Memory, GitStatus)
 //   - Git health / conflict checks
 //   - System prompt assembly (PromptAssembler + verified file memory + git)
 //   - Resume summary injection
@@ -10,7 +10,10 @@ import { ContextChain } from "../context/sources.js";
 import { ClaudeMdSource } from "../context/claude-md.js";
 import { GitStatusSource } from "../context/git-status.js";
 import { SoulSource } from "../context/soul.js";
-import { FileMemorySource } from "../context/file-memory.js";
+import {
+  ProjectMemorySource,
+  UserMemorySource,
+} from "../context/agent-memory.js";
 import { sessionStartHook, conflictCheckHook } from "../tools/git/hooks.js";
 import { getPromptAssembler } from "../prompt/assembler.js";
 import { buildSubagentStaticPrompt } from "../prompt/static.js";
@@ -36,7 +39,7 @@ export interface ContextAssemblerOptions {
  * Build the complete system prompt for a session.
  * Chains: Static + Capability prompts (via PromptAssembler)
  *        + Context sources (CLAUDE.md, memory, git, etc.)
- *        + verified, bounded file-memory profile
+ *        + bounded project and user memory indexes
  *        + Git health
  *        + Previous session resume
  */
@@ -78,7 +81,8 @@ export async function assembleContext(
   } else {
     contextChain.register(new SoulSource());
     contextChain.register(new ClaudeMdSource());
-    contextChain.register(new FileMemorySource());
+    contextChain.register(new UserMemorySource());
+    contextChain.register(new ProjectMemorySource());
     contextChain.register(new GitStatusSource());
   }
 

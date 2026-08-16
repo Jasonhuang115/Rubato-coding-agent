@@ -1,5 +1,9 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { ConversationInbox } from "../src/agent/subagents/conversation-inbox.js";
+import { ControlPlaneStore } from "../src/runtime/control-plane/store.js";
 import type { TaskResult } from "../src/shared/core-types.js";
 
 function result(taskId: string): TaskResult {
@@ -36,5 +40,16 @@ describe("ConversationInbox terminal delivery", () => {
     expect(event.taskIds).toEqual(["task-a"]);
     expect(inbox.drain()).toEqual([]);
     expect(inbox.deliver(result("task-a"))).toBe(false);
+  });
+
+  it("acknowledges a persisted terminal event consumed through wait", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rubato-inbox-"));
+    const store = new ControlPlaneStore(dir, { dbPath: path.join(dir, "state.sqlite3") });
+    const inbox = new ConversationInbox("conversation-1", store);
+    inbox.deliver(result("task-a"));
+    expect((await inbox.wait()).taskIds).toEqual(["task-a"]);
+    expect(store.listPendingEvents("conversation-1")).toEqual([]);
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
   });
 });

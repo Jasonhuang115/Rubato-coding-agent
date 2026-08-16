@@ -19,6 +19,7 @@ const CONFIG_FILE_NAMES = [
 const ENV_FILE_NAMES = [".env", ".env.local"];
 
 type ConfigFileInput = Partial<AgentConfig>;
+let warnedLegacyMemoryConfig = false;
 
 /**
  * Load .env files from working directory and home directory.
@@ -122,6 +123,8 @@ export function loadConfig(workingDir: string): AgentConfig {
     }
   }
 
+  warnLegacyMemoryConfig(fileConfig);
+
   const config: AgentConfig = {
     model: {
       provider: process.env.CODING_AGENT_PROVIDER ??
@@ -142,24 +145,8 @@ export function loadConfig(workingDir: string): AgentConfig {
     },
     memory: {
       enabled: fileConfig.memory?.enabled ?? true,
-      learningEnabled: fileConfig.memory?.learningEnabled ?? true,
-      profileMaxTokens: fileConfig.memory?.profileMaxTokens ?? 1_000,
-      dreamSessionThreshold: fileConfig.memory?.dreamSessionThreshold ?? 5,
-      dreamCandidateThreshold: fileConfig.memory?.dreamCandidateThreshold ?? 20,
-      dreamMaxAgeHours: fileConfig.memory?.dreamMaxAgeHours ?? 24,
-      autoPublishExplicitLowRisk:
-        fileConfig.memory?.autoPublishExplicitLowRisk ?? true,
-      // Left undefined on purpose when unset: POLICY.yml supplies the default
-      // so its utility knobs are not permanently shadowed by a config default.
-      ...(fileConfig.memory?.utilityLearningRate !== undefined
-        ? { utilityLearningRate: fileConfig.memory.utilityLearningRate }
-        : {}),
-      ...(fileConfig.memory?.utilityMinUses !== undefined
-        ? { utilityMinUses: fileConfig.memory.utilityMinUses }
-        : {}),
-      bootstrapEnabled: fileConfig.memory?.bootstrapEnabled ?? true,
-      dreamAutoRun: fileConfig.memory?.dreamAutoRun ?? true,
-      dreamMaxRunsPerStart: fileConfig.memory?.dreamMaxRunsPerStart ?? 2,
+      projectEnabled: fileConfig.memory?.projectEnabled ?? true,
+      userEnabled: fileConfig.memory?.userEnabled ?? true,
     },
     session: {
       cleanupPeriodDays: fileConfig.session?.cleanupPeriodDays ?? 30,
@@ -177,6 +164,30 @@ export function loadConfig(workingDir: string): AgentConfig {
   };
 
   return config;
+}
+
+function warnLegacyMemoryConfig(config: ConfigFileInput): void {
+  if (warnedLegacyMemoryConfig || !config.memory) return;
+  const memory = config.memory as unknown as Record<string, unknown>;
+  const retired = [
+    "learningEnabled",
+    "profileMaxTokens",
+    "dreamSessionThreshold",
+    "dreamCandidateThreshold",
+    "dreamMaxAgeHours",
+    "autoPublishExplicitLowRisk",
+    "utilityLearningRate",
+    "utilityMinUses",
+    "bootstrapEnabled",
+    "dreamAutoRun",
+    "dreamMaxRunsPerStart",
+  ].filter((key) => key in memory);
+  if (retired.length === 0) return;
+  warnedLegacyMemoryConfig = true;
+  console.warn(
+    `Warning: retired memory config ignored: ${retired.join(", ")}. ` +
+      "Use enabled, projectEnabled, and userEnabled.",
+  );
 }
 
 // Simple deep merge for configs

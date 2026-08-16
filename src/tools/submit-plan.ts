@@ -1,7 +1,7 @@
 import fs from "fs";
 import path from "path";
 import type { ToolDefinition } from "../shared/core-types.js";
-import { projectMemoryId } from "../memory-files/paths.js";
+import { projectMemoryId } from "../shared/project-id.js";
 import { getRubatoHome } from "../shared/rubato-home.js";
 
 function safeSessionId(sessionId: string): string {

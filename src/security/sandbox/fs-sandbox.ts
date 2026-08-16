@@ -6,12 +6,7 @@ import * as fs from "fs";
 import * as os from "os";
 import type { ISandbox, SandboxResult } from "./sandbox.js";
 import { matchSensitivePath } from "./sensitive-paths.js";
-import {
-  readPurgeState,
-  verifyRelease,
-} from "../../memory-files/release.js";
-import type { MemoryScopePaths } from "../../memory-files/types.js";
-import { projectMemoryId } from "../../memory-files/paths.js";
+import { projectMemoryId } from "../../shared/project-id.js";
 import { getRubatoHome } from "../../shared/rubato-home.js";
 
 const TOOL_RESULT_PATTERN = /^[A-Za-z0-9_-]+\.txt$/;
@@ -78,7 +73,8 @@ export class FsSandbox implements ISandbox {
         allowed: false,
         reason:
           `Rubato private path blocked: "${filePath}". ` +
-          "Only current releases and the current project's redacted sessions are readable.",
+          "Only the current project's curated session/run artifacts are readable; " +
+          "durable memory is accessible only through the Memory tool.",
       };
     }
 
@@ -186,20 +182,7 @@ function resolveAllowedRubatoRead(
     }
   }
 
-  const globalRelease = resolveCurrentReleaseRead(
-    resolved,
-    path.join(rubatoHome, "memory", "global"),
-  );
-  if (globalRelease) return globalRelease;
-
-  const projectScopes = projectIds.map((id) =>
-    path.join(rubatoHome, "memory", "projects", id)
-  );
-  const currentProjectScope = projectScopes.find((scope) =>
-    fs.existsSync(path.join(scope, "CURRENT"))
-  );
-  if (!currentProjectScope) return undefined;
-  return resolveCurrentReleaseRead(resolved, currentProjectScope);
+  return undefined;
 }
 
 function resolveSessionRead(resolved: string, sessionsDir: string): string | undefined {
@@ -218,118 +201,6 @@ function resolveSessionRead(resolved: string, sessionsDir: string): string | und
   return safeRealPathWithin(resolved, sessionsDir);
 }
 
-function resolveCurrentReleaseRead(
-  resolved: string,
-  scopeDir: string,
-): string | undefined {
-  const marker = path.join(scopeDir, "CURRENT");
-  if (!fs.existsSync(marker)) return undefined;
-
-  const releasesDir = path.join(scopeDir, "releases");
-  let releaseDir: string | undefined;
-  let markerIsReleaseLink = false;
-  try {
-    const markerStat = fs.lstatSync(marker);
-    if (markerStat.isSymbolicLink()) {
-      const target = fs.realpathSync(marker);
-      if (fs.statSync(target).isDirectory() && isDirectChild(target, releasesDir)) {
-        releaseDir = target;
-        markerIsReleaseLink = true;
-      }
-    } else if (markerStat.isFile()) {
-      const releaseId = parseCurrentReleaseId(fs.readFileSync(marker, "utf8"));
-      if (releaseId) releaseDir = path.join(releasesDir, releaseId);
-    }
-  } catch {
-    return undefined;
-  }
-  if (!releaseDir || !fs.existsSync(releaseDir)) return undefined;
-  const releaseId = path.basename(releaseDir);
-  const scopePaths = memoryPathsForScopeDir(scopeDir);
-  if (!scopePaths) return undefined;
-  const verification = verifyRelease(scopePaths, releaseId);
-  if (
-    !verification.valid ||
-    !verification.manifest ||
-    verification.manifest.purgeEpoch < readPurgeState(scopePaths).epoch
-  ) {
-    return undefined;
-  }
-
-  if (resolved === marker) {
-    return safeRealPathWithin(marker, scopeDir);
-  }
-
-  const releaseReal = safeRealPathWithin(releaseDir, releasesDir);
-  if (!releaseReal) return undefined;
-  const isDirectReleasePath = isPathWithin(resolved, releaseDir);
-  const isCurrentLinkPath = markerIsReleaseLink && isPathWithin(resolved, marker);
-  if (!isDirectReleasePath && !isCurrentLinkPath) return undefined;
-
-  // Support both direct releases/<id>/... paths and CURRENT/... when CURRENT
-  // is a symlink to the release directory.
-  try {
-    if (fs.existsSync(resolved)) {
-      const real = fs.realpathSync(resolved);
-      return isPathWithin(real, releaseReal) ? real : undefined;
-    }
-  } catch {
-    return undefined;
-  }
-
-  return isDirectReleasePath ? resolved : undefined;
-}
-
-function memoryPathsForScopeDir(
-  scopeDir: string,
-): MemoryScopePaths | undefined {
-  const parent = path.dirname(scopeDir);
-  let memoryDir: string;
-  let scope: "global" | "project";
-  let projectId: string | undefined;
-  if (path.basename(scopeDir) === "global") {
-    memoryDir = parent;
-    scope = "global";
-  } else if (path.basename(parent) === "projects") {
-    memoryDir = path.dirname(parent);
-    scope = "project";
-    projectId = path.basename(scopeDir);
-  } else {
-    return undefined;
-  }
-  const rootDir = path.dirname(memoryDir);
-  return {
-    rootDir,
-    memoryDir,
-    scopeDir,
-    currentPath: path.join(scopeDir, "CURRENT"),
-    releasesDir: path.join(scopeDir, "releases"),
-    stagingDir: path.join(scopeDir, ".staging"),
-    lockPath: path.join(scopeDir, ".publish.lock"),
-    purgeLedgerPath: path.join(memoryDir, "purge-ledger.jsonl"),
-    scope,
-    ...(projectId ? { projectId } : {}),
-  };
-}
-
-function parseCurrentReleaseId(raw: string): string | undefined {
-  const trimmed = raw.trim();
-  if (/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(trimmed)) return trimmed;
-  try {
-    const parsed = JSON.parse(trimmed) as { release_id?: unknown; id?: unknown };
-    const candidate = typeof parsed.release_id === "string"
-      ? parsed.release_id
-      : typeof parsed.id === "string"
-        ? parsed.id
-        : undefined;
-    return candidate && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(candidate)
-      ? candidate
-      : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
 function safeRealPathWithin(candidate: string, boundary: string): string | undefined {
   try {
     const realCandidate = fs.realpathSync(candidate);
@@ -344,16 +215,6 @@ function safeRealPathWithin(candidate: string, boundary: string): string | undef
 
 function isPathWithin(candidate: string, boundary: string): boolean {
   return candidate === boundary || candidate.startsWith(boundary + path.sep);
-}
-
-function isDirectChild(candidate: string, parent: string): boolean {
-  const relative = path.relative(parent, candidate);
-  return (
-    relative.length > 0 &&
-    !relative.startsWith("..") &&
-    !path.isAbsolute(relative) &&
-    !relative.includes(path.sep)
-  );
 }
 
 function projectId(workingDir: string): string {

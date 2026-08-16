@@ -2,8 +2,9 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { projectMemoryId } from "../src/memory-files/paths.js";
+import { projectMemoryId } from "../src/shared/project-id.js";
 import type { AgentConfig, StreamRenderer, ToolDefinition } from "../src/shared/core-types.js";
+import { ControlPlaneStore } from "../src/runtime/control-plane/store.js";
 
 const fakeProvider = vi.hoisted(() => ({
   name: "test",
@@ -11,20 +12,10 @@ const fakeProvider = vi.hoisted(() => ({
   supportsPromptCaching: vi.fn(() => false),
   countTokens: vi.fn(async () => 1),
 }));
-const learnFromStoredSessionRecords = vi.hoisted(() => vi.fn(() => ({
-  observed: 0,
-  duplicates: 0,
-  candidates: [],
-  publishedReleaseIds: [],
-  needsReview: 0,
-  skipped: [],
-})));
-
 vi.mock("../src/model/router.js", () => ({ createProvider: () => fakeProvider }));
 vi.mock("../src/runtime/context-assembler.js", () => ({
   assembleContext: vi.fn(async () => ({ systemPrompt: "system", systemTokens: 1 })),
 }));
-vi.mock("../src/memory-files/runtime.js", () => ({ learnFromStoredSessionRecords }));
 vi.mock("../src/tools/git/hooks.js", () => ({
   sessionEndHook: vi.fn(async () => ({ advice: [] })),
   prePushHook: vi.fn(async () => null),
@@ -85,10 +76,9 @@ describe("agentLoop lifecycle", () => {
       .toEqual([{ type: "done", reason: "user_interrupt" }]);
     expect(updates).toHaveLength(1);
     expect(updates[0]).toMatchObject({ id: "lifecycle-session", updates: { status: "ended" } });
-    expect(learnFromStoredSessionRecords).toHaveBeenCalled();
   });
 
-  it("closes the hash-chained session without a database side channel", async () => {
+  it("keeps content in JSONL/draft while SQLite stores only root-run control state", async () => {
     fakeProvider.chat.mockImplementation(async function* () {
       yield { type: "text_delta" as const, text: "A complete answer" };
       yield {
@@ -120,6 +110,19 @@ describe("agentLoop lifecycle", () => {
       data: { role: "user", content: "hello" },
     }));
     expect(records.at(-1)).toEqual(expect.objectContaining({ type: "session_closed" }));
+    const control = new ControlPlaneStore(homeDir);
+    const run = control.getRun("answered-session");
+    expect(run).toMatchObject({
+      conversationId: "answered-session",
+      kind: "root",
+      status: "finished",
+      inputTokens: 1,
+      outputTokens: 3,
+      toolCalls: 0,
+    });
+    expect(fs.readFileSync(run!.draftPath!, "utf8")).toContain("A complete answer");
+    expect(control.schemaColumns("agent_runs")).not.toContain("response");
+    control.close();
   });
 
   it("lets the root decide whether ordinary exploration needs delegation", async () => {

@@ -93,11 +93,18 @@ export class ToolRuntime {
   ): Promise<ToolRuntimeResult> {
     if (ctx.mode === "plan") {
       const allowed = new Set([
-        "Read", "Grep", "Glob", "WebFetch", "WebSearch", "Subagent", "Task", "SubmitPlan",
+        "Read", "Grep", "Glob", "WebFetch", "WebSearch", "Memory", "Subagent", "Task", "SubmitPlan",
       ]);
       if (!allowed.has(toolName)) {
         return {
           content: `Plan mode blocked tool "${toolName}". Only read-only exploration and SubmitPlan are allowed.`,
+          isError: true,
+          denied: false,
+        };
+      }
+      if (toolName === "Memory" && input.command !== "view") {
+        return {
+          content: "Plan mode permits Memory.view only.",
           isError: true,
           denied: false,
         };

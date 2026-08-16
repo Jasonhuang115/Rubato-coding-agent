@@ -7,7 +7,6 @@ import path from "path";
 import { warnRecoverable } from "../../shared/diagnostics.js";
 import type { SessionMeta, SessionRecord } from "../../shared/core-types.js";
 import { redactValue } from "../../agent/subagents/redaction.js";
-import { isMemorySessionPurged } from "../../memory-files/release.js";
 import { getRubatoHome } from "../../shared/rubato-home.js";
 
 export type SessionEventType = SessionRecord["type"] | "session_closed";
@@ -43,13 +42,10 @@ function getSessionDir(projectHash: string): string {
 }
 
 export class SessionStore {
-  private readonly sessionId: string;
-  private readonly projectHash: string;
   private dir: string;
   private filePath: string;
   private initialized = false;
   private closed = false;
-  private persistenceDisabled = false;
   private nextSeq = 0;
   private previousHash: string | null = null;
   private records: StoredSessionRecord[] = [];
@@ -58,16 +54,14 @@ export class SessionStore {
     if (!/^[a-f0-9]{64}$/.test(projectHash)) {
       throw new Error("SessionStore requires a canonical SHA-256 project ID.");
     }
-    this.sessionId = sessionId;
-    this.projectHash = projectHash;
     this.dir = getSessionDir(projectHash);
     this.filePath = path.join(this.dir, `${sessionId}.jsonl`);
   }
 
   init(): void {
-    if (this.refreshPurgeTombstone()) return;
     fs.mkdirSync(this.dir, { recursive: true });
     fs.closeSync(fs.openSync(this.filePath, "a"));
+    repairIncompleteTail(this.filePath);
     const existing = readStrictSessionFile(this.filePath);
     if (existing.length > 0) {
       const verification = verifyRecords(existing);
@@ -86,12 +80,13 @@ export class SessionStore {
     this.initialized = true;
   }
 
-  append(record: SessionRecord): void {
-    this.appendEvent(record);
+  append(record: SessionRecord): StoredSessionRecord | undefined {
+    return this.appendEvent(record);
   }
 
-  private appendEvent(record: Omit<StoredSessionRecord, "event_id" | "seq" | "prev_hash" | "hash">): void {
-    if (this.refreshPurgeTombstone()) return;
+  private appendEvent(
+    record: Omit<StoredSessionRecord, "event_id" | "seq" | "prev_hash" | "hash">,
+  ): StoredSessionRecord | undefined {
     if (this.closed) {
       throw new Error(`Cannot append to closed session "${this.filePath}"`);
     }
@@ -114,34 +109,35 @@ export class SessionStore {
     }
     this.nextSeq++;
     this.previousHash = stored.hash;
+    return stored;
   }
 
-  writeMeta(meta: SessionMeta): void {
-    this.append({
+  writeMeta(meta: SessionMeta): StoredSessionRecord | undefined {
+    return this.append({
       type: "session_meta",
       timestamp: Date.now(),
       data: meta,
     });
   }
 
-  writeMessage(message: unknown): void {
-    this.append({
+  writeMessage(message: unknown): StoredSessionRecord | undefined {
+    return this.append({
       type: "message",
       timestamp: Date.now(),
       data: message,
     });
   }
 
-  writeToolEvent(event: unknown): void {
-    this.append({
+  writeToolEvent(event: unknown): StoredSessionRecord | undefined {
+    return this.append({
       type: "tool_event",
       timestamp: Date.now(),
       data: event,
     });
   }
 
-  writeCompaction(summary: unknown): void {
-    this.append({
+  writeCompaction(summary: unknown): StoredSessionRecord | undefined {
+    return this.append({
       type: "compaction",
       timestamp: Date.now(),
       data: summary,
@@ -149,7 +145,7 @@ export class SessionStore {
   }
 
   close(): void {
-    if (this.refreshPurgeTombstone() || !this.initialized || this.closed) {
+    if (!this.initialized || this.closed) {
       return;
     }
     this.appendEvent({
@@ -169,38 +165,6 @@ export class SessionStore {
     return this.filePath;
   }
 
-  /**
-   * A purge may happen while this process still holds a live SessionStore.
-   * Re-reading the durable fingerprint before every append prevents that
-   * process from recreating a physically deleted transcript.
-   */
-  private refreshPurgeTombstone(): boolean {
-    if (this.persistenceDisabled) return true;
-    try {
-      if (
-        !isMemorySessionPurged(
-          getRubatoHome(),
-          this.sessionId,
-          this.projectHash,
-        )
-      ) {
-        return false;
-      }
-    } catch (error) {
-      // A malformed privacy ledger cannot be treated as permission to write.
-      warnRecoverable(
-        `session:${this.sessionId}:purge-ledger-fail-closed`,
-        error,
-      );
-    }
-    this.persistenceDisabled = true;
-    this.initialized = false;
-    this.closed = true;
-    this.records = [];
-    this.nextSeq = 0;
-    this.previousHash = null;
-    return true;
-  }
 }
 
 // ---- Session loader (reads back JSONL) ----
@@ -259,20 +223,39 @@ function hashRecord(record: Omit<StoredSessionRecord, "hash">): string {
 function readStrictSessionFile(filePath: string): StoredSessionRecord[] {
   const content = fs.readFileSync(filePath, "utf-8");
   const records: StoredSessionRecord[] = [];
+  const lines = content.split("\n");
   let lineNumber = 0;
-  for (const line of content.split("\n")) {
+  for (const [index, line] of lines.entries()) {
     lineNumber++;
     const trimmed = line.trim();
     if (!trimmed) continue;
     try {
       records.push(JSON.parse(trimmed) as StoredSessionRecord);
     } catch (error) {
+      if (index === lines.length - 1 && !content.endsWith("\n")) {
+        warnRecoverable(`session:${path.basename(filePath)}:incomplete-tail`, error);
+        break;
+      }
       throw new Error(
         `Malformed JSONL record at line ${lineNumber}: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
   }
   return records;
+}
+
+function repairIncompleteTail(filePath: string): void {
+  const content = fs.readFileSync(filePath, "utf8");
+  if (!content || content.endsWith("\n")) return;
+  const newline = content.lastIndexOf("\n");
+  const tail = content.slice(newline + 1).trim();
+  if (!tail) return;
+  try {
+    JSON.parse(tail);
+  } catch (error) {
+    fs.truncateSync(filePath, newline + 1);
+    warnRecoverable(`session:${path.basename(filePath)}:truncated-tail`, error);
+  }
 }
 
 function verifyRecords(records: StoredSessionRecord[]): SessionVerificationResult {

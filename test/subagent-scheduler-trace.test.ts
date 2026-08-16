@@ -103,14 +103,5 @@ describe("scheduler, trace, and artifact invariants", () => {
     expect(prune.removed).toContain(removable.taskId);
     expect(prune.removed).not.toContain(pinned.taskId);
 
-    const interrupted = makeTask("task-interrupted");
-    interrupted.status = "running";
-    interrupted.endedAt = undefined;
-    artifacts.initializeTask(interrupted);
-    expect(artifacts.recoverOrphaned()).toContainEqual(expect.objectContaining({
-      taskId: interrupted.taskId,
-      status: "failed",
-      failureKind: "interrupted",
-    }));
   });
 });

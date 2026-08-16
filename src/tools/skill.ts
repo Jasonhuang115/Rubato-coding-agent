@@ -87,7 +87,12 @@ export const skillTool: ToolDefinition = {
 
     const task = args || `Run the "${skill.name}" skill`;
     try {
-      const runtime = processSubagentRegistry.getOrCreate(ctx.sessionId, ctx.workingDir, ctx.config);
+      const runtime = processSubagentRegistry.getOrCreate(
+        ctx.conversationId ?? ctx.sessionId,
+        ctx.workingDir,
+        ctx.config,
+        ctx.runId ?? ctx.sessionId,
+      );
       const submitted = runtime.submit({
         description: `${skill.name} skill`,
         prompt: task,
