@@ -17,8 +17,8 @@ import { roughTokenEstimate } from "../shared/tokens.js";
 // ---- Configuration ----
 
 const AUTOCOMPACT_BUFFER = 20_000;
-const ROOT_COMPACT_KEEP_RECENT = 60;
-const SUBAGENT_COMPACT_KEEP_RECENT = 24;
+export const ROOT_COMPACT_KEEP_RECENT = 60;
+export const SUBAGENT_COMPACT_KEEP_RECENT = 24;
 const MAX_COMPACTION_FAILURES = 3;
 const ROOT_COMPACTION_CEILING = 240_000;
 const SUBAGENT_COMPACTION_CEILING = 120_000;
@@ -46,6 +46,24 @@ export interface CompactionOptions {
   config: AgentConfig;
   readGuard: ReadGuardState;
   consecutiveFailures: number;
+}
+
+export function compactionKeepRecent(isSubagent: boolean): number {
+  return isSubagent ? SUBAGENT_COMPACT_KEEP_RECENT : ROOT_COMPACT_KEEP_RECENT;
+}
+
+export function wouldCompact(options: {
+  messages: Message[];
+  systemTokens: number;
+  model: string;
+  forceCompact?: boolean;
+  skipCompaction?: boolean;
+  isSubagent?: boolean;
+}): boolean {
+  if (options.skipCompaction) return false;
+  if (options.forceCompact) return true;
+  const approxTokens = estimateMessageTokens(options.messages) + options.systemTokens;
+  return approxTokens > getAutoCompactThreshold(options.model, Boolean(options.isSubagent));
 }
 
 /**

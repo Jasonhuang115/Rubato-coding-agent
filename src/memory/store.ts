@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "crypto";
+import { randomUUID } from "crypto";
 import { TextDecoder } from "util";
 import fs from "fs";
 import path from "path";
@@ -11,6 +11,7 @@ export const MEMORY_INDEX_MAX_LINES = 200;
 export const MEMORY_INDEX_MAX_BYTES = 25 * 1024;
 export const MEMORY_FILE_MAX_BYTES = 256 * 1024;
 export const MEMORY_NAMESPACE_MAX_BYTES = 10 * 1024 * 1024;
+export const MEMORY_USER_INJECT_MAX_BYTES = 6 * 1024;
 
 export interface MemoryStoreOptions {
   projectId: string;
@@ -21,14 +22,12 @@ export interface MemoryView {
   kind: "file" | "directory" | "missing";
   path: string;
   content: string;
-  hash?: string;
   totalLines?: number;
   sizeBytes?: number;
 }
 
 export interface MemoryMutationResult {
   message: string;
-  hash?: string;
   warnings: string[];
 }
 
@@ -57,6 +56,7 @@ export class MemoryStore {
     startLine = 1,
     endLine?: number,
   ): MemoryView {
+    assertUserMemoryPath(namespace, relativePath, true);
     const root = this.root(namespace);
     const target = resolveMemoryPath(root, relativePath, false);
     if (!fs.existsSync(target)) {
@@ -70,7 +70,6 @@ export class MemoryStore {
         kind: "directory",
         path: displayPath(namespace, relativePath),
         content: content || "[empty directory]",
-        hash: digestDirectory(target),
         sizeBytes: namespaceSize(root),
       };
     }
@@ -85,7 +84,6 @@ export class MemoryStore {
       content: lines.slice(start - 1, end)
         .map((line, index) => `${String(start + index).padStart(6, " ")}\t${line}`)
         .join("\n"),
-      hash: sha256(content),
       totalLines: lines.length,
       sizeBytes: stat.size,
     };
@@ -97,6 +95,7 @@ export class MemoryStore {
     fileText: string,
   ): MemoryMutationResult {
     return this.withNamespaceLock(namespace, () => {
+      assertUserMemoryPath(namespace, relativePath);
       const root = this.ensureRoot(namespace);
       const target = resolveMemoryPath(root, relativePath, true);
       assertMarkdownPath(target);
@@ -105,7 +104,7 @@ export class MemoryStore {
       ensureProjectedCapacity(root, 0, Buffer.byteLength(fileText));
       ensureDirectoryWithoutSymlinks(root, path.dirname(target));
       atomicWrite(target, fileText);
-      return mutationResult(relativePath, fileText, "Memory file created.");
+      return mutationResult(namespace, relativePath, fileText, "Memory file created.");
     });
   }
 
@@ -114,9 +113,8 @@ export class MemoryStore {
     relativePath: string,
     oldText: string,
     newText: string,
-    expectedHash: string,
   ): MemoryMutationResult {
-    return this.mutateFile(namespace, relativePath, expectedHash, (current) => {
+    return this.mutateFile(namespace, relativePath, (current) => {
       const occurrences = countOccurrences(current, oldText);
       if (occurrences === 0) throw new Error("old_str was not found in the memory file.");
       if (occurrences > 1) throw new Error("old_str is not unique in the memory file.");
@@ -129,9 +127,8 @@ export class MemoryStore {
     relativePath: string,
     line: number,
     text: string,
-    expectedHash: string,
   ): MemoryMutationResult {
-    return this.mutateFile(namespace, relativePath, expectedHash, (current) => {
+    return this.mutateFile(namespace, relativePath, (current) => {
       const lines = current.split("\n");
       const position = Math.trunc(line);
       if (position < 0 || position > lines.length) {
@@ -146,9 +143,11 @@ export class MemoryStore {
     namespace: MemoryNamespace,
     relativePath: string,
     newRelativePath: string,
-    expectedHash: string,
   ): MemoryMutationResult {
     return this.withNamespaceLock(namespace, () => {
+      if (namespace === "user") {
+        throw new Error("User memory only allows MEMORY.md and cannot be renamed.");
+      }
       const root = this.ensureRoot(namespace);
       const source = resolveMemoryPath(root, relativePath, true);
       const target = resolveMemoryPath(root, newRelativePath, true);
@@ -156,26 +155,24 @@ export class MemoryStore {
       if (!fs.existsSync(source)) throw new Error(`Memory path does not exist: ${relativePath}`);
       if (fs.existsSync(target)) throw new Error(`Memory path already exists: ${newRelativePath}`);
       rejectSymlinkPath(root, source);
-      assertExpectedHash(source, expectedHash);
       if (fs.statSync(source).isFile()) assertMarkdownPath(target);
       ensureDirectoryWithoutSymlinks(root, path.dirname(target));
       fs.renameSync(source, target);
-      return { message: "Memory path renamed.", hash: digestPath(target), warnings: [] };
+      return { message: "Memory path renamed.", warnings: [] };
     });
   }
 
   delete(
     namespace: MemoryNamespace,
     relativePath: string,
-    expectedHash: string,
   ): MemoryMutationResult {
     return this.withNamespaceLock(namespace, () => {
+      assertUserMemoryPath(namespace, relativePath);
       const root = this.ensureRoot(namespace);
       const target = resolveMemoryPath(root, relativePath, true);
       if (target === root) throw new Error("The memory namespace root cannot be deleted.");
       if (!fs.existsSync(target)) throw new Error(`Memory path does not exist: ${relativePath}`);
       rejectSymlinkPath(root, target);
-      assertExpectedHash(target, expectedHash);
       fs.rmSync(target, { recursive: true, force: false });
       return { message: "Memory path deleted.", warnings: [] };
     });
@@ -184,11 +181,11 @@ export class MemoryStore {
   private mutateFile(
     namespace: MemoryNamespace,
     relativePath: string,
-    expectedHash: string,
     transform: (current: string) => string,
     message: string,
   ): MemoryMutationResult {
     return this.withNamespaceLock(namespace, () => {
+      assertUserMemoryPath(namespace, relativePath);
       const root = this.ensureRoot(namespace);
       const target = resolveMemoryPath(root, relativePath, true);
       assertMarkdownPath(target);
@@ -197,14 +194,11 @@ export class MemoryStore {
       }
       rejectSymlinkPath(root, target);
       const current = readUtf8(target);
-      if (sha256(current) !== expectedHash) {
-        throw new Error("Memory conflict: the file changed after it was viewed. View it again before editing.");
-      }
       const next = transform(current);
       validateMemoryText(next);
       ensureProjectedCapacity(root, Buffer.byteLength(current), Buffer.byteLength(next));
       atomicWrite(target, next);
-      return mutationResult(relativePath, next, message);
+      return mutationResult(namespace, relativePath, next, message);
     });
   }
 
@@ -233,7 +227,7 @@ export class MemoryStore {
       }
     }
     try {
-      fs.writeFileSync(descriptor, `${process.pid}\t${new Date().toISOString()}\n`, "utf8");
+      fs.writeFileSync(descriptor, `${process.pid}\t${new Date().toISOString()}\n`, { encoding: "utf8" });
       return action();
     } finally {
       fs.closeSync(descriptor);
@@ -246,21 +240,11 @@ export function readMemoryIndex(
   namespace: MemoryNamespace,
   options: MemoryStoreOptions,
 ): string | null {
-  const store = new MemoryStore(options);
-  const root = store.root(namespace);
-  const indexPath = path.join(root, MEMORY_INDEX_FILE);
-  if (!fs.existsSync(indexPath)) return null;
-  try {
-    rejectSymlinkPath(root, indexPath);
-    const bytes = fs.readFileSync(indexPath);
-    new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-    return decodeUtf8Prefix(bytes, MEMORY_INDEX_MAX_BYTES)
-      .split("\n")
-      .slice(0, MEMORY_INDEX_MAX_LINES)
-      .join("\n");
-  } catch {
-    return null;
-  }
+  return readMemoryFile(namespace, options, MEMORY_INDEX_MAX_BYTES, MEMORY_INDEX_MAX_LINES);
+}
+
+export function readUserMemoryFile(options: MemoryStoreOptions): string | null {
+  return readMemoryFile("user", options, MEMORY_USER_INJECT_MAX_BYTES);
 }
 
 export function migrateLegacyMemoryData(rootDir?: string): {
@@ -289,6 +273,39 @@ export function migrateLegacyMemoryData(rootDir?: string): {
       error: error instanceof Error ? error.message : String(error),
     };
   }
+}
+
+function readMemoryFile(
+  namespace: MemoryNamespace,
+  options: MemoryStoreOptions,
+  maxBytes: number,
+  maxLines?: number,
+): string | null {
+  const store = new MemoryStore(options);
+  const root = store.root(namespace);
+  const indexPath = path.join(root, MEMORY_INDEX_FILE);
+  if (!fs.existsSync(indexPath)) return null;
+  try {
+    rejectSymlinkPath(root, indexPath);
+    const bytes = fs.readFileSync(indexPath);
+    new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    const decoded = decodeUtf8Prefix(bytes, maxBytes);
+    return maxLines === undefined ? decoded : decoded.split("\n").slice(0, maxLines).join("\n");
+  } catch {
+    return null;
+  }
+}
+
+function assertUserMemoryPath(
+  namespace: MemoryNamespace,
+  relativePath: string,
+  allowDirectory = false,
+): void {
+  if (namespace !== "user") return;
+  const normalized = relativePath.replaceAll("\\", "/").replace(/^\.\/+/, "");
+  if (allowDirectory && (normalized === "." || normalized === "" || normalized === "/")) return;
+  if (normalized === MEMORY_INDEX_FILE) return;
+  throw new Error("User memory only allows MEMORY.md.");
 }
 
 function resolveMemoryPath(root: string, relativePath: string, mutating: boolean): string {
@@ -420,39 +437,6 @@ function directoryListing(directory: string, root: string): string {
   return lines.join("\n");
 }
 
-function digestPath(target: string): string {
-  return fs.statSync(target).isDirectory()
-    ? digestDirectory(target)
-    : sha256(readUtf8(target));
-}
-
-function digestDirectory(directory: string): string {
-  const records: string[] = [];
-  const visit = (current: string): void => {
-    for (const entry of fs.readdirSync(current, { withFileTypes: true })
-      .filter((item) => item.name !== ".memory.lock")
-      .sort((left, right) => left.name.localeCompare(right.name))) {
-      const entryPath = path.join(current, entry.name);
-      const relative = path.relative(directory, entryPath).split(path.sep).join("/");
-      if (entry.isSymbolicLink()) throw new Error("Symbolic links are not allowed in memory paths.");
-      if (entry.isDirectory()) {
-        records.push(`d:${relative}`);
-        visit(entryPath);
-      } else {
-        records.push(`f:${relative}:${sha256(fs.readFileSync(entryPath))}`);
-      }
-    }
-  };
-  visit(directory);
-  return sha256(records.join("\n"));
-}
-
-function assertExpectedHash(target: string, expectedHash: string): void {
-  if (!/^[a-f0-9]{64}$/.test(expectedHash) || digestPath(target) !== expectedHash) {
-    throw new Error("Memory conflict: the path changed after it was viewed. View it again before mutating.");
-  }
-}
-
 function readUtf8(filePath: string): string {
   return new TextDecoder("utf-8", { fatal: true }).decode(fs.readFileSync(filePath));
 }
@@ -465,21 +449,29 @@ function atomicWrite(filePath: string, content: string): void {
 }
 
 function mutationResult(
+  namespace: MemoryNamespace,
   relativePath: string,
   content: string,
   message: string,
 ): MemoryMutationResult {
   const warnings: string[] = [];
-  if (relativePath.replaceAll("\\", "/") === MEMORY_INDEX_FILE) {
+  const normalized = relativePath.replaceAll("\\", "/");
+  if (normalized === MEMORY_INDEX_FILE) {
     const lines = content.split("\n").length;
     const bytes = Buffer.byteLength(content);
-    if (lines > MEMORY_INDEX_MAX_LINES || bytes > MEMORY_INDEX_MAX_BYTES) {
+    if (namespace === "user") {
+      if (bytes > MEMORY_USER_INJECT_MAX_BYTES) {
+        warnings.push(
+          "User MEMORY.md exceeds the resident portrait limit. Compact it now: keep four short sections and drop project-specific details.",
+        );
+      }
+    } else if (lines > MEMORY_INDEX_MAX_LINES || bytes > MEMORY_INDEX_MAX_BYTES) {
       warnings.push(
         "MEMORY.md exceeds the startup index limit. Compact it now: keep one concise entry per topic and move details into topic files.",
       );
     }
   }
-  return { message, hash: sha256(content), warnings };
+  return { message, warnings };
 }
 
 function decodeUtf8Prefix(bytes: Buffer, limit: number): string {
@@ -508,8 +500,4 @@ function countOccurrences(haystack: string, needle: string): number {
     position += needle.length;
   }
   return count;
-}
-
-function sha256(value: string | Buffer): string {
-  return createHash("sha256").update(value).digest("hex");
 }

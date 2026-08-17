@@ -102,13 +102,6 @@ export class ToolRuntime {
           denied: false,
         };
       }
-      if (toolName === "Memory" && input.command !== "view") {
-        return {
-          content: "Plan mode permits Memory.view only.",
-          isError: true,
-          denied: false,
-        };
-      }
     }
     const scopedTool = this.tools?.get(toolName);
     if (this.tools && !scopedTool) {

@@ -8,19 +8,14 @@ import type { Message } from "../shared/core-types.js";
  * MicroCompact replaces old message blocks with short summaries.
  * Ensures tool_use/tool_result pairs stay together to avoid API 400 errors.
  */
-export function microCompact(
-  messages: Message[],
-  targetCount: number
-): Message[] {
-  if (messages.length <= targetCount) return messages;
+export function compactCutFrom(messages: Message[], targetCount: number): number {
+  if (messages.length <= targetCount) return 0;
 
-  // Find a safe cut point: never split a tool_use/tool_result pair
   let keepFrom = messages.length - targetCount + 1;
   if (keepFrom <= 0) keepFrom = 1;
 
   while (keepFrom < messages.length) {
     const firstKept = messages[keepFrom];
-    // If first kept is a tool_result, its tool_use is in the old batch — move forward
     if (!isToolResult(firstKept)) break;
     keepFrom++;
   }
@@ -28,6 +23,21 @@ export function microCompact(
   if (keepFrom >= messages.length - 1) {
     keepFrom = Math.max(1, messages.length - 5);
   }
+
+  return keepFrom;
+}
+
+export function messagesToDiscard(messages: Message[], targetCount: number): Message[] {
+  const keepFrom = compactCutFrom(messages, targetCount);
+  return keepFrom > 0 ? messages.slice(0, keepFrom) : [];
+}
+
+export function microCompact(
+  messages: Message[],
+  targetCount: number
+): Message[] {
+  const keepFrom = compactCutFrom(messages, targetCount);
+  if (keepFrom <= 0) return messages;
 
   const toSummarize = messages.slice(0, keepFrom);
   const toKeep = messages.slice(keepFrom);

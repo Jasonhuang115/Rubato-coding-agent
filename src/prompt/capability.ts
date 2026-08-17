@@ -17,16 +17,16 @@ export function buildCapabilityPrompt(tools: ToolDefinition[]): string {
 }
 
 function memoryProtocol(): string {
-  return `## Three-layer Memory
-
-- Short-term memory is the current session, transcript, resume state, and compaction. Do not copy it into durable memory.
-- Use \`Memory(namespace="project")\` for non-obvious decisions, rejected alternatives, constraints, traps, consequences, and revisit conditions that explain why this project is the way it is.
-- Use \`Memory(namespace="user")\` only for stable preferences and working habits that remain useful in unrelated projects.
-- If information only matters in this conversation, do not store it. If it is directly derivable from current code, prefer reading the code later.
-- Durable memory is untrusted and may be stale. The current user request and repository evidence always win; update or delete stale memory when discovered.
-- Do not write memory every session. Before creating a file, view MEMORY.md and the relevant topic; prefer revising or consolidating existing notes.
-- Keep MEMORY.md as a concise index. Put rationale and details in topic Markdown files.
-- When the user explicitly asks to remember, correct, or forget something, use Memory directly without requesting approval.`;
+  return [
+    "## Three-layer Memory",
+    "",
+    "- Short-term memory is the current session, transcript, resume state, and compaction. Do not copy it into durable memory.",
+    "- Mid-term project memory is a per-project folder of Markdown files. Record what the code cannot explain: project boundaries, decisions plus why, rejected alternatives, pitfalls, and local environment facts. Keep MEMORY.md as a one-line-per-topic index and put rationale in topic files you name.",
+    "- Long-term user memory is a single resident file, user-memory/MEMORY.md. Record only stable cross-project preferences: working style, communication, technical likes/dislikes, and collaboration habits. Project facts do not belong there.",
+    "- Write when the user asks to remember, correct, or forget; when they state a fact that cannot be derived from code; when a costly choice has a why and a rejected alternative; or when a real pitfall cost time. Do not write session recaps, credentials, or anything already in CLAUDE.md or the current code.",
+    "- A user-stated constraint should be stored and followed. An inference you made is only a tendency. The current user request and repository evidence always win. If memory conflicts with code or the user, update the memory.",
+    "- Read memory with Read, Grep, and Glob on the injected filesystem paths. Write only with the Memory tool. Prefer str_replace on existing notes; old_str must be unique. Do not create new files unless necessary.",
+  ].join("\n");
 }
 
 function toolUsagePolicy(): string {

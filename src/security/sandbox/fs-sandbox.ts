@@ -73,8 +73,7 @@ export class FsSandbox implements ISandbox {
         allowed: false,
         reason:
           `Rubato private path blocked: "${filePath}". ` +
-          "Only the current project's curated session/run artifacts are readable; " +
-          "durable memory is accessible only through the Memory tool.",
+          "Only the current project's curated session/run artifacts and durable memory files are readable.",
       };
     }
 
@@ -180,6 +179,16 @@ function resolveAllowedRubatoRead(
       const verifiedCatalog = safeRealPathWithin(catalogPath, projectBase);
       if (verifiedCatalog) return verifiedCatalog;
     }
+    const projectMemoryDir = path.join(projectBase, "memory");
+    if (isPathWithin(resolved, projectMemoryDir)) {
+      const verified = safeRealPathWithin(resolved, projectMemoryDir);
+      if (verified) return verified;
+    }
+  }
+
+  const userMemoryDir = path.join(rubatoHome, "user-memory");
+  if (isPathWithin(resolved, userMemoryDir)) {
+    return safeRealPathWithin(resolved, userMemoryDir);
   }
 
   return undefined;

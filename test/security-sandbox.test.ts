@@ -268,7 +268,7 @@ describe("FsSandbox path traversal", () => {
     }
   });
 
-  it("exposes current-project sessions but no private memory directories to native readers", () => {
+  it("exposes current-project sessions and durable memory directories to native readers", () => {
     const previous = process.env.RUBATO_HOME;
     const temp = fs.mkdtempSync(path.join(os.tmpdir(), "rubato-fs-sandbox-"));
     const rubatoHome = path.join(temp, ".rubato");
@@ -311,10 +311,10 @@ describe("FsSandbox path traversal", () => {
 
       expect(
         sandbox.validate("Read", { file_path: path.join(projectMemory, "MEMORY.md") }, workspace).allowed,
-      ).toBe(false);
+      ).toBe(true);
       expect(
         sandbox.validate("Read", { file_path: path.join(userMemory, "MEMORY.md") }, workspace).allowed,
-      ).toBe(false);
+      ).toBe(true);
       expect(
         sandbox.validate(
           "Read",

@@ -204,7 +204,7 @@ MCP server 提供的工具会动态追加，并以 `mcp:<server>:<tool>` 命名�
 
 ### 上下文、压缩与会话恢复
 
-当前进程中的用户消息、Assistant 回复、工具结果、模式状态和最近文件构成 Agent 的工作上下文。当上下文接近模型窗口时，Runtime 会先整理陈旧工具结果，再把较早对话压缩为摘要，同时保留近期消息和最近访问的文件路径。`/compact` 可以手动触发同一流程。
+当前进程中的用户消息、Assistant 回复、工具结果、模式状态和最近文件构成 Agent 的工作上下文。当上下文接近模型窗口时，根 Agent 会先对即将丢弃的片段做一次记忆抽取，再用启发式函数把较早对话压缩为摘要，同时保留近期消息和最近访问的文件路径。`/compact` 可以手动触发同一流程。
 
 session 事件以 JSONL 追加，并通过 `seq`、`prev_hash`、`hash` 形成 hash chain。`-c`、`-r` 和 `/sessions resume` 从会话摘要、目标和关键事件组装紧凑恢复上下文。
 
@@ -388,7 +388,7 @@ SubmitPlan
 
 ## 5. 三层记忆系统
 
-Rubato 区分短期、中期和长期记忆。短期记忆属于上下文工程；中期和长期记忆由 Agent 通过普通 Markdown 自主管理，不经过 RAG、规则打分、候选复核或用户确认。
+Rubato 区分短期、中期和长期记忆。短期记忆属于上下文工程；中期和长期记忆由根 Agent 通过普通 Markdown 自主管理，不经过 RAG、规则打分、候选复核或用户确认。
 
 ### 短期记忆
 
@@ -399,29 +399,29 @@ Rubato 区分短期、中期和长期记忆。短期记忆属于上下文工程�
 - 当前 Plan Mode 状态、Todo 和任务结果；
 - 最近读取的文件与压缩摘要。
 
-它在当前轮立即生效。接近上下文上限时，Runtime 会整理较早内容，根 Agent 保留约 60 条近期消息，Subagent 保留约 24 条，并重新提供最近访问的文件路径。
+它在当前轮立即生效。接近上下文上限时，Runtime 会先整理陈旧工具结果。根 Agent 在真正压缩之前，对即将丢弃的同一段消息做一次专用模型调用，把值得保存的项目决策、边界、坑和跨项目偏好写入记忆；抽取失败不会阻塞压缩。压缩本身是启发式函数摘要，根 Agent 保留约 60 条近期消息，Subagent 保留约 24 条，并重新提供最近访问的文件路径。Subagent 的对话不会被抽取。
 
 每个事件同时进入项目级 hash-chained session JSONL。恢复会话时，Rubato 使用目标、摘要和关键事件建立紧凑上下文。
 
 ### 中期记忆：Project Memory
 
-项目记忆位于 `~/.rubato/projects/<project-sha256>/memory/`。它跨窗口保存代码无法直接解释的项目历史，例如非显然技术决策、舍弃方案、当时约束、架构边界、已知陷阱和重新评估条件。
+项目记忆位于 `~/.rubato/projects/<project-sha256>/memory/`。它跨窗口保存代码无法直接解释的项目历史：项目边界、非显然技术决策及其原因、舍弃方案、已知陷阱和本地环境约定。
 
-`MEMORY.md` 是每次根会话加载的简洁索引；详细理由由 Agent 放进自行组织的主题 Markdown。不同项目严格隔离，Subagent 不直接写共享记忆。
+`MEMORY.md` 是每次根会话加载的简洁索引；详细理由由 Agent 放进自行组织的主题 Markdown。不同项目严格隔离。读取主题文件使用原生 Read、Grep、Glob；写入只通过 `Memory` 工具。
 
 ### 长期记忆：User Memory
 
-用户记忆位于 `~/.rubato/user-memory/`，保存跨无关项目仍然成立的编码、测试、审查、沟通和工具偏好。项目事实不能写入这一层。
+用户记忆是单个常驻文件 `~/.rubato/user-memory/MEMORY.md`，保存跨无关项目仍然成立的工作风格、沟通偏好、技术偏好与禁区、协作习惯。项目事实不能写入这一层。根会话会把该文件全文注入 system prompt（约 6KB 上限）。
 
 分类原则是：只在当前会话有效则不保存；换项目仍成立则写用户记忆；只解释当前项目则写项目记忆。
 
 ### Agent 自主管理
 
-根 Agent 使用无需批准的 `Memory` 工具执行 `view`、`create`、`str_replace`、`insert`、`rename` 和 `delete`。模型自行决定是否值得保存、如何分文件、何时合并、修订或删除。Runtime 不运行会话结束提取器，也不会自动生成项目事实。
+根 Agent 使用无需批准的 `Memory` 工具执行 `view`、`create`、`str_replace`、`insert`、`rename` 和 `delete`。`str_replace` 要求 `old_str` 在文件中唯一。Plan Mode 也可以写记忆，因为记忆不在用户工作区里。模型自行决定是否值得保存、如何分文件、何时合并、修订或删除。压缩阈值命中时，Runtime 会额外做一次抽取调用，但仍由同一套 Memory 工具落盘。
 
-当前请求和仓库真实状态始终优先于记忆。记忆作为不可信、可能过时的上下文注入；发现冲突时由 Agent 更新或删除旧笔记。
+当前请求和仓库真实状态始终优先于记忆。记忆作为不可信、可能过时的上下文注入；发现冲突时由 Agent 更新或删除旧笔记。用户明确给出的约束应当遵守；Agent 自己归纳的偏好只作为倾向。
 
-两个 `MEMORY.md` 分别最多预载 200 行或 25KB，主题文件按需读取。Runtime 只维护 namespace 隔离、路径和符号链接安全、原子写入、并发 hash、容量限制与凭据过滤。
+项目 `MEMORY.md` 最多预载 200 行或 25KB，主题文件按需用 Read/Grep/Glob 读取。Runtime 维护 namespace 隔离、路径和符号链接安全、原子写入、namespace 锁、容量限制与凭据过滤。
 
 ### 记忆命令
 
@@ -447,8 +447,7 @@ Rubato 区分短期、中期和长期记忆。短期记忆属于上下文工程�
 ├── mcp.json
 ├── skills/
 ├── user-memory/
-│   ├── MEMORY.md
-│   └── <topic>.md
+│   └── MEMORY.md
 └── projects/<project-sha256>/
     ├── memory/
     │   ├── MEMORY.md

@@ -7,10 +7,12 @@ import {
 export const memoryTool: ToolDefinition = {
   name: "Memory",
   description:
-    "Read and maintain durable Markdown memory without user approval. " +
+    "Write durable Markdown memory without user approval. " +
+    "Read memory with native Read/Grep/Glob against the injected filesystem paths. " +
     "Use project memory for this repository's non-obvious decisions and rationale; " +
-    "use user memory only for stable preferences that apply across unrelated projects. " +
-    "Do not write every session. Keep MEMORY.md concise and move details to topic files.",
+    "use user memory only for MEMORY.md, the long-term user portrait. " +
+    "Do not write every session. Keep project MEMORY.md as a concise index and move details to topic files. " +
+    "str_replace requires a unique old_str; prefer revising existing notes over creating new files.",
   inputSchema: {
     type: "object",
     properties: {
@@ -28,10 +30,6 @@ export const memoryTool: ToolDefinition = {
       insert_line: { type: "number", description: "Insert after this line; 0 inserts first" },
       insert_text: { type: "string" },
       new_path: { type: "string" },
-      expected_hash: {
-        type: "string",
-        description: "SHA-256 returned by the latest view; required for existing-path mutations",
-      },
     },
     required: ["namespace", "command", "path"],
   },
@@ -52,9 +50,6 @@ export const memoryTool: ToolDefinition = {
       }
       if (namespace === "user" && ctx.config.memory?.userEnabled === false) {
         throw new Error("User memory is disabled.");
-      }
-      if (ctx.mode === "plan" && command !== "view") {
-        throw new Error("Plan Mode permits Memory.view only.");
       }
       if (!ctx.projectId) throw new Error("No root project identity is available.");
       const store = new MemoryStore({ projectId: ctx.projectId });
@@ -77,7 +72,6 @@ export const memoryTool: ToolDefinition = {
               relativePath,
               requiredString(input.old_str, "old_str"),
               requiredString(input.new_str, "new_str", true),
-              requiredHash(input.expected_hash),
             )
           : command === "insert"
             ? store.insert(
@@ -85,17 +79,15 @@ export const memoryTool: ToolDefinition = {
                 relativePath,
                 requiredInteger(input.insert_line, "insert_line"),
                 requiredString(input.insert_text, "insert_text", true),
-                requiredHash(input.expected_hash),
               )
             : command === "rename"
               ? store.rename(
                   namespace,
                   relativePath,
                   requiredString(input.new_path, "new_path"),
-                  requiredHash(input.expected_hash),
                 )
               : command === "delete"
-                ? store.delete(namespace, relativePath, requiredHash(input.expected_hash))
+                ? store.delete(namespace, relativePath)
                 : (() => { throw new Error(`Unsupported memory command: ${command}`); })();
       return { content: JSON.stringify(result, null, 2) };
     } catch (error) {
@@ -128,11 +120,4 @@ function requiredInteger(value: unknown, name: string): number {
 
 function optionalInteger(value: unknown, fallback: number): number {
   return typeof value === "number" && Number.isInteger(value) ? value : fallback;
-}
-
-function requiredHash(value: unknown): string {
-  if (typeof value !== "string" || !/^[a-f0-9]{64}$/.test(value)) {
-    throw new Error("expected_hash must be the SHA-256 returned by the latest view.");
-  }
-  return value;
 }

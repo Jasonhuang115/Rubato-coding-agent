@@ -11,10 +11,13 @@ import {
   MemoryStore,
   migrateLegacyMemoryData,
 } from "../src/memory/store.js";
+import { extractMemories, shouldExtractMemories } from "../src/memory/extraction.js";
 import { SecurityRuntime } from "../src/security/runtime.js";
-import type { AgentContext } from "../src/shared/core-types.js";
+import type { AgentContext, ModelProvider } from "../src/shared/core-types.js";
 import { memoryTool } from "../src/tools/memory.js";
 import { ToolRuntime } from "../src/runtime/tool-runtime.js";
+import { messagesToDiscard, compactCutFrom, microCompact } from "../src/context/compression.js";
+import { wouldCompact } from "../src/runtime/compaction-controller.js";
 
 const PROJECT_ID = "a".repeat(64);
 const originalRubatoHome = process.env.RUBATO_HOME;
@@ -44,49 +47,31 @@ describe("agent-managed memory store", () => {
     expect(store.root("user")).toBe(path.join(fs.realpathSync(root), "user-memory"));
   });
 
-  it("supports create, view, replace, insert, rename, and delete", () => {
+  it("supports create, view, replace, insert, rename, and delete without hashes", () => {
     const store = new MemoryStore({ projectId: PROJECT_ID, rootDir: root });
     store.create("project", "decisions/api.md", "# API\n- omit id\n");
-    const first = store.view("project", "decisions/api.md");
-    const replaced = store.replace(
-      "project",
-      "decisions/api.md",
-      "omit id",
-      "omit unstable internal id",
-      first.hash!,
-    );
-    const inserted = store.insert(
-      "project",
-      "decisions/api.md",
-      2,
-      "- revisit when detail lookup exists",
-      replaced.hash!,
-    );
-    const renamed = store.rename(
-      "project",
-      "decisions/api.md",
-      "decisions/submission-api.md",
-      inserted.hash!,
-    );
+    store.replace("project", "decisions/api.md", "omit id", "omit unstable internal id");
+    store.insert("project", "decisions/api.md", 2, "- revisit when detail lookup exists");
+    store.rename("project", "decisions/api.md", "decisions/submission-api.md");
     expect(store.view("project", "decisions/submission-api.md").content)
       .toContain("revisit when detail lookup exists");
-    store.delete("project", "decisions/submission-api.md", renamed.hash!);
+    store.delete("project", "decisions/submission-api.md");
     expect(store.view("project", "decisions/submission-api.md").kind).toBe("missing");
   });
 
-  it("rejects stale edits, traversal, encoded paths, symlinks, roots, and credentials", () => {
+  it("rejects traversal, encoded paths, symlinks, roots, credentials, and extra user files", () => {
     const store = new MemoryStore({ projectId: PROJECT_ID, rootDir: root });
     store.create("project", "MEMORY.md", "# Index\n");
-    const stale = store.view("project", "MEMORY.md").hash!;
-    const current = store.replace("project", "MEMORY.md", "Index", "Project", stale);
-    expect(() => store.replace("project", "MEMORY.md", "Project", "Other", stale))
-      .toThrow(/conflict/i);
-    expect(current.hash).toMatch(/^[a-f0-9]{64}$/);
+    expect(() => store.replace("project", "MEMORY.md", "missing", "Other"))
+      .toThrow(/not found/i);
+    store.replace("project", "MEMORY.md", "Index", "Project");
     expect(() => store.create("project", "../escape.md", "bad")).toThrow(/traversal/i);
     expect(() => store.create("project", "%2e%2e/escape.md", "bad")).toThrow(/encoded/i);
-    expect(() => store.delete("project", ".", store.view("project").hash!)).toThrow(/root/i);
-    expect(() => store.create("user", "secret.md", "api_key=abcdefghijklmnop"))
+    expect(() => store.delete("project", ".")).toThrow(/root/i);
+    expect(() => store.create("project", "secret.md", "api_key=abcdefghijklmnop"))
       .toThrow(/sensitive/i);
+    expect(() => store.create("user", "secret.md", "not a secret")).toThrow(/MEMORY.md/i);
+    expect(() => store.rename("user", "MEMORY.md", "other.md")).toThrow(/MEMORY.md/i);
 
     const outside = fs.mkdtempSync(path.join(os.tmpdir(), "rubato-memory-outside-"));
     const projectRoot = store.root("project");
@@ -114,7 +99,7 @@ describe("agent-managed memory store", () => {
 });
 
 describe("memory context and tool runtime", () => {
-  it("injects bounded, separately labelled indexes but not topic bodies", async () => {
+  it("injects a project index and a resident user portrait", async () => {
     const store = new MemoryStore({ projectId: PROJECT_ID, rootDir: root });
     store.create("project", "MEMORY.md", `# Project\n${"p".repeat(MEMORY_INDEX_MAX_BYTES + 100)}`);
     store.create("project", "details.md", "TOPIC BODY MUST STAY ON DEMAND");
@@ -124,11 +109,14 @@ describe("memory context and tool runtime", () => {
     const user = await new UserMemorySource().fetch("task", ctx);
     expect(project?.content).toContain("Project Memory (mid-term)");
     expect(project?.content).not.toContain("TOPIC BODY MUST STAY ON DEMAND");
+    expect(project?.content).toContain(store.root("project"));
     expect(Buffer.byteLength(project?.content ?? "")).toBeLessThan(MEMORY_INDEX_MAX_BYTES + 2_000);
     expect(user?.content).toContain("User Memory (long-term)");
+    expect(user?.content).toContain("concise reviews");
+    expect(user?.content).toContain(`${store.root("user")}/MEMORY.md`);
   });
 
-  it("runs without confirmation and enforces read-only Plan Mode", async () => {
+  it("runs without confirmation and allows writes in Plan Mode", async () => {
     const ctx = context("default");
     const confirm = vi.fn(async () => "deny_once" as const);
     const runtime = new ToolRuntime({
@@ -151,11 +139,10 @@ describe("memory context and tool runtime", () => {
       namespace: "project", command: "view", path: "MEMORY.md",
     }, ctx);
     expect(viewed.isError).toBe(false);
-    const blocked = await runtime.execute("Memory", {
+    const written = await runtime.execute("Memory", {
       namespace: "project", command: "create", path: "other.md", file_text: "x",
     }, ctx);
-    expect(blocked.isError).toBe(true);
-    expect(blocked.content).toContain("Memory.view only");
+    expect(written.isError).toBe(false);
   });
 
   it("rejects subagents and disabled namespaces", async () => {
@@ -185,6 +172,118 @@ describe("legacy memory cleanup", () => {
     expect(fs.readFileSync(session, "utf8")).toBe("keep\n");
     expect(fs.existsSync(path.join(root, "user-memory"))).toBe(true);
     expect(migrateLegacyMemoryData(root).removed).toBe(false);
+  });
+});
+
+describe("memory extraction before compaction", () => {
+  it("shares the compaction cut point so extraction sees the discarded slice", () => {
+    const messages = Array.from({ length: 10 }, (_, index) => ({
+      role: "user" as const,
+      content: `msg ${index}`,
+    }));
+    const cut = compactCutFrom(messages, 4);
+    expect(messagesToDiscard(messages, 4)).toEqual(messages.slice(0, cut));
+    const compacted = microCompact(messages, 4);
+    expect(compacted[0].content).toContain("Earlier conversation");
+  });
+
+  it("writes project memory then lets compaction proceed even if later rounds fail", async () => {
+    const store = new MemoryStore({ projectId: PROJECT_ID, rootDir: root });
+    store.create("project", "MEMORY.md", "# Index\n");
+    const ctx = context("default");
+    let calls = 0;
+    const provider: ModelProvider = {
+      name: "test",
+      supportsPromptCaching: () => false,
+      countTokens: async () => 1,
+      async *chat() {
+        calls += 1;
+        if (calls === 1) {
+          yield { type: "tool_use_start", id: "t1", name: "Memory" };
+          yield {
+            type: "tool_use_end",
+            id: "t1",
+            input: {
+              namespace: "project",
+              command: "create",
+              path: "decisions.md",
+              file_text: "# Why omit source\nInternal pipeline only.\n",
+            },
+          };
+          yield {
+            type: "message_stop",
+            stopReason: "tool_use",
+            usage: { inputTokens: 10, outputTokens: 10 },
+          };
+          return;
+        }
+        throw new Error("provider down");
+      },
+    };
+
+    const result = await extractMemories({
+      discarded: [{ role: "user", content: "Do not distinguish upload source." }],
+      ctx,
+      config: ctx.config,
+      provider,
+    });
+    expect(result.wrote).toBe(true);
+    expect(result.warning).toMatch(/failed|provider down/i);
+    expect(store.view("project", "decisions.md").content).toContain("Internal pipeline");
+  });
+
+  it("does not treat a no-op extraction as a write", async () => {
+    const ctx = context("default");
+    const provider: ModelProvider = {
+      name: "test",
+      supportsPromptCaching: () => false,
+      countTokens: async () => 1,
+      async *chat() {
+        yield { type: "text_delta", text: "NO_MEMORY_UPDATES" };
+        yield {
+          type: "message_stop",
+          stopReason: "end_turn",
+          usage: { inputTokens: 1, outputTokens: 1 },
+        };
+      },
+    };
+    const result = await extractMemories({
+      discarded: [{ role: "user", content: "hello" }],
+      ctx,
+      config: ctx.config,
+      provider,
+    });
+    expect(result.wrote).toBe(false);
+    expect(result.warning).toBeUndefined();
+  });
+
+  it("skips extraction for subagents, disabled memory, and the same compaction cycle", () => {
+    expect(shouldExtractMemories({
+      isRoot: false, extractedThisCycle: false, memoryEnabled: true, willCompact: true,
+    })).toBe(false);
+    expect(shouldExtractMemories({
+      isRoot: true, extractedThisCycle: false, memoryEnabled: false, willCompact: true,
+    })).toBe(false);
+    expect(shouldExtractMemories({
+      isRoot: true, extractedThisCycle: true, memoryEnabled: true, willCompact: true,
+    })).toBe(false);
+    expect(shouldExtractMemories({
+      isRoot: true, extractedThisCycle: false, memoryEnabled: true, willCompact: true,
+    })).toBe(true);
+  });
+
+  it("skips extraction when compaction would not run", () => {
+    expect(wouldCompact({
+      messages: [{ role: "user", content: "short" }],
+      systemTokens: 10,
+      model: "gpt-4o",
+    })).toBe(false);
+    expect(wouldCompact({
+      messages: [{ role: "user", content: "short" }],
+      systemTokens: 10,
+      model: "gpt-4o",
+      forceCompact: true,
+    })).toBe(true);
   });
 });
 

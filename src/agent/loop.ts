@@ -29,7 +29,14 @@ import type { SessionManager } from "../runtime/session/manager.js";
 import { AgentModeController } from "./mode.js";
 import { sessionEndHook } from "../tools/git/hooks.js";
 import { assembleContext } from "../runtime/context-assembler.js";
-import { checkAndCompact, runMicroCompact } from "../runtime/compaction-controller.js";
+import {
+  checkAndCompact,
+  compactionKeepRecent,
+  runMicroCompact,
+  wouldCompact,
+} from "../runtime/compaction-controller.js";
+import { messagesToDiscard } from "../context/compression.js";
+import { extractMemories, shouldExtractMemories } from "../memory/extraction.js";
 import {
   executeTurn,
   UserInterruptError,
@@ -251,6 +258,7 @@ export async function* agentLoop(
   // ---- Compaction tracking ----
   let consecutiveCompactionFailures = 0;
   let skipAutoCompact = options.skipCompaction ?? false;
+  let extractedThisCycle = false;
 
   // ---- Main turn loop ----
   const configuredMaxTurns = options.maxTurns ??
@@ -299,7 +307,46 @@ export async function* agentLoop(
       turn: turn + 1,
     });
 
-    // ---- Compaction ----
+    // ---- Memory extraction then compaction ----
+    const willCompact = wouldCompact({
+      messages,
+      systemTokens,
+      model: config.model.model,
+      forceCompact: options.forceCompaction,
+      skipCompaction: skipAutoCompact,
+      isSubagent: Boolean(ctx.taskRuntime),
+    });
+    if (shouldExtractMemories({
+      isRoot: isRootProfile,
+      extractedThisCycle,
+      memoryEnabled: ctx.config.memory?.enabled !== false,
+      willCompact,
+    })) {
+      extractedThisCycle = true;
+      const discarded = messagesToDiscard(
+        messages,
+        compactionKeepRecent(Boolean(ctx.taskRuntime)),
+      );
+      if (discarded.length > 0) {
+        yield {
+          type: "compacting",
+          reason: options.forceCompaction
+            ? "Extracting durable memory before requested compaction"
+            : "Extracting durable memory before compaction",
+        };
+        const extraction = await extractMemories({
+          discarded,
+          ctx,
+          config,
+          provider,
+          abortSignal: options.abortSignal,
+        });
+        if (extraction.warning) {
+          yield { type: "warning", message: extraction.warning };
+        }
+      }
+    }
+
     const compactResult = await checkAndCompact({
       messages,
       systemTokens,
@@ -315,6 +362,7 @@ export async function* agentLoop(
     if (options.forceCompaction) options.forceCompaction = false;
 
     if (compactResult.compacted) {
+      extractedThisCycle = false;
       yield { type: "compacting", reason: compactResult.reason ?? "Auto-compaction" };
       messages.length = 0;
       messages.push(...compactResult.messages);
