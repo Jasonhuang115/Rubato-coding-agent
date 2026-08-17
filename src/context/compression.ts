@@ -1,6 +1,42 @@
-// Context compression — MicroCompact + Snip for managing context window
+// Context compression — LLM summary + heuristic MicroCompact fallback
 
-import type { Message } from "../shared/core-types.js";
+import type { AgentConfig, Message, ModelProvider } from "../shared/core-types.js";
+import { processStream } from "../runtime/step-executor.js";
+import { SILENT_RENDERER, serializeMessages } from "./transcript.js";
+
+const MAX_COMPACT_TOKENS = 8_192;
+
+const COMPACT_SYSTEM_PROMPT = [
+  "You are compressing a coding-agent conversation to save context-window space.",
+  "This is NOT durable memory extraction. Do not write notes, call tools, or invent facts.",
+  "The summary you produce will REPLACE the discarded messages. Later turns will only see your summary plus the recent messages that were kept.",
+  "",
+  "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools. Tool calls will be rejected and the compression will fail.",
+  "Wrap the final structured summary in <summary>...</summary>. You may think first, but only the <summary> block is kept.",
+].join("\n");
+
+const COMPACT_USER_INSTRUCTIONS = [
+  "Create a detailed summary of the conversation below, paying close attention to the user's explicit requests and the assistant's previous actions.",
+  "Capture technical details, code patterns, and architectural decisions needed to continue development without losing context.",
+  "",
+  "Your <summary> MUST include these sections:",
+  "",
+  "1. Primary Request and Intent: Capture the user's explicit requests and intents in detail.",
+  "2. Key Technical Concepts and Decisions: Important technologies, patterns, and decisions, including why they were made.",
+  "3. Files and Code Sections: Files examined, modified, or created. For each, why it mattered, what changed, and key snippets when they are needed to continue.",
+  "4. Errors and Fixes: Errors encountered and how they were fixed. Include user feedback about mistakes.",
+  "5. User Corrections and Explicit Feedback: Verbatim quotes where the user corrected the assistant or said to do something differently.",
+  "6. Pending Tasks: Work the user explicitly asked for that is not finished.",
+  "7. Current Work: Precisely what was being done immediately before this summary, with file names and snippets where applicable.",
+  "8. Next Step: Only if it directly continues the most recent explicit user request. Quote the conversation to show where you left off. If the last task concluded, do not invent a next step.",
+  "",
+  "Be precise and thorough. Do not omit user corrections.",
+].join("\n");
+
+const COMPACT_CONTINUATION = [
+  "This session is being continued from a previous conversation that ran out of context.",
+  "The summary below covers the compacted portion.",
+].join(" ");
 
 // ---- MicroCompact: condense individual messages ----
 
@@ -139,12 +175,63 @@ function summarizeMessages(messages: Message[]): Message {
   return { role: "user", content: parts.join("\n") };
 }
 
-import type { AgentContext, AgentConfig } from "../shared/core-types.js";
-export async function compactViaSubagent(
+export async function compactViaModel(
   messages: Message[],
-  _ctx: AgentContext,
-  _config: AgentConfig,
+  config: AgentConfig,
+  provider: ModelProvider,
   keepRecent: number,
+  abortSignal?: AbortSignal,
 ): Promise<Message[]> {
-  return microCompact(messages, keepRecent);
+  const keepFrom = compactCutFrom(messages, keepRecent);
+  if (keepFrom <= 0) return messages;
+
+  const toSummarize = messages.slice(0, keepFrom);
+  const toKeep = messages.slice(keepFrom);
+  const summary = await summarizeViaModel(toSummarize, config, provider, abortSignal);
+  return [
+    { role: "user", content: `${COMPACT_CONTINUATION}\n\n${summary}` },
+    ...toKeep,
+  ];
+}
+
+async function summarizeViaModel(
+  toSummarize: Message[],
+  config: AgentConfig,
+  provider: ModelProvider,
+  abortSignal?: AbortSignal,
+): Promise<string> {
+  const stream = await processStream(
+    provider,
+    {
+      model: config.model.model,
+      system: COMPACT_SYSTEM_PROMPT,
+      messages: [{
+        role: "user",
+        content: [
+          COMPACT_USER_INSTRUCTIONS,
+          "",
+          serializeMessages(toSummarize),
+        ].join("\n"),
+      }],
+      tools: [],
+      maxTokens: MAX_COMPACT_TOKENS,
+      signal: abortSignal ?? new AbortController().signal,
+    },
+    SILENT_RENDERER,
+  );
+
+  if (stream.toolUses.length > 0) {
+    throw new Error("Compaction model called tools");
+  }
+  const text = stream.text.trim();
+  if (!text) {
+    throw new Error("Compaction model returned empty summary");
+  }
+  return parseCompactSummary(text);
+}
+
+function parseCompactSummary(text: string): string {
+  const match = text.match(/<summary>([\s\S]*?)<\/summary>/);
+  if (match?.[1]?.trim()) return match[1].trim();
+  return text;
 }

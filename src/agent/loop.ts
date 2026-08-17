@@ -355,6 +355,8 @@ export async function* agentLoop(
       skipCompaction: skipAutoCompact,
       ctx,
       config,
+      provider,
+      abortSignal: options.abortSignal,
       readGuard,
       consecutiveFailures: consecutiveCompactionFailures,
     });

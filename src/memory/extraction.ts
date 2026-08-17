@@ -3,10 +3,10 @@ import type {
   AgentContext,
   Message,
   ModelProvider,
-  StreamRenderer,
   ToolUseBlock,
 } from "../shared/core-types.js";
 import { processStream } from "../runtime/step-executor.js";
+import { SILENT_RENDERER, serializeMessages } from "../context/transcript.js";
 import { memoryTool } from "../tools/memory.js";
 import {
   MemoryStore,
@@ -16,7 +16,6 @@ import {
 
 const MAX_EXTRACTION_ROUNDS = 3;
 const MAX_EXTRACTION_TOKENS = 4_096;
-const MAX_TRANSCRIPT_CHARS = 80_000;
 
 export interface MemoryExtractionOptions {
   discarded: Message[];
@@ -58,7 +57,7 @@ export async function extractMemories(
       "Extract durable memory if and only if it meets the write rules. Prefer revising existing notes.",
       "If nothing qualifies, reply with NO_MEMORY_UPDATES and stop.",
       "",
-      serializeMessages(options.discarded, MAX_TRANSCRIPT_CHARS),
+      serializeMessages(options.discarded),
     ].join("\n"),
   }];
 
@@ -157,39 +156,3 @@ function buildExtractionPrompt(ctx: AgentContext): string {
     userPortrait,
   ].join("\n");
 }
-
-function serializeMessages(messages: Message[], maxChars: number): string {
-  const chunks: string[] = [];
-  for (const message of messages) {
-    if (typeof message.content === "string") {
-      chunks.push(`${message.role}: ${message.content}`);
-      continue;
-    }
-    const parts = message.content.map((block) => {
-      if (block.type === "text") return block.text;
-      if (block.type === "tool_use") {
-        return `[${block.name} ${JSON.stringify(block.input).slice(0, 400)}]`;
-      }
-      return `[tool_result ${(block.content ?? "").slice(0, 400)}]`;
-    });
-    chunks.push(`${message.role}: ${parts.join("\n")}`);
-  }
-  const text = chunks.join("\n\n");
-  if (text.length <= maxChars) return text;
-  const head = Math.floor(maxChars * 0.35);
-  const tail = maxChars - head - 28;
-  return `${text.slice(0, head)}\n\n[...truncated...]\n\n${text.slice(-tail)}`;
-}
-
-const SILENT_RENDERER: StreamRenderer = {
-  renderUserMessage() {},
-  renderAssistantMessage() {},
-  renderThinking() {},
-  renderSystemMessage() {},
-  renderToolUse() {},
-  renderToolResult() {},
-  renderError() {},
-  renderWarning() {},
-  clear() {},
-  flush() {},
-};

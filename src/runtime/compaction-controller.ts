@@ -3,13 +3,17 @@
 //   - Token estimation for messages + system prompt
 //   - Dynamic compaction threshold per model
 //   - Auto-compaction trigger (token-based)
-//   - compactViaSubagent call with fallback to microCompact
+//   - compactViaModel call with fallback to microCompact
 //   - Post-compact restoration (recent files injection)
 //   - Micro-compact before requests
 
-import type { Message, AgentContext, AgentConfig } from "../shared/core-types.js";
-import { microCompact } from "../context/compression.js";
-import { compactViaSubagent } from "../context/compression.js";
+import type {
+  Message,
+  AgentContext,
+  AgentConfig,
+  ModelProvider,
+} from "../shared/core-types.js";
+import { compactViaModel, microCompact } from "../context/compression.js";
 import { microCompactBeforeRequest } from "../context/micro-compact.js";
 import type { ReadGuardState } from "../shared/core-types.js";
 import { roughTokenEstimate } from "../shared/tokens.js";
@@ -44,6 +48,8 @@ export interface CompactionOptions {
   skipCompaction?: boolean;
   ctx: AgentContext;
   config: AgentConfig;
+  provider: ModelProvider;
+  abortSignal?: AbortSignal;
   readGuard: ReadGuardState;
   consecutiveFailures: number;
 }
@@ -75,7 +81,7 @@ export async function checkAndCompact(
 ): Promise<CompactionResult> {
   const {
     messages, systemTokens, model, forceCompact, skipCompaction,
-    ctx, config, readGuard, consecutiveFailures,
+    ctx, config, provider, abortSignal, readGuard, consecutiveFailures,
   } = options;
 
   if (skipCompaction) {
@@ -97,7 +103,13 @@ export async function checkAndCompact(
     : `~${Math.round(approxTokens / 1000)}K / ${Math.round(threshold / 1000)}K tokens (${model})`;
 
   try {
-    const compacted = await compactViaSubagent(messages, ctx, config, keepRecent);
+    const compacted = await compactViaModel(
+      messages,
+      config,
+      provider,
+      keepRecent,
+      abortSignal,
+    );
 
     // Post-compact restoration: inject recently accessed files
     const snapshot = readGuard.serialize();
