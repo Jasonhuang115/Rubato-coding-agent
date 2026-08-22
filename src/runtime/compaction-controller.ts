@@ -1,11 +1,7 @@
 // CompactionController — context compaction orchestration
-// Extracted from loop.ts. Handles:
-//   - Token estimation for messages + system prompt
-//   - Dynamic compaction threshold per model
-//   - Auto-compaction trigger (token-based)
-//   - compactViaModel call with fallback to microCompact
-//   - Post-compact restoration (recent files injection)
-//   - Micro-compact before requests
+// Layered compact: keep last 10 user turns, judge against the current
+// model's working window, then clear/offload recent tool results, then shrink
+// turns. Occupancy failure is unrecoverable (root session should stop).
 
 import type {
   Message,
@@ -13,31 +9,58 @@ import type {
   AgentConfig,
   ModelProvider,
 } from "../shared/core-types.js";
-import { compactViaModel, microCompact } from "../context/compression.js";
 import { microCompactBeforeRequest } from "../context/micro-compact.js";
 import type { ReadGuardState } from "../shared/core-types.js";
-import { roughTokenEstimate } from "../shared/tokens.js";
+import { estimateMessageTokens } from "../shared/tokens.js";
+import {
+  getCompactionBudget,
+  systemLeavesNoConversationRoom,
+  type CompactionBudget,
+} from "./model-windows.js";
+import { PASS1_KEEP_TURNS } from "../context/compression.js";
+import {
+  applyToolResultActions,
+  collectToolResultEntries,
+  countKeptUserTurns,
+  extractSummaryText,
+  heuristicToolResultActions,
+  offloadHeavyToolResults,
+  pickToolResultActionsViaModel,
+  shrinkOldestKeptTurn,
+  SHRINK_FLOOR_TURNS,
+  summarizeOlderTurns,
+} from "../context/layered-compact.js";
+import {
+  listOffloadPaths,
+  toolResultOffloadDir,
+  writeCompactionHandoff,
+} from "../context/tool-result-offload.js";
+import path from "path";
 
-// ---- Configuration ----
+export { estimateMessageTokens };
+export { PASS1_KEEP_TURNS };
+export const MAX_COMPACTION_FAILURES = 3;
 
-const AUTOCOMPACT_BUFFER = 20_000;
-export const ROOT_COMPACT_KEEP_RECENT = 60;
-export const SUBAGENT_COMPACT_KEEP_RECENT = 24;
-const MAX_COMPACTION_FAILURES = 3;
-const ROOT_COMPACTION_CEILING = 240_000;
-const SUBAGENT_COMPACTION_CEILING = 120_000;
+export type CompactionOutcome = "ok" | "skipped" | "unrecoverable";
+export type UnrecoverableCode = "occupancy" | "system_too_large";
 
-// ---- Public API ----
+export interface CompactionHandoff {
+  sessionId: string;
+  summary: string;
+  offloadIndex: string[];
+  handoffPath?: string;
+}
 
 export interface CompactionResult {
-  /** Whether compaction was performed. */
   compacted: boolean;
-  /** Compaction reason (for yielding to the agent loop). */
   reason?: string;
-  /** Updated messages (replaced if compacted). */
   messages: Message[];
-  /** Whether auto-compaction should be disabled going forward. */
   disableAutoCompact: boolean;
+  outcome: CompactionOutcome;
+  unrecoverableCode?: UnrecoverableCode;
+  warning?: string;
+  handoff?: CompactionHandoff;
+  modelCallFailed?: boolean;
 }
 
 export interface CompactionOptions {
@@ -46,6 +69,7 @@ export interface CompactionOptions {
   model: string;
   forceCompact?: boolean;
   skipCompaction?: boolean;
+  overflowRecovery?: boolean;
   ctx: AgentContext;
   config: AgentConfig;
   provider: ModelProvider;
@@ -54,8 +78,13 @@ export interface CompactionOptions {
   consecutiveFailures: number;
 }
 
-export function compactionKeepRecent(isSubagent: boolean): number {
-  return isSubagent ? SUBAGENT_COMPACT_KEEP_RECENT : ROOT_COMPACT_KEEP_RECENT;
+export function compactionKeepTurns(): number {
+  return PASS1_KEEP_TURNS;
+}
+
+/** @deprecated Use compactionKeepTurns — kept as an alias for call-site updates. */
+export function compactionKeepRecent(_isSubagent?: boolean): number {
+  return PASS1_KEEP_TURNS;
 }
 
 export function wouldCompact(options: {
@@ -65,105 +94,244 @@ export function wouldCompact(options: {
   forceCompact?: boolean;
   skipCompaction?: boolean;
   isSubagent?: boolean;
+  contextWindow?: number;
+  maxTokens?: number;
 }): boolean {
   if (options.skipCompaction) return false;
   if (options.forceCompact) return true;
+  const budget = getCompactionBudget({
+    model: options.model,
+    isSubagent: options.isSubagent,
+    contextWindow: options.contextWindow,
+    maxTokens: options.maxTokens,
+  });
   const approxTokens = estimateMessageTokens(options.messages) + options.systemTokens;
-  return approxTokens > getAutoCompactThreshold(options.model, Boolean(options.isSubagent));
+  return approxTokens > budget.trigger;
 }
 
-/**
- * Check if compaction is needed and execute if so.
- * Returns updated messages and whether compaction was performed.
- */
 export async function checkAndCompact(
   options: CompactionOptions,
 ): Promise<CompactionResult> {
   const {
     messages, systemTokens, model, forceCompact, skipCompaction,
-    ctx, config, provider, abortSignal, readGuard, consecutiveFailures,
+    overflowRecovery, ctx, config, provider, abortSignal, readGuard,
+    consecutiveFailures,
   } = options;
 
+  const budget = getCompactionBudget({
+    model,
+    isSubagent: Boolean(ctx.taskRuntime),
+    contextWindow: config.model.contextWindow,
+    maxTokens: config.model.maxTokens,
+  });
+
   if (skipCompaction) {
-    return { compacted: false, messages, disableAutoCompact: false };
+    return skipped(messages, budget.windowWarning);
+  }
+
+  if (systemLeavesNoConversationRoom(systemTokens, budget)) {
+    return {
+      compacted: false,
+      messages,
+      disableAutoCompact: false,
+      outcome: "unrecoverable",
+      unrecoverableCode: "system_too_large",
+      reason: systemTooLargeMessage(systemTokens, budget),
+      warning: budget.windowWarning,
+    };
   }
 
   const approxTokens = estimateMessageTokens(messages) + systemTokens;
-  const threshold = getAutoCompactThreshold(model, Boolean(ctx.taskRuntime));
-  const keepRecent = ctx.taskRuntime
-    ? SUBAGENT_COMPACT_KEEP_RECENT
-    : ROOT_COMPACT_KEEP_RECENT;
-
-  if (!forceCompact && approxTokens <= threshold) {
-    return { compacted: false, messages, disableAutoCompact: false };
+  const overTrigger = approxTokens > budget.trigger;
+  if (!forceCompact && !overflowRecovery && !overTrigger) {
+    return skipped(messages, budget.windowWarning);
   }
 
   const reason = forceCompact
     ? "User requested compaction"
-    : `~${Math.round(approxTokens / 1000)}K / ${Math.round(threshold / 1000)}K tokens (${model})`;
+    : overflowRecovery
+      ? "Context overflow — compacting further"
+      : `~${Math.round(approxTokens / 1000)}K / ${Math.round(budget.trigger / 1000)}K tokens (${model})`;
 
-  try {
-    const compacted = await compactViaModel(
-      messages,
-      config,
-      provider,
-      keepRecent,
-      abortSignal,
-    );
+  const offloadDir = toolResultOffloadDir(ctx.projectId, ctx.sessionId);
+  let next = offloadHeavyToolResults(messages, offloadDir);
+  let modelCallFailed = false;
 
-    // Post-compact restoration: inject recently accessed files
-    const snapshot = readGuard.serialize();
-    const recentFiles = Object.entries(snapshot.files)
-      .sort(([, a], [, b]) => b.timestamp - a.timestamp)
-      .slice(0, 3)
-      .map(([fp]) => fp);
-    if (recentFiles.length > 0) {
-      compacted.push({
-        role: "user",
-        content: `[Recently accessed files after compaction: ${recentFiles.join(", ")}. You may want to re-read these if you need their current content.]`,
-      });
-    }
+  const pass1 = await summarizeOlderTurns(
+    next,
+    PASS1_KEEP_TURNS,
+    config,
+    provider,
+    abortSignal,
+  );
+  next = pass1.messages;
+  if (pass1.modelFailed) modelCallFailed = true;
 
-    return {
-      compacted: true,
-      reason,
-      messages: compacted,
-      disableAutoCompact: false,
-    };
-  } catch {
-    // Compaction failure: track and fall back to string-based
-    const newFailures = consecutiveFailures + 1;
-    if (newFailures >= MAX_COMPACTION_FAILURES) {
-      return {
-        compacted: true,
-        reason: `Compaction failed ${newFailures} times — disabling auto-compaction.`,
-        messages: microCompact(messages, keepRecent),
-        disableAutoCompact: true,
-      };
-    }
-
-    return {
-      compacted: true,
-      reason: `Compaction failed (${newFailures}/${MAX_COMPACTION_FAILURES}) — falling back to string-based.`,
-      messages: microCompact(messages, keepRecent),
-      disableAutoCompact: false,
-    };
+  if (occupancyOk(next, systemTokens, budget)) {
+    return success(next, reason, readGuard, modelCallFailed, consecutiveFailures, budget.windowWarning);
   }
+
+  next = await runPass2(next, config, provider, abortSignal, offloadDir);
+  if (occupancyOk(next, systemTokens, budget)) {
+    return success(next, `${reason} — pass 2`, readGuard, modelCallFailed, consecutiveFailures, budget.windowWarning);
+  }
+
+  while (
+    countKeptUserTurns(next) > SHRINK_FLOOR_TURNS &&
+    !occupancyOk(next, systemTokens, budget)
+  ) {
+    const shrunk = shrinkOldestKeptTurn(next);
+    if (shrunk === next) break;
+    next = shrunk;
+  }
+
+  if (occupancyOk(next, systemTokens, budget)) {
+    return success(next, `${reason} — shrunk turns`, readGuard, modelCallFailed, consecutiveFailures, budget.windowWarning);
+  }
+
+  const handoff = buildHandoff(next, ctx, offloadDir);
+  return {
+    compacted: true,
+    reason: occupancyFailureMessage(ctx.sessionId, handoff, Boolean(ctx.taskRuntime)),
+    messages: next,
+    disableAutoCompact: false,
+    outcome: "unrecoverable",
+    unrecoverableCode: "occupancy",
+    handoff,
+    modelCallFailed,
+    warning: budget.windowWarning,
+  };
+}
+
+async function runPass2(
+  messages: Message[],
+  config: AgentConfig,
+  provider: ModelProvider,
+  abortSignal: AbortSignal | undefined,
+  offloadDir: string,
+): Promise<Message[]> {
+  const entries = collectToolResultEntries(messages);
+  if (entries.length === 0) return messages;
+  let actions;
+  try {
+    actions = await pickToolResultActionsViaModel(entries, config, provider, abortSignal);
+  } catch {
+    actions = heuristicToolResultActions(entries);
+  }
+  return applyToolResultActions(messages, actions, offloadDir);
+}
+
+function occupancyOk(messages: Message[], systemTokens: number, budget: CompactionBudget): boolean {
+  return systemTokens + estimateMessageTokens(messages) < budget.successCeiling;
+}
+
+function success(
+  messages: Message[],
+  reason: string,
+  readGuard: ReadGuardState,
+  modelCallFailed: boolean,
+  consecutiveFailures: number,
+  warning?: string,
+): CompactionResult {
+  const restored = injectRecentFiles(messages, readGuard);
+  const newFailures = modelCallFailed ? consecutiveFailures + 1 : 0;
+  return {
+    compacted: true,
+    reason: modelCallFailed
+      ? `Compaction summary failed (${newFailures}/${MAX_COMPACTION_FAILURES}) — used heuristic summary.`
+      : reason,
+    messages: restored,
+    disableAutoCompact: modelCallFailed && newFailures >= MAX_COMPACTION_FAILURES,
+    outcome: "ok",
+    modelCallFailed,
+    warning,
+  };
+}
+
+function skipped(messages: Message[], warning?: string): CompactionResult {
+  return {
+    compacted: false,
+    messages,
+    disableAutoCompact: false,
+    outcome: "skipped",
+    warning,
+  };
+}
+
+function injectRecentFiles(messages: Message[], readGuard: ReadGuardState): Message[] {
+  const snapshot = readGuard.serialize();
+  const recentFiles = Object.entries(snapshot.files)
+    .sort(([, a], [, b]) => b.timestamp - a.timestamp)
+    .slice(0, 3)
+    .map(([fp]) => fp);
+  if (recentFiles.length === 0) return messages;
+  return [
+    ...messages,
+    {
+      role: "user",
+      content: `[Recently accessed files after compaction: ${recentFiles.join(", ")}. You may want to re-read these if you need their current content.]`,
+    },
+  ];
+}
+
+function buildHandoff(messages: Message[], ctx: AgentContext, offloadDir: string): CompactionHandoff {
+  const summary = extractSummaryText(messages);
+  const offloadIndex = listOffloadPaths(messages);
+  let handoffPath: string | undefined;
+  try {
+    handoffPath = writeCompactionHandoff({
+      dir: path.dirname(offloadDir),
+      sessionId: ctx.sessionId,
+      summary,
+      offloadIndex,
+    });
+  } catch {
+    // Session disk is best-effort; the in-memory handoff still works.
+  }
+  return { sessionId: ctx.sessionId, summary, offloadIndex, handoffPath };
+}
+
+function systemTooLargeMessage(systemTokens: number, budget: CompactionBudget): string {
+  const window = budget.window ?? 0;
+  return (
+    `System prompt is unexpectedly large (~${Math.round(systemTokens)} tokens) ` +
+    `for working window ${window} (output reserve ${budget.outputReserve}). ` +
+    `This is a configuration or prompt-assembly bug, not a conversation-history problem.`
+  );
+}
+
+function occupancyFailureMessage(
+  sessionId: string,
+  handoff: CompactionHandoff,
+  isSubagent: boolean,
+): string {
+  const index = handoff.offloadIndex.length > 0
+    ? handoff.offloadIndex.map((p) => `  ${p}`).join("\n")
+    : "  (none)";
+  if (isSubagent) {
+    // Subagent stop-path rewrite is out of this plan; fail the task without /clear copy.
+    return (
+      `Context compaction could not free enough space to continue this subagent task.\n` +
+      `Session: ${sessionId}\n` +
+      (handoff.handoffPath ? `Handoff: ${handoff.handoffPath}\n` : "") +
+      `Offloaded files:\n${index}`
+    );
+  }
+  return (
+    `Context compaction could not free enough space to continue.\n` +
+    `Session: ${sessionId}\n` +
+    `Start a new conversation with /clear. The summary and offloaded file index were saved` +
+    (handoff.handoffPath ? ` at ${handoff.handoffPath}` : "") +
+    `.\nOffloaded files:\n${index}`
+  );
 }
 
 export interface MicroCompactResult {
-  /** Whether any tool results were cleared. */
   cleared: boolean;
-  /** Number of stale results cleared. */
   count: number;
-  /** Updated messages. */
   messages: Message[];
 }
 
-/**
- * Run pre-request micro-compaction to clear stale tool results.
- * Lightweight, no LLM cost.
- */
 export function runMicroCompact(messages: Message[]): MicroCompactResult {
   const mcResult = microCompactBeforeRequest(messages);
   if (mcResult.cleared > 0) {
@@ -172,50 +340,29 @@ export function runMicroCompact(messages: Message[]): MicroCompactResult {
   return { cleared: false, count: 0, messages };
 }
 
-/** Estimate tokens for a message array. Pads by 4/3 for safety. */
-export function estimateMessageTokens(messages: Message[]): number {
-  let total = 0;
-  for (const msg of messages) {
-    if (typeof msg.content === "string") {
-      total += roughTokenEstimate(msg.content);
-      continue;
-    }
-    for (const block of msg.content) {
-      switch (block.type) {
-        case "text":
-          total += roughTokenEstimate(block.text);
-          break;
-        case "tool_result":
-          total += roughTokenEstimate(block.content ?? "");
-          break;
-        case "tool_use":
-          total += roughTokenEstimate(block.name + JSON.stringify(block.input));
-          break;
-      }
-    }
-  }
-  return Math.ceil(total * (4 / 3));
+export function getAutoCompactThreshold(
+  model: string,
+  isSubagent = false,
+  options?: { contextWindow?: number; maxTokens?: number },
+): number {
+  return getCompactionBudget({
+    model,
+    isSubagent,
+    contextWindow: options?.contextWindow,
+    maxTokens: options?.maxTokens,
+  }).trigger;
 }
 
-// ---- Dynamic compaction threshold ----
-
-function getEffectiveContextWindow(model: string): number {
-  const CONTEXT_WINDOWS: Record<string, number> = {
-    "deepseek-chat": 1_000_000,
-    "deepseek-reasoner": 1_000_000,
-    "deepseek-v4-pro": 1_000_000,
-    "claude-sonnet-4-20250514": 200_000,
-    "claude-opus-4-20250514": 200_000,
-    "gpt-4o": 128_000,
-    "gpt-4-turbo": 128_000,
-  };
-  return CONTEXT_WINDOWS[model] ?? 128_000;
-}
-
-export function getAutoCompactThreshold(model: string, isSubagent = false): number {
-  const providerLimit = getEffectiveContextWindow(model) - AUTOCOMPACT_BUFFER;
-  const operatingCeiling = isSubagent
-    ? SUBAGENT_COMPACTION_CEILING
-    : ROOT_COMPACTION_CEILING;
-  return Math.min(providerLimit, operatingCeiling);
+export function formatHandoffResumeSummary(handoff: CompactionHandoff): string {
+  const index = handoff.offloadIndex.length > 0
+    ? handoff.offloadIndex.map((p) => `- ${p}`).join("\n")
+    : "- (none)";
+  return [
+    `Previous session: ${handoff.sessionId}`,
+    "",
+    handoff.summary,
+    "",
+    "Offloaded tool results (Read these paths if you need the original output):",
+    index,
+  ].join("\n");
 }

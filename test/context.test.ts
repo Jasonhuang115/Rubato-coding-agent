@@ -117,17 +117,15 @@ describe("ContextChain", () => {
 });
 
 describe("MicroCompact", () => {
-  it("compresses messages when over target count", () => {
-    const messages = Array.from({ length: 20 }, (_, i) => ({
+  it("compresses older user turns when over the keep-turns budget", () => {
+    const messages = Array.from({ length: 24 }, (_, i) => ({
       role: i % 2 === 0 ? ("user" as const) : ("assistant" as const),
       content: `Message ${i}: doing work on /path/to/file${i}.ts`,
     }));
 
-    const target = 10;
-    const compressed = microCompact(messages, target);
+    const compressed = microCompact(messages, 10);
 
     expect(compressed.length).toBeLessThan(messages.length);
-    // First message should be the summary
     expect(compressed[0].content).toContain("[Earlier conversation");
   });
 

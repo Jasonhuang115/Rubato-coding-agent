@@ -4,6 +4,7 @@ import {
   estimateMessageTokens,
   getAutoCompactThreshold,
 } from "../src/runtime/compaction-controller.js";
+import { getCompactionBudget } from "../src/runtime/model-windows.js";
 import { roughTokenEstimate } from "../src/shared/tokens.js";
 
 describe("CompactionController token estimation", () => {
@@ -16,13 +17,18 @@ describe("CompactionController token estimation", () => {
     }])).toBeGreaterThan(0);
   });
 
-  it("uses an operational ceiling below very large provider windows", () => {
-    expect(getAutoCompactThreshold("deepseek-v4-pro")).toBe(240_000);
+  it("uses the working window without a global 240k root ceiling", () => {
+    const budget = getCompactionBudget({ model: "deepseek-v4-pro" });
+    expect(getAutoCompactThreshold("deepseek-v4-pro")).toBe(budget.trigger);
+    expect(budget.window).toBe(256_000);
+    expect(budget.trigger).toBeLessThan(256_000);
     expect(getAutoCompactThreshold("deepseek-v4-pro", true)).toBe(120_000);
   });
 
   it("still respects providers with smaller context windows", () => {
-    expect(getAutoCompactThreshold("gpt-4o")).toBe(108_000);
+    const budget = getCompactionBudget({ model: "gpt-4o" });
+    expect(getAutoCompactThreshold("gpt-4o")).toBe(budget.trigger);
+    expect(budget.window).toBe(128_000);
     expect(getAutoCompactThreshold("gpt-4o", true)).toBe(108_000);
   });
 });

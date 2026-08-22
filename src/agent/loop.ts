@@ -31,7 +31,8 @@ import { sessionEndHook } from "../tools/git/hooks.js";
 import { assembleContext } from "../runtime/context-assembler.js";
 import {
   checkAndCompact,
-  compactionKeepRecent,
+  compactionKeepTurns,
+  estimateMessageTokens,
   runMicroCompact,
   wouldCompact,
 } from "../runtime/compaction-controller.js";
@@ -43,6 +44,7 @@ import {
   CircuitBreakerError,
   MaxRetriesError,
   StreamFailedError,
+  ContextOverflowError,
 } from "../runtime/step-executor.js";
 import { processSubagentRegistry } from "./subagents/registry.js";
 import type { TaskInboxEvent } from "./subagents/conversation-inbox.js";
@@ -68,7 +70,18 @@ export type AgentEvent =
       isError: boolean;
       security?: { verdict: string; risk: string; reason: string };
     }
-  | { type: "error"; message: string; retryable: boolean }
+  | {
+      type: "error";
+      message: string;
+      retryable: boolean;
+      code?: string;
+      handoff?: {
+        sessionId: string;
+        summary: string;
+        offloadIndex: string[];
+        handoffPath?: string;
+      };
+    }
   | { type: "warning"; message: string }
   | { type: "turn_start"; turn: number }
   | { type: "turn_end"; turn: number; usage?: { input: number; output: number } }
@@ -259,6 +272,8 @@ export async function* agentLoop(
   let consecutiveCompactionFailures = 0;
   let skipAutoCompact = options.skipCompaction ?? false;
   let extractedThisCycle = false;
+  let overflowRecovery = false;
+  let lastModelId = config.model.model;
 
   // ---- Main turn loop ----
   const configuredMaxTurns = options.maxTurns ??
@@ -298,6 +313,19 @@ export async function* agentLoop(
       provider = createProvider(config.model);
       yield { type: "warning", message: `Switched to ${config.model.provider}/${config.model.model}` };
     }
+    if (config.model.model !== lastModelId) {
+      const previous = lastModelId;
+      lastModelId = config.model.model;
+      const used = Math.round(
+        (estimateMessageTokens(messages) + systemTokens) / 1000,
+      );
+      yield {
+        type: "warning",
+        message:
+          `Model changed ${previous} → ${config.model.model}. ` +
+          `Current conversation ~${used}k tokens; the new working window will be used for compaction.`,
+      };
+    }
 
     yield { type: "turn_start", turn: turn + 1 };
     rootRuntime?.trace.append({
@@ -312,9 +340,11 @@ export async function* agentLoop(
       messages,
       systemTokens,
       model: config.model.model,
-      forceCompact: options.forceCompaction,
-      skipCompaction: skipAutoCompact,
+      forceCompact: options.forceCompaction || overflowRecovery,
+      skipCompaction: skipAutoCompact && !overflowRecovery,
       isSubagent: Boolean(ctx.taskRuntime),
+      contextWindow: config.model.contextWindow,
+      maxTokens: config.model.maxTokens,
     });
     if (shouldExtractMemories({
       isRoot: isRootProfile,
@@ -325,7 +355,7 @@ export async function* agentLoop(
       extractedThisCycle = true;
       const discarded = messagesToDiscard(
         messages,
-        compactionKeepRecent(Boolean(ctx.taskRuntime)),
+        compactionKeepTurns(),
       );
       if (discarded.length > 0) {
         yield {
@@ -351,8 +381,9 @@ export async function* agentLoop(
       messages,
       systemTokens,
       model: config.model.model,
-      forceCompact: options.forceCompaction,
-      skipCompaction: skipAutoCompact,
+      forceCompact: options.forceCompaction || overflowRecovery,
+      skipCompaction: skipAutoCompact && !overflowRecovery,
+      overflowRecovery,
       ctx,
       config,
       provider,
@@ -363,8 +394,34 @@ export async function* agentLoop(
 
     if (options.forceCompaction) options.forceCompaction = false;
 
+    if (compactResult.warning) {
+      yield { type: "warning", message: compactResult.warning };
+    }
+
+    if (compactResult.outcome === "unrecoverable") {
+      if (compactResult.compacted) {
+        messages.length = 0;
+        messages.push(...compactResult.messages);
+        if (persistConversation) {
+          sessionStore.writeCompaction({ turn, messageCount: messages.length });
+        }
+      }
+      yield {
+        type: "error",
+        message: compactResult.reason ?? "Context compaction failed",
+        retryable: false,
+        code: compactResult.unrecoverableCode,
+        handoff: compactResult.handoff,
+      };
+    // Subagent unrecoverable path is intentionally unchanged beyond this
+    // task-failing error: no "open a new conversation" rewrite. See plan.
+      doneReason = "compaction_unrecoverable";
+      break;
+    }
+
     if (compactResult.compacted) {
       extractedThisCycle = false;
+      overflowRecovery = false;
       yield { type: "compacting", reason: compactResult.reason ?? "Auto-compaction" };
       messages.length = 0;
       messages.push(...compactResult.messages);
@@ -378,8 +435,7 @@ export async function* agentLoop(
       skipAutoCompact = true;
     }
 
-    // Track compaction failures
-    if (compactResult.compacted && compactResult.reason?.includes("failed")) {
+    if (compactResult.modelCallFailed) {
       consecutiveCompactionFailures++;
     } else if (compactResult.compacted) {
       consecutiveCompactionFailures = 0;
@@ -434,6 +490,25 @@ export async function* agentLoop(
         onTextFlush: assistantDraft ? () => assistantDraft.flush() : undefined,
       });
     } catch (err) {
+      if (err instanceof ContextOverflowError) {
+        if (overflowRecovery) {
+          yield {
+            type: "error",
+            message:
+              `Context window overflow after compaction. ${err.message}`,
+            retryable: false,
+            code: "occupancy",
+          };
+          doneReason = "compaction_unrecoverable";
+          break;
+        }
+        overflowRecovery = true;
+        yield {
+          type: "warning",
+          message: "Model reported a context overflow. Compacting further before retrying.",
+        };
+        continue;
+      }
       if (err instanceof UserInterruptError) {
         assistantDraft?.boundary("interrupted");
         rootRuntime?.trace.append({

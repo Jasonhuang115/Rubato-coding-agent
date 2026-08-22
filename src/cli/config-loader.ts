@@ -138,6 +138,14 @@ export function loadConfig(workingDir: string): AgentConfig {
       apiKey: process.env.CODING_AGENT_API_KEY ??
         fileConfig.model?.apiKey,
       maxRetries: fileConfig.model?.maxRetries ?? 3,
+      maxTokens: parsePositiveInt(
+        process.env.CODING_AGENT_MAX_TOKENS,
+        fileConfig.model?.maxTokens,
+      ),
+      contextWindow: parsePositiveInt(
+        process.env.CODING_AGENT_CONTEXT_WINDOW,
+        fileConfig.model?.contextWindow,
+      ),
     },
     permissions: {
       ...DEFAULT_PERMISSIONS,
@@ -164,6 +172,20 @@ export function loadConfig(workingDir: string): AgentConfig {
   };
 
   return config;
+}
+
+function parsePositiveInt(
+  envValue: string | undefined,
+  fileValue: number | undefined,
+): number | undefined {
+  if (envValue !== undefined) {
+    const parsed = Number.parseInt(envValue, 10);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  if (typeof fileValue === "number" && Number.isFinite(fileValue) && fileValue > 0) {
+    return fileValue;
+  }
+  return undefined;
 }
 
 function warnLegacyMemoryConfig(config: ConfigFileInput): void {

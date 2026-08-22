@@ -123,6 +123,8 @@ export interface AgentConfig {
     baseURL?: string;       // 自定义 API 端点
     apiKey?: string;        // 覆盖环境变量
     maxRetries?: number;
+    contextWindow?: number; // working context window override
+    maxTokens?: number;     // output cap; also used as compaction output reserve
   };
   permissions: {
     bash: PermissionMode;

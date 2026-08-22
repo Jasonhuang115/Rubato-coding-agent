@@ -21,6 +21,7 @@ import {
 } from "./memory-commands.js";
 import { AnsiStreamRenderer } from "./stream-renderer.js";
 import { agentLoop, abortCurrentRequest } from "../agent/loop.js";
+import { formatHandoffResumeSummary } from "../runtime/compaction-controller.js";
 import {
   register,
   unregister,
@@ -649,6 +650,7 @@ async function main(): Promise<void> {
       { id: activeSessionId, conversationId: activeConversationId },
     );
     try {
+      let occupancyHandoff: Parameters<typeof formatHandoffResumeSummary>[0] | undefined;
       for await (const event of agentLoop({
         config,
         workingDir: workdir,
@@ -688,6 +690,9 @@ async function main(): Promise<void> {
 
           case "error":
             renderer.renderError(event.message);
+            if (event.code === "occupancy" && event.handoff) {
+              occupancyHandoff = event.handoff;
+            }
             break;
 
           case "warning":
@@ -711,6 +716,13 @@ async function main(): Promise<void> {
           case "done":
             console.log(`\n[Session ended: ${event.reason}]`);
             processing = false;
+            if (event.reason === "compaction_unrecoverable" && occupancyHandoff && rl) {
+              loopState.shouldRestart = true;
+              loopState.newSessionId = randomUUID();
+              loopState.conversationId = randomUUID();
+              loopState.resumeSummary = formatHandoffResumeSummary(occupancyHandoff);
+              console.log("\n  Starting a new session with the previous summary and offload index.");
+            }
             break;
 
           case "turn_end":

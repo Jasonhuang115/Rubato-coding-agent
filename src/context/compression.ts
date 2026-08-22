@@ -38,28 +38,60 @@ const COMPACT_CONTINUATION = [
   "The summary below covers the compacted portion.",
 ].join(" ");
 
+export const PASS1_KEEP_TURNS = 10;
+export const SHRINK_FLOOR_TURNS = 1;
+
+export function isPureToolResult(msg: Message): boolean {
+  if (typeof msg.content === "string") return false;
+  return msg.content.length > 0 && msg.content.every((b) => b.type === "tool_result");
+}
+
+export function isCompactionSummary(msg: Message): boolean {
+  const text = messageText(msg);
+  return text.includes(COMPACT_CONTINUATION) || text.includes("[Earlier conversation");
+}
+
+/** A user turn starts at a user message that is not a tool-result continuation. */
+export function isUserTurnStart(msg: Message): boolean {
+  if (msg.role !== "user") return false;
+  if (isCompactionSummary(msg)) return false;
+  return !isPureToolResult(msg);
+}
+
+export function userTurnStartIndices(messages: Message[]): number[] {
+  const starts: number[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    if (isUserTurnStart(messages[i]!)) starts.push(i);
+  }
+  return starts;
+}
+
+function messageText(msg: Message): string {
+  if (typeof msg.content === "string") return msg.content;
+  return msg.content
+    .filter((b): b is { type: "text"; text: string } => b.type === "text")
+    .map((b) => b.text)
+    .join("\n");
+}
+
 // ---- MicroCompact: condense individual messages ----
 
 /**
- * MicroCompact replaces old message blocks with short summaries.
- * Ensures tool_use/tool_result pairs stay together to avoid API 400 errors.
+ * Split so the tail contains the last `keepTurns` user turns.
+ * tool_use / tool_result pairs stay together.
+ * Returns 0 when there is nothing older to summarize.
  */
-export function compactCutFrom(messages: Message[], targetCount: number): number {
-  if (messages.length <= targetCount) return 0;
+export function compactCutFrom(messages: Message[], keepTurns: number): number {
+  const starts = userTurnStartIndices(messages);
+  if (starts.length === 0) return 0;
+  if (starts.length <= keepTurns) return 0;
 
-  let keepFrom = messages.length - targetCount + 1;
-  if (keepFrom <= 0) keepFrom = 1;
-
-  while (keepFrom < messages.length) {
-    const firstKept = messages[keepFrom];
-    if (!isToolResult(firstKept)) break;
+  let keepFrom = starts[starts.length - keepTurns]!;
+  while (keepFrom < messages.length && isPureToolResult(messages[keepFrom]!)) {
     keepFrom++;
   }
 
-  if (keepFrom >= messages.length - 1) {
-    keepFrom = Math.max(1, messages.length - 5);
-  }
-
+  if (keepFrom <= 0 || keepFrom >= messages.length) return 0;
   return keepFrom;
 }
 
@@ -70,9 +102,9 @@ export function messagesToDiscard(messages: Message[], targetCount: number): Mes
 
 export function microCompact(
   messages: Message[],
-  targetCount: number
+  keepTurns: number
 ): Message[] {
-  const keepFrom = compactCutFrom(messages, targetCount);
+  const keepFrom = compactCutFrom(messages, keepTurns);
   if (keepFrom <= 0) return messages;
 
   const toSummarize = messages.slice(0, keepFrom);
@@ -82,9 +114,8 @@ export function microCompact(
   return [summary, ...toKeep];
 }
 
-function isToolResult(msg: Message): boolean {
-  if (typeof msg.content === "string") return false;
-  return msg.content.some((b) => b.type === "tool_result");
+export function heuristicSummaryMessage(messages: Message[]): Message {
+  return summarizeMessages(messages);
 }
 
 function summarizeMessages(messages: Message[]): Message {
@@ -179,10 +210,10 @@ export async function compactViaModel(
   messages: Message[],
   config: AgentConfig,
   provider: ModelProvider,
-  keepRecent: number,
+  keepTurns: number,
   abortSignal?: AbortSignal,
 ): Promise<Message[]> {
-  const keepFrom = compactCutFrom(messages, keepRecent);
+  const keepFrom = compactCutFrom(messages, keepTurns);
   if (keepFrom <= 0) return messages;
 
   const toSummarize = messages.slice(0, keepFrom);

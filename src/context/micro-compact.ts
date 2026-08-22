@@ -9,6 +9,7 @@
 // (which doesn't carry per-message timestamps).
 
 import type { Message } from "../shared/core-types.js";
+import { extractOffloadPath } from "./tool-result-offload.js";
 
 // ---- Configuration ----
 
@@ -24,7 +25,16 @@ const COMPACTABLE_TOOLS = new Set([
 ]);
 
 /** Placeholder inserted in place of cleared tool result content. */
-const CLEARED_MESSAGE = "[Old tool result content cleared]";
+export const CLEARED_MESSAGE = "[Old tool result content cleared]";
+
+export function clearedToolResultPlaceholder(offloadPath?: string): string {
+  if (!offloadPath) return CLEARED_MESSAGE;
+  return `[Old tool result content cleared; full output at ${offloadPath}]`;
+}
+
+export function isClearedToolResult(content: string): boolean {
+  return content === CLEARED_MESSAGE || content.startsWith("[Old tool result content cleared");
+}
 
 /** If the last assistant message is more than this many messages ago,
  * stale tool result clearing is triggered even for a short history. */
@@ -103,11 +113,14 @@ export function microCompactBeforeRequest(
       if (
         block.type === "tool_result" &&
         clearSet.has(block.tool_use_id) &&
-        block.content !== CLEARED_MESSAGE
+        !isClearedToolResult(block.content)
       ) {
         cleared++;
         touched = true;
-        return { ...block, content: CLEARED_MESSAGE };
+        return {
+          ...block,
+          content: clearedToolResultPlaceholder(extractOffloadPath(block.content ?? "")),
+        };
       }
       return block;
     });
@@ -162,7 +175,7 @@ function collectLiveCompactableToolIds(messages: Message[]): string[] {
       if (
         block.type === "tool_result" &&
         compactableSet.has(block.tool_use_id) &&
-        block.content !== CLEARED_MESSAGE
+        !isClearedToolResult(block.content ?? "")
       ) {
         liveIds.add(block.tool_use_id);
       }

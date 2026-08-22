@@ -21,16 +21,17 @@ import type { AgentEvent } from "../agent/loop.js";
 import { dispatch } from "../tools/registry.js";
 import { ToolRuntime } from "./tool-runtime.js";
 import type { ToolRuntimeResult } from "./tool-runtime.js";
+import { offloadIfLarge, toolResultOffloadDir } from "../context/tool-result-offload.js";
+import { DEFAULT_OUTPUT_TOKENS } from "./model-windows.js";
 import { prePushHook } from "../tools/git/hooks.js";
 
 // ---- Configuration ----
 
-const DEFAULT_MAX_TOKENS = 16_384;
+const DEFAULT_MAX_TOKENS = DEFAULT_OUTPUT_TOKENS;
 const DEFAULT_MAX_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 1000;
 const CIRCUIT_BREAKER_THRESHOLD = 5;
 const CIRCUIT_BREAKER_WINDOW_MS = 60_000;
-const OFFLOAD_THRESHOLD = 30_000;
 
 // ---- Types ----
 
@@ -222,7 +223,7 @@ export async function* executeTurn(
     try {
       streamResult = await processStream(
         provider,
-        { model, system: systemPrompt, messages, tools, maxTokens: DEFAULT_MAX_TOKENS, signal: abortController.signal },
+        { model, system: systemPrompt, messages, tools, maxTokens: ctx.config?.model?.maxTokens ?? DEFAULT_MAX_TOKENS, signal: abortController.signal },
         renderer,
         ctx.taskRuntime?.onActivity,
         ctx.taskRuntime?.onTextDelta ?? options.onTextDelta,
@@ -243,8 +244,12 @@ export async function* executeTurn(
         throw new UserInterruptError("Interrupted (Ctrl+C)");
       }
 
-      retryCount++;
       const message = err instanceof Error ? err.message : String(err);
+      if (isContextOverflowError(message)) {
+        throw new ContextOverflowError(message);
+      }
+
+      retryCount++;
       const providerAllowsRetry =
         !(err instanceof ProviderStreamError) || err.retryable;
       const retryable = providerAllowsRetry && retryCount <= maxRetries;
@@ -310,6 +315,7 @@ export async function* executeTurn(
     name: toolUse.name,
     input: toolUse.input,
   })));
+  const offloadDir = toolResultOffloadDir(ctx.projectId, ctx.sessionId);
 
   for (const tu of executableToolUses) {
     yield { type: "tool_call", id: tu.id, name: tu.name, input: tu.input };
@@ -370,7 +376,7 @@ export async function* executeTurn(
         content: [{
           type: "tool_result",
           tool_use_id: toolUse.id,
-          content: offloadIfLarge(result.content, toolUse.name, toolUse.input),
+          content: offloadIfLarge(result.content, toolUse.name, toolUse.input, offloadDir),
           is_error: result.isError,
         }],
       });
@@ -428,7 +434,7 @@ export async function* executeTurn(
       content: [{
         type: "tool_result",
         tool_use_id: tu.id,
-        content: offloadIfLarge(result.content, tu.name, tu.input),
+        content: offloadIfLarge(result.content, tu.name, tu.input, offloadDir),
         is_error: result.isError,
       }],
     });
@@ -530,52 +536,11 @@ function isCircuitBreakerOpen(ts: number[]): boolean {
   return ts.length >= CIRCUIT_BREAKER_THRESHOLD;
 }
 
-// ---- Offload large results ----
-
-import fs from "fs";
-import path from "path";
-import { createHash } from "crypto";
-
-export function offloadIfLarge(
-  content: string,
-  toolName: string,
-  toolInput?: Record<string, unknown>,
-): string {
-  if (content.length <= OFFLOAD_THRESHOLD) return content;
-
-  const dir = "/tmp/rubato-tool-results";
-  fs.mkdirSync(dir, { recursive: true });
-  const requestedPath = toolName === "Read" && typeof toolInput?.file_path === "string"
-    ? path.resolve(toolInput.file_path)
-    : undefined;
-  const readingExistingOffload = requestedPath !== undefined &&
-    path.dirname(requestedPath) === dir;
-  const hash = createHash("sha256").update(content).digest("hex").slice(0, 16);
-  const filePath = readingExistingOffload
-    ? requestedPath
-    : path.join(dir, `${toolName}-${hash}.txt`);
-  if (!readingExistingOffload && !fs.existsSync(filePath)) {
-    fs.writeFileSync(filePath, content, "utf-8");
-  }
-
-  const previewLen = 800;
-  const preview = content.slice(0, previewLen);
-  return [
-    readingExistingOffload
-      ? `[Large offloaded result remains at ${filePath}; no duplicate copy was created.]`
-      : `[Full output (${(content.length / 1024).toFixed(1)}KB) offloaded to ${filePath}]`,
-    ``,
-    `Preview:`,
-    preview,
-    content.length > previewLen
-      ? readingExistingOffload
-        ? `\n... [use Grep or Read with offset/limit on ${filePath}; do not read the whole file again]`
-        : `\n... [use Read with offset/limit or Grep on ${filePath} to inspect the full ${(content.length / 1024).toFixed(0)}KB output]`
-      : ``,
-  ].join("\n");
-}
-
 // ---- Utilities ----
+
+function isContextOverflowError(message: string): boolean {
+  return /context.?length|context.?window|maximum context|too many tokens|prompt is too long|reduce the length of the messages|token limit/i.test(message);
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -595,9 +560,14 @@ export class MaxRetriesError extends Error {
 export class StreamFailedError extends Error {
   constructor(message: string) { super(message); this.name = "StreamFailedError"; }
 }
+export class ContextOverflowError extends Error {
+  constructor(message: string) { super(message); this.name = "ContextOverflowError"; }
+}
 export class ProviderStreamError extends Error {
   constructor(message: string, readonly retryable: boolean) {
     super(message);
     this.name = "ProviderStreamError";
   }
 }
+
+export { offloadIfLarge } from "../context/tool-result-offload.js";

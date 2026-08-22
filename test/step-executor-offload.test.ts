@@ -1,35 +1,39 @@
 import fs from "fs";
+import os from "os";
 import path from "path";
 import { afterEach, describe, expect, it } from "vitest";
-import { offloadIfLarge } from "../src/runtime/step-executor.js";
+import { offloadIfLarge } from "../src/context/tool-result-offload.js";
 
-const createdFiles: string[] = [];
+const createdDirs: string[] = [];
 
 afterEach(() => {
-  for (const filePath of createdFiles.splice(0)) {
-    fs.rmSync(filePath, { force: true });
+  for (const dir of createdDirs.splice(0)) {
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 
 describe("large tool-result offloading", () => {
   it("deduplicates identical output and does not offload an offloaded Read again", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rubato-offload-"));
+    createdDirs.push(dir);
     const content = `unique-${Date.now()}-${"x".repeat(31_000)}`;
-    const first = offloadIfLarge(content, "Glob", { pattern: "**/*" });
-    const filePath = first.match(/offloaded to (\/tmp\/rubato-tool-results\/[^}\]\n]+)/)?.[1];
+    const first = offloadIfLarge(content, "Glob", { pattern: "**/*" }, dir);
+    const filePath = first.match(/offloaded to ([^\s\]]+)/)?.[1];
     expect(filePath).toBeTruthy();
-    createdFiles.push(filePath!);
+    expect(filePath?.startsWith(dir)).toBe(true);
     expect(fs.readFileSync(filePath!, "utf8")).toBe(content);
 
-    const duplicate = offloadIfLarge(content, "Glob", { pattern: "**/*" });
+    const duplicate = offloadIfLarge(content, "Glob", { pattern: "**/*" }, dir);
     expect(duplicate).toContain(filePath);
 
-    const filesBeforeRead = new Set(fs.readdirSync(path.dirname(filePath!)));
+    const filesBeforeRead = new Set(fs.readdirSync(dir));
     const readResult = offloadIfLarge(
       `File: ${filePath}\n${"numbered output\n".repeat(2_500)}`,
       "Read",
       { file_path: filePath },
+      dir,
     );
-    const filesAfterRead = new Set(fs.readdirSync(path.dirname(filePath!)));
+    const filesAfterRead = new Set(fs.readdirSync(dir));
 
     expect(readResult).toContain(`remains at ${filePath}`);
     expect(readResult).toContain("use Grep or Read with offset/limit");

@@ -2,6 +2,7 @@ import path from "path";
 import fs from "fs";
 import YAML from "yaml";
 import type { AgentConfig } from "../shared/core-types.js";
+import { describeWorkingWindow, resolveWorkingContextWindow } from "../runtime/model-windows.js";
 import { getGitState } from "../tools/git/advisor.js";
 import { getBranchHealth } from "../tools/git/branch-health.js";
 import { getSkillRegistry } from "../skills/registry.js";
@@ -59,10 +60,12 @@ export function saveModelPreference(provider: string, model: string): void {
   fs.writeFileSync(configPath, YAML.stringify(existing), "utf-8");
 }
 
-export function handleModelCommand(input: string, config: { model: { provider: string; model: string } }): void {
+export function handleModelCommand(input: string, config: AgentConfig): void {
   const args = input.split(/\s+/).slice(1);
   if (args.length === 0) {
+    const window = describeWorkingWindow(config.model.model, config.model.contextWindow);
     console.log(`\n  Current: ${config.model.provider}/${config.model.model}`);
+    console.log(`  Working context window: ${window}`);
     console.log("  Type /model <name> to switch  (e.g. /model deepseek-chat)");
     return;
   }
@@ -78,7 +81,14 @@ export function handleModelCommand(input: string, config: { model: { provider: s
   config.model.provider = provider;
   config.model.model = target;
   saveModelPreference(provider, target);
+  const resolved = resolveWorkingContextWindow(target, config.model.contextWindow);
+  const windowLabel = describeWorkingWindow(target, config.model.contextWindow);
   console.log(`\n  Switched to ${provider}/${target}  (takes effect on next message)`);
+  console.log(`  Working context window: ${windowLabel}`);
+  if (resolved.source === "unresolved") {
+    console.log(`  ⚠ ${resolved.warning}`);
+  }
+  console.log("  If the current conversation is larger than this window, Rubato will compact first.");
 }
 
 export interface SessionsCommandResult { restartLoop: boolean; resumeId?: string; }
