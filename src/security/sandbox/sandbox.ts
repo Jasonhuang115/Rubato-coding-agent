@@ -83,6 +83,17 @@ export const DEFAULT_CONSTRAINTS: SecurityConstraints = {
  * A Sandbox validates and potentially modifies tool input before execution.
  * Implementations handle: filesystem, shell, network, git, and environment.
  */
+/** Optional per-call filesystem scope, used by subagent report writes. */
+export interface SandboxScope {
+  /** Absolute path of the current task's report.md, if any. */
+  reportWritePath?: string;
+  /**
+   * When false, Write/Edit cannot touch the workspace; only `reportWritePath`
+   * is writable. Root agents omit this (workspace writes stay allowed).
+   */
+  workspaceWrites?: boolean;
+}
+
 export interface ISandbox {
   readonly name: string;
 
@@ -91,5 +102,10 @@ export interface ISandbox {
    * - If allowed=false, the tool must NOT execute.
    * - If allowed=true, use sanitizedInput (or original input if none provided).
    */
-  validate(toolName: string, input: Record<string, unknown>, workingDir: string): SandboxResult;
+  validate(
+    toolName: string,
+    input: Record<string, unknown>,
+    workingDir: string,
+    scope?: SandboxScope,
+  ): SandboxResult;
 }

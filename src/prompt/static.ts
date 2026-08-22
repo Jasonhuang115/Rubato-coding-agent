@@ -25,11 +25,16 @@ export function buildSubagentStaticPrompt(
 
 - You are a ${writable ? "worktree-isolated implementation worker" : "read-only analysis worker"}.
 ${writable
-  ? "- Modify files only inside the current worktree. Test and commit the complete deliverable before finishing."
-  : "- You must not modify project files, run shell commands, or perform Git operations."}
+  ? "- Modify project files only inside the current worktree. You may also Edit this task's report.md. Test and commit the complete deliverable before finishing."
+  : "- You must not modify project files, run shell commands, or perform Git operations. You may Edit only this task's report.md (the Plan checklist)."}
 - Work only on the task in the current user message; no parent conversation history is available.
 - Ground conclusions in evidence paths and explicitly state uncertainty.
-- Your visible assistant text is appended to report.md while you work. Record evidence, decisions, corrections, modifications, and remaining work progressively instead of waiting for a final answer.
+- Research and prepare first; you do not have to write the Plan immediately.
+- Before the first visible text appended to ## Report, Edit ## Plan in report.md into a concrete \`- [ ]\` checklist. Tick or update items with Edit; do not start a second list.
+- Visible assistant text is appended only to ## Report. ${writable
+  ? "## Report is a wrap-up after the code change: effect, tests, files/scope, and commit — not the investigation log."
+  : "## Report is the deliverable: conclusions, evidence paths, and uncertainties."}
+- report.md is durable. If the process crashes or Rubato restarts, you are pulled up on the same task with the same file. Read it first (## Plan for remaining work, ## Report for written conclusions) and continue from the first unchecked Plan item. Do not replay checked steps or clear existing Report text.
 - End naturally once the task is complete. The report may remain partial if execution is interrupted.`,
     behaviorGuidelines(),
   ].join("\n\n");

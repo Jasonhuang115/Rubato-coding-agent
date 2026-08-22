@@ -1,7 +1,7 @@
 // CompositeSandbox — chains multiple ISandbox implementations together
 // Each sandbox validates in order; first rejection stops the chain.
 
-import type { ISandbox, SandboxResult } from "./sandbox.js";
+import type { ISandbox, SandboxResult, SandboxScope } from "./sandbox.js";
 
 export class CompositeSandbox implements ISandbox {
   readonly name = "composite-sandbox";
@@ -11,11 +11,16 @@ export class CompositeSandbox implements ISandbox {
     this.sandboxes = sandboxes;
   }
 
-  validate(toolName: string, input: Record<string, unknown>, workingDir: string): SandboxResult {
+  validate(
+    toolName: string,
+    input: Record<string, unknown>,
+    workingDir: string,
+    scope?: SandboxScope,
+  ): SandboxResult {
     let currentInput = input;
 
     for (const sandbox of this.sandboxes) {
-      const result = sandbox.validate(toolName, currentInput, workingDir);
+      const result = sandbox.validate(toolName, currentInput, workingDir, scope);
       if (!result.allowed) return result; // Stop on first rejection
 
       // Pass sanitized input to next sandbox

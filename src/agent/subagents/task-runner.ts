@@ -32,6 +32,10 @@ export interface TaskRunnerInput {
   registerReportFlusher?: (flush: () => void) => void;
   onActivity: (activity: string, toolName?: string) => void;
   mode?: "default" | "plan";
+  reportPath?: string;
+  writableWorkspace?: boolean;
+  editReport?: SubagentRuntimeContext["editReport"];
+  takePlanReminder?: () => string | undefined;
 }
 
 export interface TaskRunnerOutput {
@@ -71,9 +75,13 @@ export class TaskRunner {
       rootSessionId: input.rootSessionId,
       taskId: input.taskId,
       agentId: input.agentId,
+      reportPath: input.reportPath,
+      writableWorkspace: input.writableWorkspace,
       onActivity: input.onActivity,
       onTextDelta: appendReport,
       onTextFlush: flushReport,
+      editReport: input.editReport,
+      takePlanReminder: input.takePlanReminder,
     };
     const coverageTracker = new ObservableCoverageTracker(
       input.workingDir,

@@ -4,7 +4,6 @@ import path from "path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { projectMemoryId } from "../src/shared/project-id.js";
 import type { AgentConfig, StreamRenderer, ToolDefinition } from "../src/shared/core-types.js";
-import { ControlPlaneStore } from "../src/runtime/control-plane/store.js";
 
 const fakeProvider = vi.hoisted(() => ({
   name: "test",
@@ -78,7 +77,7 @@ describe("agentLoop lifecycle", () => {
     expect(updates[0]).toMatchObject({ id: "lifecycle-session", updates: { status: "ended" } });
   });
 
-  it("keeps content in JSONL/draft while SQLite stores only root-run control state", async () => {
+  it("keeps conversation content in JSONL and draft files without a SQLite control plane", async () => {
     fakeProvider.chat.mockImplementation(async function* () {
       yield { type: "text_delta" as const, text: "A complete answer" };
       yield {
@@ -110,19 +109,15 @@ describe("agentLoop lifecycle", () => {
       data: { role: "user", content: "hello" },
     }));
     expect(records.at(-1)).toEqual(expect.objectContaining({ type: "session_closed" }));
-    const control = new ControlPlaneStore(homeDir);
-    const run = control.getRun("answered-session");
-    expect(run).toMatchObject({
-      conversationId: "answered-session",
-      kind: "root",
-      status: "finished",
-      inputTokens: 1,
-      outputTokens: 3,
-      toolCalls: 0,
-    });
-    expect(fs.readFileSync(run!.draftPath!, "utf8")).toContain("A complete answer");
-    expect(control.schemaColumns("agent_runs")).not.toContain("response");
-    control.close();
+    const projectDir = path.join(
+      homeDir,
+      ".rubato",
+      "projects",
+      projectMemoryId(homeDir),
+    );
+    expect(fs.existsSync(path.join(projectDir, "state.sqlite3"))).toBe(false);
+    const draft = path.join(projectDir, "runs", "answered-session", "assistant-draft.md");
+    expect(fs.readFileSync(draft, "utf8")).toContain("A complete answer");
   });
 
   it("lets the root decide whether ordinary exploration needs delegation", async () => {

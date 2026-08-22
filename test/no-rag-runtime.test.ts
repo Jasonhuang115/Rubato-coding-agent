@@ -35,26 +35,28 @@ describe("normal runtime has only agent-managed file memory", () => {
     expect(relativeFiles).not.toContain("src/context/memory-md.ts");
     expect(relativeFiles).not.toContain("src/context/mnemosyne-source.ts");
     expect(relativeFiles).not.toContain("src/context/file-memory.ts");
-    expect(graph.externalSpecifiers.has("better-sqlite3")).toBe(true);
+    expect(graph.externalSpecifiers.has("better-sqlite3")).toBe(false);
   });
 
-  it("loads SQLite only through the control-plane store", () => {
+  it("keeps better-sqlite3 out of the runtime and package", () => {
     const sqliteImports = allTypeScriptFiles(SRC_ROOT)
       .filter((filePath) =>
         /(?:from|import|require)\s*\(?\s*["']better-sqlite3["']/
           .test(fs.readFileSync(filePath, "utf8")))
       .map((filePath) => path.relative(PROJECT_ROOT, filePath))
       .sort();
-    expect(sqliteImports).toEqual(["src/runtime/control-plane/store.ts"]);
+    expect(sqliteImports).toEqual([]);
 
     const packageJson = JSON.parse(
       fs.readFileSync(path.join(PROJECT_ROOT, "package.json"), "utf8"),
     ) as {
       dependencies?: Record<string, string>;
       optionalDependencies?: Record<string, string>;
+      devDependencies?: Record<string, string>;
     };
-    expect(packageJson.dependencies?.["better-sqlite3"]).toBeDefined();
+    expect(packageJson.dependencies?.["better-sqlite3"]).toBeUndefined();
     expect(packageJson.optionalDependencies?.["better-sqlite3"]).toBeUndefined();
+    expect(packageJson.devDependencies?.["better-sqlite3"]).toBeUndefined();
     expect(allTypeScriptFiles(SRC_ROOT).some((filePath) =>
       filePath.includes(`${path.sep}memory-files${path.sep}`)))
       .toBe(false);

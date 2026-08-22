@@ -352,9 +352,19 @@ export interface SubagentRuntimeContext {
   rootSessionId: string;
   taskId: string;
   agentId: string;
+  /** Absolute path of this task's durable report.md. */
+  reportPath?: string;
+  /** When false, the sandbox may Edit only report.md, not workspace files. */
+  writableWorkspace?: boolean;
   onActivity?: (activity: string, toolName?: string) => void;
   onTextDelta?: (text: string) => void;
   onTextFlush?: () => void;
+  takePlanReminder?: () => string | undefined;
+  editReport?: (
+    oldString: string,
+    newString: string,
+    replaceAll?: boolean,
+  ) => { before: string; after: string };
   coverage?: SubagentCoverageTracker;
 }
 

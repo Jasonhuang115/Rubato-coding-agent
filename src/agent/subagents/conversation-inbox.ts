@@ -1,6 +1,5 @@
 import type { TaskResult } from "../../shared/core-types.js";
-import { randomUUID } from "node:crypto";
-import type { ControlPlaneStore } from "../../runtime/control-plane/store.js";
+import type { ArtifactStore } from "./artifact-store.js";
 
 export type SubagentTerminalResult = Pick<
   TaskResult,
@@ -13,7 +12,6 @@ export interface TaskInboxEvent {
   taskIds: string[];
   results: SubagentTerminalResult[];
   createdAt: number;
-  eventIds?: string[];
 }
 
 type Listener = (event: TaskInboxEvent) => void;
@@ -22,16 +20,14 @@ export class ConversationInbox {
   private queue: TaskInboxEvent[] = [];
   private listeners = new Set<Listener>();
   private pendingResults: SubagentTerminalResult[] = [];
-  private pendingEventIds = new Map<string, string>();
   private deliveredTaskIds = new Set<string>();
   private flushScheduled = false;
-  private readonly claimOwner = `inbox-${randomUUID()}`;
 
   constructor(
     private readonly rootSessionId: string,
-    private readonly controlPlane?: ControlPlaneStore,
+    private readonly artifacts?: ArtifactStore,
   ) {
-    if (controlPlane) this.restorePending();
+    if (artifacts) this.restorePending();
   }
 
   deliver(result: TaskResult): boolean {
@@ -48,14 +44,6 @@ export class ConversationInbox {
       reportPath: result.reportPath,
       error: result.error,
     });
-    const eventId = this.controlPlane?.createTerminalEvent(this.rootSessionId, {
-      taskId: result.taskId,
-      status: result.status === "finished" ? "finished" : "failed",
-      failureKind: result.failureKind,
-      reportPath: result.reportPath,
-      claimOwner: this.claimOwner,
-    });
-    if (eventId) this.pendingEventIds.set(result.taskId, eventId);
     if (this.flushScheduled) return true;
     this.flushScheduled = true;
     queueMicrotask(() => this.flush());
@@ -97,8 +85,10 @@ export class ConversationInbox {
   }
 
   private acknowledge(events: TaskInboxEvent[]): void {
-    const ids = events.flatMap((event) => event.eventIds ?? []);
-    this.controlPlane?.markEventsDelivered(ids, this.claimOwner);
+    if (!this.artifacts) return;
+    for (const event of events) {
+      for (const taskId of event.taskIds) this.artifacts.markNotified(taskId);
+    }
   }
 
   private flush(): void {
@@ -109,11 +99,6 @@ export class ConversationInbox {
     if (results.length === 0) return;
     for (const result of results) this.deliveredTaskIds.add(result.taskId);
     const event = this.eventFromResults(results);
-    event.eventIds = results.flatMap((result) => {
-      const eventId = this.pendingEventIds.get(result.taskId);
-      this.pendingEventIds.delete(result.taskId);
-      return eventId ? [eventId] : [];
-    });
     this.queue.push(event);
     for (const listener of this.listeners) listener(event);
   }
@@ -132,22 +117,15 @@ export class ConversationInbox {
   }
 
   private restorePending(): void {
-    const persisted = this.controlPlane?.claimEvents(
-      this.rootSessionId,
-      this.claimOwner,
-    ) ?? [];
-    const terminal = persisted.filter((event) =>
-      event.kind === "subagent_terminal" && event.taskId && event.terminalStatus && event.reportPath);
-    if (terminal.length === 0) return;
-    const results: SubagentTerminalResult[] = terminal.map((event) => ({
-      taskId: event.taskId!,
-      status: event.terminalStatus!,
-      reportPath: event.reportPath!,
+    const pending = this.artifacts?.listUnnotifiedResults(this.rootSessionId) ?? [];
+    if (pending.length === 0) return;
+    const results: SubagentTerminalResult[] = pending.map((result) => ({
+      taskId: result.taskId,
+      status: result.status,
+      reportPath: result.reportPath,
+      error: result.error,
     }));
     for (const result of results) this.deliveredTaskIds.add(result.taskId);
-    this.queue.push({
-      ...this.eventFromResults(results, Math.min(...terminal.map((event) => event.createdAt))),
-      eventIds: terminal.map((event) => event.eventId),
-    });
+    this.queue.push(this.eventFromResults(results));
   }
 }

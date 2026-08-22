@@ -3,7 +3,7 @@
 
 import { PolicyEngine } from "./policy/engine.js";
 import type { AgentConfig } from "../shared/core-types.js";
-import type { SecurityDecision, RiskLevel } from "./sandbox/sandbox.js";
+import type { SecurityDecision, RiskLevel, SandboxScope } from "./sandbox/sandbox.js";
 import type { SandboxResult } from "./sandbox/sandbox.js";
 import { CompositeSandbox } from "./sandbox/composite.js";
 import { FsSandbox } from "./sandbox/fs-sandbox.js";
@@ -13,7 +13,7 @@ import { GitSandbox } from "./sandbox/git-sandbox.js";
 import { EnvSandbox } from "./sandbox/env-sandbox.js";
 
 export { EnvSandbox } from "./sandbox/env-sandbox.js";
-export type { SecurityDecision, SecurityVerdict, RiskLevel, SandboxResult } from "./sandbox/sandbox.js";
+export type { SecurityDecision, SecurityVerdict, RiskLevel, SandboxResult, SandboxScope } from "./sandbox/sandbox.js";
 export type { ISandbox } from "./sandbox/sandbox.js";
 
 /**
@@ -41,7 +41,12 @@ export class SecurityRuntime {
    * Full security check: policy evaluation + sandbox validation.
    * Returns a SecurityDecision that tells the caller what to do.
    */
-  evaluate(toolName: string, input: Record<string, unknown>, workingDir: string): SecurityDecision {
+  evaluate(
+    toolName: string,
+    input: Record<string, unknown>,
+    workingDir: string,
+    scope?: SandboxScope,
+  ): SecurityDecision {
     // 1. Policy check (is this allowed?)
     const policyResult = this.policyEngine.check(toolName, input);
 
@@ -64,7 +69,7 @@ export class SecurityRuntime {
         };
       }
 
-      const sandboxResult = this.sandbox.validate(toolName, input, workingDir);
+      const sandboxResult = this.sandbox.validate(toolName, input, workingDir, scope);
       if (!sandboxResult.allowed) {
         const sandboxReason = sandboxResult.reason ?? "Blocked by sandbox";
         return {
@@ -98,7 +103,7 @@ export class SecurityRuntime {
     }
 
     // 2. Sandbox validation (how to safely execute?)
-    const sandboxResult = this.sandbox.validate(toolName, input, workingDir);
+    const sandboxResult = this.sandbox.validate(toolName, input, workingDir, scope);
 
     if (!sandboxResult.allowed) {
       const sandboxReason = sandboxResult.reason ?? "Blocked by sandbox";
@@ -155,8 +160,13 @@ export class SecurityRuntime {
   /**
    * Quick sandbox-only validation (skip policy, for tools already approved by policy).
    */
-  validateSandbox(toolName: string, input: Record<string, unknown>, workingDir: string): SandboxResult {
-    return this.sandbox.validate(toolName, input, workingDir);
+  validateSandbox(
+    toolName: string,
+    input: Record<string, unknown>,
+    workingDir: string,
+    scope?: SandboxScope,
+  ): SandboxResult {
+    return this.sandbox.validate(toolName, input, workingDir, scope);
   }
 
   /**
@@ -197,6 +207,9 @@ export class SecurityRuntime {
 
   /** Build a helpful suggestion based on the tool and the denial reason. */
   private buildSuggestion(toolName: string, reason: string): string {
+    if (reason.includes("Read-only subagent") || reason.includes("current task report")) {
+      return "Edit only the current task's report.md. Workspace files are not writable for this agent.";
+    }
     if (reason.includes("outside workspace") || reason.includes("path traversal")) {
       return "Use workspace-relative paths. The tool can only access files within the project directory.";
     }

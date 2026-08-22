@@ -251,6 +251,8 @@ describe("fully asynchronous Subagent runtime", () => {
       endedAt: now,
     });
     expect(fs.readFileSync(task.artifacts.report, "utf8")).toContain("progress survives");
+    expect(fs.readFileSync(task.artifacts.report, "utf8")).toContain("## Plan");
+    expect(fs.readFileSync(task.artifacts.report, "utf8")).toContain("## Report");
   });
 
   it("streams only visible text deltas to the report callback", async () => {

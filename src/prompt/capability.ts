@@ -42,9 +42,9 @@ function toolUsagePolicy(): string {
 - Subagent always dispatches a fresh-context background task and returns immediately. Only the root Agent may call it.
 - Delegate only independent, substantial scopes. Retain a meaningful non-overlapping root scope and continue working after dispatch.
 - Always pass a generous positive \`timeout_ms\`. It is a safety ceiling against a permanently stuck task, not a work budget or target duration.
-- Each task has a unique absolute \`report.md\` path and writes visible findings there progressively. There is no final-message handoff.
+- Each task has a unique absolute \`report.md\` path. Visible findings append to \`## Report\`; the task's living checklist is \`## Plan\`.
 - Each root model call receives a fresh snapshot of all task states: \`queued\`, \`running\`, \`finished\`, or \`failed\`. Terminal changes automatically wake a later serial root run.
-- Never wait, watch, join, acknowledge, or poll a Subagent. When a report is relevant, Grep its exposed path first and Read only the matching ranges.
+- Never wait, watch, join, acknowledge, or poll a Subagent. When a report is relevant, Grep \`## Report\` for conclusions, wrap-up, and evidence. Do not treat \`## Plan\` as the deliverable, and do not Read the Plan merely to watch progress. Task completion is the snapshot status and the terminal notification.
 - For exhaustive tasks pass \`coverage="exhaustive"\`; do not claim completeness unless its coverage artifact has \`gate_satisfied=true\`.
 - Read-only types are Explore, Research, General, and Verify. Worker is worktree-isolated and requires a non-overlapping \`scope\`; inspect its report and diff before integration.
 - Subagents cannot dispatch Subagents. The root Agent owns coordination, synthesis, integration, and final verification.`;

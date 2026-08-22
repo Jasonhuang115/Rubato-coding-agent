@@ -4,7 +4,7 @@ import fs from "fs";
 import path from "path";
 import type { ToolDefinition } from "../shared/core-types.js";
 import { enforceReadGuard } from "./registry.js";
-import { resolveToolPath } from "./path-utils.js";
+import { resolveToolPath, isSameToolPath } from "./path-utils.js";
 
 export const writeTool: ToolDefinition = {
   name: "Write",
@@ -32,6 +32,15 @@ export const writeTool: ToolDefinition = {
   async handler(input, ctx) {
     const filePath = resolveToolPath(input.file_path as string, ctx.workingDir);
     const content = input.content as string;
+
+    if (ctx.taskRuntime?.reportPath && isSameToolPath(filePath, ctx.taskRuntime.reportPath)) {
+      return {
+        content:
+          "Do not overwrite report.md. Edit the Plan section in place, " +
+          "and let visible assistant text append to ## Report.",
+        isError: true,
+      };
+    }
 
     // ReadGuard check for existing files
     if (fs.existsSync(filePath)) {

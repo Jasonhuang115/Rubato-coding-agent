@@ -3,7 +3,6 @@ import path from "path";
 import { createHash, randomUUID } from "crypto";
 import { ArtifactStore } from "./artifact-store.js";
 import { isPrivateReasoningKey, isSecretKey, redactText } from "./redaction.js";
-import type { ControlPlaneStore } from "../../runtime/control-plane/store.js";
 import { OpikTraceSink, type OpikEvent } from "./opik-trace-sink.js";
 const LARGE_OUTPUT = 30_000;
 
@@ -26,13 +25,12 @@ export class TraceSink {
 
   constructor(
     private readonly artifacts: ArtifactStore,
-    private readonly controlPlane?: ControlPlaneStore,
     private readonly context: { conversationId?: string; runId?: string } = {},
   ) {
     const previous = this.readExistingState();
     this.traceId = previous?.traceId ?? randomUUID();
     this.sequence = previous?.sequence ?? 0;
-    this.opik = OpikTraceSink.fromEnvironment(controlPlane);
+    this.opik = OpikTraceSink.fromEnvironment((sequences) => this.persistOpikSequences(sequences));
   }
 
   get path(): string {
@@ -76,19 +74,23 @@ export class TraceSink {
   }
 
   async replayUnexported(conversationId: string): Promise<void> {
-    if (!this.opik || !this.controlPlane) return;
-    for (const candidate of this.controlPlane.listTraceExports(conversationId)) {
-      if (!fs.existsSync(candidate.tracePath)) continue;
-      const lines = fs.readFileSync(candidate.tracePath, "utf8").split("\n");
+    if (!this.opik) return;
+    for (const tracePath of this.artifacts.listTraceFiles()) {
+      const exported = readOpikExported(tracePath);
+      if (!fs.existsSync(tracePath)) continue;
+      const lines = fs.readFileSync(tracePath, "utf8").split("\n");
       for (const line of lines) {
         if (!line.trim()) continue;
         try {
           const event = JSON.parse(line) as OpikEvent;
           const runId = typeof event.runId === "string" ? event.runId : event.sessionId;
+          const belongs =
+            event.conversationId === conversationId ||
+            event.sessionId === conversationId;
           if (
-            runId === candidate.runId &&
+            belongs &&
             typeof event.sequence === "number" &&
-            event.sequence > candidate.exportedSequence
+            event.sequence > (exported[runId] ?? 0)
           ) {
             this.opik.append(event);
           }
@@ -98,6 +100,14 @@ export class TraceSink {
       }
     }
     await this.opik.flush();
+  }
+
+  private persistOpikSequences(sequences: Map<string, number>): void {
+    const current = readOpikExported(this.artifacts.tracePath);
+    for (const [runId, sequence] of sequences) {
+      current[runId] = Math.max(current[runId] ?? 0, sequence);
+    }
+    writeOpikExported(this.artifacts.tracePath, current);
   }
 
   private sanitize(value: unknown, taskId?: string, key = ""): unknown {
@@ -181,4 +191,30 @@ export class TraceSink {
     }
     return latest;
   }
+}
+
+function opikExportPath(tracePath: string): string {
+  return path.join(path.dirname(tracePath), "opik-exported-seq.json");
+}
+
+function readOpikExported(tracePath: string): Record<string, number> {
+  const filePath = opikExportPath(tracePath);
+  if (!fs.existsSync(filePath)) return {};
+  try {
+    const parsed = JSON.parse(fs.readFileSync(filePath, "utf8")) as Record<string, unknown>;
+    const result: Record<string, number> = {};
+    for (const [runId, value] of Object.entries(parsed)) {
+      if (typeof value === "number" && Number.isFinite(value)) result[runId] = value;
+    }
+    return result;
+  } catch {
+    return {};
+  }
+}
+
+function writeOpikExported(tracePath: string, sequences: Record<string, number>): void {
+  const filePath = opikExportPath(tracePath);
+  const temp = `${filePath}.${randomUUID().slice(0, 8)}.tmp`;
+  fs.writeFileSync(temp, `${JSON.stringify(sequences, null, 2)}\n`, "utf8");
+  fs.renameSync(temp, filePath);
 }

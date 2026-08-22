@@ -4,18 +4,24 @@
 import * as path from "path";
 import * as fs from "fs";
 import * as os from "os";
-import type { ISandbox, SandboxResult } from "./sandbox.js";
+import type { ISandbox, SandboxResult, SandboxScope } from "./sandbox.js";
 import { matchSensitivePath } from "./sensitive-paths.js";
 import { projectMemoryId } from "../../shared/project-id.js";
 import { getRubatoHome } from "../../shared/rubato-home.js";
 
 const TOOL_RESULT_PATTERN = /^[A-Za-z0-9_-]+\.txt$/;
 const NATIVE_READ_TOOLS = new Set(["Read", "Grep", "Glob"]);
+const NATIVE_WRITE_TOOLS = new Set(["Write", "Edit"]);
 
 export class FsSandbox implements ISandbox {
   readonly name = "fs-sandbox";
 
-  validate(toolName: string, input: Record<string, unknown>, workingDir: string): SandboxResult {
+  validate(
+    toolName: string,
+    input: Record<string, unknown>,
+    workingDir: string,
+    scope?: SandboxScope,
+  ): SandboxResult {
     const pathKey = toolName === "Grep" || toolName === "Glob" ? "path" : "file_path";
     const filePath = input[pathKey] as string | undefined;
     if (!filePath) return { allowed: true };
@@ -29,7 +35,35 @@ export class FsSandbox implements ISandbox {
       // A not-yet-created workspace falls back to its lexical path.
     }
 
-    // 0. Allow reads of current-project Rubato artifacts, but no arbitrary
+    // 0. Allow Write/Edit of the current task's report.md, symmetric to
+    // curated artifact reads. Never task.json, other tasks, or memory.
+    if (NATIVE_WRITE_TOOLS.has(toolName) && scope?.reportWritePath) {
+      const reportPath = resolveReportWrite(resolved, scope.reportWritePath);
+      if (reportPath) {
+        const sensitive = matchSensitivePath(reportPath);
+        if (sensitive) {
+          return {
+            allowed: false,
+            reason: `Sensitive path blocked: "${filePath}" contains ${sensitive.label}`,
+          };
+        }
+        return {
+          allowed: true,
+          sanitizedInput: { ...input, [pathKey]: reportPath },
+        };
+      }
+    }
+
+    if (NATIVE_WRITE_TOOLS.has(toolName) && scope?.workspaceWrites === false) {
+      return {
+        allowed: false,
+        reason:
+          `Read-only subagent can only Edit the current task report.md. ` +
+          `Refused: "${filePath}".`,
+      };
+    }
+
+    // 1. Allow reads of current-project Rubato artifacts, but no arbitrary
     // RUBATO_HOME or /tmp access. BashRead/BashWrite intentionally do not
     // qualify: only native Read/Grep/Glob may use the curated read surface.
     if (NATIVE_READ_TOOLS.has(toolName)) {
@@ -114,6 +148,16 @@ export class FsSandbox implements ISandbox {
     if (path.isAbsolute(filePath)) return path.resolve(filePath);
     return path.resolve(workingDir, filePath);
   }
+}
+
+function resolveReportWrite(
+  resolved: string,
+  reportWritePath: string,
+): string | undefined {
+  const allowed = path.resolve(reportWritePath);
+  if (path.resolve(resolved) !== allowed) return undefined;
+  const taskDir = path.dirname(allowed);
+  return safeRealPathWithin(resolved, taskDir);
 }
 
 function resolveRubatoArtifactRead(

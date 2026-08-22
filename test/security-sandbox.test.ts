@@ -229,6 +229,31 @@ describe("FsSandbox path traversal", () => {
       check("/tmp/test-rubato-home/projects/another-project/runs/session/trace.jsonl").allowed,
     ).toBe(false);
     expect(sandbox.validate("Write", { file_path: report }, WS).allowed).toBe(false);
+    expect(sandbox.validate("Edit", { file_path: report }, WS).allowed).toBe(false);
+    if (previous === undefined) delete process.env.RUBATO_HOME;
+    else process.env.RUBATO_HOME = previous;
+  });
+
+  it("allows Edit of the current task report.md and blocks other Rubato writes", () => {
+    const previous = process.env.RUBATO_HOME;
+    process.env.RUBATO_HOME = "/tmp/test-rubato-home";
+    const projectHash = createHash("sha256")
+      .update(path.resolve(WS))
+      .digest("hex");
+    const report = `/tmp/test-rubato-home/projects/${projectHash}/runs/session/tasks/task-1/report.md`;
+    const other = `/tmp/test-rubato-home/projects/${projectHash}/runs/session/tasks/task-2/report.md`;
+    const spec = `/tmp/test-rubato-home/projects/${projectHash}/runs/session/tasks/task-1/task.json`;
+    const scope = { reportWritePath: report, workspaceWrites: false };
+    expect(sandbox.validate("Edit", { file_path: report }, WS, scope).allowed).toBe(true);
+    expect(sandbox.validate("Edit", { file_path: other }, WS, scope).allowed).toBe(false);
+    expect(sandbox.validate("Edit", { file_path: spec }, WS, scope).allowed).toBe(false);
+    expect(sandbox.validate("Edit", { file_path: `${WS}/src/file.ts` }, WS, scope).allowed).toBe(false);
+    expect(
+      sandbox.validate("Edit", { file_path: `${WS}/src/file.ts` }, WS, {
+        reportWritePath: report,
+        workspaceWrites: true,
+      }).allowed,
+    ).toBe(true);
     if (previous === undefined) delete process.env.RUBATO_HOME;
     else process.env.RUBATO_HOME = previous;
   });

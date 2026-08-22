@@ -41,15 +41,19 @@ describe("persistent Subagent recovery", () => {
     }, context(root), GENERAL_DEF, []);
     await vi.waitFor(() => expect(first.get(submitted.task.taskId)?.status).toBe("running"));
     first.pauseAll();
-    await vi.waitFor(() => expect(first.controlPlane.getTask(submitted.task.taskId)?.status).toBe("queued"));
-    const before = first.controlPlane.getTask(submitted.task.taskId)!;
-    expect(before.accumulatedRuntimeMs).toBeGreaterThanOrEqual(0);
-    expect(fs.readFileSync(before.reportPath, "utf8")).toContain("first attempt evidence");
+    await vi.waitFor(() => expect(first.get(submitted.task.taskId)?.status).toBe("queued"));
+    const before = first.get(submitted.task.taskId)!;
+    const beforeSpec = JSON.parse(fs.readFileSync(before.artifacts.task, "utf8")) as {
+      accumulatedRuntimeMs?: number;
+      attempt?: number;
+    };
+    expect(beforeSpec.accumulatedRuntimeMs).toBeGreaterThanOrEqual(0);
+    expect(fs.readFileSync(before.artifacts.report, "utf8")).toContain("first attempt evidence");
 
     const second = new SubagentRuntime("conversation-1", root, config(), {
       run: async (input) => {
         expect(input.prompt).toContain("Recovery instructions");
-        expect(input.prompt).toContain(before.reportPath);
+        expect(input.prompt).toContain(before.artifacts.report);
         input.appendReport("second attempt completed");
         return {
           status: "finished",
@@ -60,9 +64,12 @@ describe("persistent Subagent recovery", () => {
     }, "root-run-2");
     await second.resumePersistedTasks();
     await vi.waitFor(() => expect(second.get(submitted.task.taskId)?.status).toBe("finished"));
-    const after = second.controlPlane.getTask(submitted.task.taskId)!;
-    expect(after.attempt).toBe(2);
-    expect(fs.readFileSync(after.reportPath, "utf8")).toContain("second attempt completed");
+    const after = second.get(submitted.task.taskId)!;
+    const afterSpec = JSON.parse(fs.readFileSync(after.artifacts.task, "utf8")) as {
+      attempt?: number;
+    };
+    expect(afterSpec.attempt).toBe(2);
+    expect(fs.readFileSync(after.artifacts.report, "utf8")).toContain("second attempt completed");
   });
 });
 

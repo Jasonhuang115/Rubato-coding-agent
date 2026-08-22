@@ -41,7 +41,7 @@ describe("PromptAssembler", () => {
     expect(prompt).toContain("returns immediately");
     expect(prompt).toContain("not a work budget");
     expect(prompt).toContain("Never wait, watch, join, acknowledge, or poll");
-    expect(prompt).toContain("Grep its exposed path first");
+    expect(prompt).toContain("Grep `## Report`");
     expect(prompt).toContain("Subagents cannot dispatch Subagents");
   });
 
@@ -55,7 +55,8 @@ describe("PromptAssembler", () => {
       contextProfile: "subagent",
     });
     expect(result.systemPrompt).toContain("dedicated architecture verifier");
-    expect(result.systemPrompt).toContain("appended to report.md while you work");
+    expect(result.systemPrompt).toContain("appended only to ## Report");
+    expect(result.systemPrompt).toContain("report.md is durable");
     expect(result.systemPrompt).toContain("End naturally");
     expect(result.systemPrompt).not.toContain("You are Rubato (rubato)");
   });

@@ -95,7 +95,8 @@ export class ToolRuntime {
       const allowed = new Set([
         "Read", "Grep", "Glob", "WebFetch", "WebSearch", "Memory", "Subagent", "Task", "SubmitPlan",
       ]);
-      if (!allowed.has(toolName)) {
+      const reportEdit = Boolean(ctx.taskRuntime) && toolName === "Edit";
+      if (!allowed.has(toolName) && !reportEdit) {
         return {
           content: `Plan mode blocked tool "${toolName}". Only read-only exploration and SubmitPlan are allowed.`,
           isError: true,
@@ -125,7 +126,10 @@ export class ToolRuntime {
     }
 
     // 1. Security evaluation (PolicyEngine + CompositeSandbox)
-    const decision = this.securityRuntime.evaluate(toolName, input, this.workingDir);
+    const decision = this.securityRuntime.evaluate(toolName, input, this.workingDir, {
+      reportWritePath: ctx.taskRuntime?.reportPath,
+      workspaceWrites: ctx.taskRuntime ? ctx.taskRuntime.writableWorkspace === true : undefined,
+    });
     const executableInput = decision.sanitizedInput ?? input;
 
     // 2. Handle verdicts

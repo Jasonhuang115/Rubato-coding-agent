@@ -1,7 +1,6 @@
 import { createHash } from "node:crypto";
 import { Opik, type Span, type Trace } from "opik";
 import { warnRecoverable } from "../../shared/diagnostics.js";
-import type { ControlPlaneStore } from "../../runtime/control-plane/store.js";
 import { isPrivateReasoningKey } from "./redaction.js";
 
 const REMOTE_TEXT_LIMIT = 8_000;
@@ -32,10 +31,12 @@ export class OpikTraceSink {
 
   constructor(
     private readonly client: OpikClientLike,
-    private readonly controlPlane?: ControlPlaneStore,
+    private readonly persistSequences?: (sequences: Map<string, number>) => void,
   ) {}
 
-  static fromEnvironment(controlPlane?: ControlPlaneStore): OpikTraceSink | undefined {
+  static fromEnvironment(
+    persistSequences?: (sequences: Map<string, number>) => void,
+  ): OpikTraceSink | undefined {
     if (!/^(1|true|yes|on)$/i.test(process.env.OPIK_ENABLED ?? "")) return undefined;
     try {
       const client = new Opik({
@@ -45,7 +46,7 @@ export class OpikTraceSink {
         projectName: process.env.OPIK_PROJECT_NAME ?? "rubato",
         batchDelayMs: 300,
       });
-      return new OpikTraceSink(client, controlPlane);
+      return new OpikTraceSink(client, persistSequences);
     } catch (error) {
       warnRecoverable("opik:initialize", error);
       return undefined;
@@ -112,8 +113,8 @@ export class OpikTraceSink {
   async flush(timeoutMs = 2_000): Promise<void> {
     try {
       await withTimeout(this.client.flush({ silent: true }), timeoutMs);
-      for (const [runId, sequence] of this.maxSequenceByRun) {
-        this.controlPlane?.setOpikExportedSequence(runId, sequence);
+      if (this.maxSequenceByRun.size > 0) {
+        this.persistSequences?.(new Map(this.maxSequenceByRun));
       }
     } catch (error) {
       warnRecoverable("opik:flush", error);

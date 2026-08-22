@@ -21,9 +21,7 @@ import { coverageSummary, emptyCoverageManifest } from "./coverage.js";
 import { TaskRunner, type TaskRunnerOutput } from "./task-runner.js";
 import { TaskScheduler } from "./task-scheduler.js";
 import { TraceSink } from "./trace-sink.js";
-import { ControlPlaneStore } from "../../runtime/control-plane/store.js";
 import fs from "node:fs";
-import path from "node:path";
 import { findDefinition } from "../agent-defs.js";
 import { getBuiltinDefinition, resolveSubagentTools } from "../subagent.js";
 
@@ -61,8 +59,6 @@ export class SubagentRuntime implements TaskService {
   readonly trace: TraceSink;
   readonly inbox: ConversationInbox;
   readonly limits: SubagentLimits;
-  readonly controlPlane: ControlPlaneStore;
-  readonly workerId = `worker-${randomUUID()}`;
 
   private readonly scheduler: TaskScheduler;
   private readonly runner: Pick<TaskRunner, "run">;
@@ -84,19 +80,15 @@ export class SubagentRuntime implements TaskService {
     readonly config: AgentConfig,
     runner: Pick<TaskRunner, "run"> = new TaskRunner(),
     readonly originRunId: string = rootSessionId,
-    controlPlane?: ControlPlaneStore,
   ) {
     this.runner = runner;
     this.limits = { ...DEFAULT_SUBAGENT_LIMITS, ...config.subagents };
     this.artifacts = new ArtifactStore(workingDir, originRunId);
-    this.controlPlane = controlPlane ?? new ControlPlaneStore(workingDir);
-    this.controlPlane.importLegacyArtifacts();
-    this.controlPlane.reconcileArtifacts(rootSessionId);
-    this.trace = new TraceSink(this.artifacts, this.controlPlane, {
+    this.trace = new TraceSink(this.artifacts, {
       conversationId: rootSessionId,
       runId: originRunId,
     });
-    this.inbox = new ConversationInbox(rootSessionId, this.controlPlane);
+    this.inbox = new ConversationInbox(rootSessionId, this.artifacts);
     this.scheduler = new TaskScheduler(this.limits.maxConcurrent);
     this.trace.append({ type: "subagent_runtime_created", sessionId: rootSessionId });
     const worktrees = WorktreeManager.tryCreate(workingDir, config);
@@ -111,7 +103,6 @@ export class SubagentRuntime implements TaskService {
         });
       }
     }
-    this.controlPlane.recoverExpiredTasks(rootSessionId);
     this.pruneArtifacts();
   }
 
@@ -158,11 +149,6 @@ export class SubagentRuntime implements TaskService {
       coverage: input.coverage,
       isolation: input.isolation,
     });
-    this.controlPlane.upsertTask(record.detail, {
-      conversationId: this.rootSessionId,
-      originRunId: this.originRunId,
-      timeoutMs: input.timeout_ms,
-    });
     this.trace.append({
       type: "task_queued",
       sessionId: this.rootSessionId,
@@ -183,27 +169,12 @@ export class SubagentRuntime implements TaskService {
     if (this.persistedTasksLoaded) return;
     this.persistedTasksLoaded = true;
     await this.trace.replayUnexported(this.rootSessionId);
-    const persisted = this.controlPlane.listTasks(this.rootSessionId);
+    const persisted = this.artifacts.listConversationTasks(this.rootSessionId);
     this.createdTaskCount = Math.max(this.createdTaskCount, persisted.length);
-    for (const control of persisted) {
-      if (this.tasks.has(control.taskId) || !fs.existsSync(control.specPath)) continue;
+    for (const saved of persisted) {
+      if (this.tasks.has(saved.spec.taskId) || !fs.existsSync(saved.paths.task)) continue;
       try {
-        const spec = JSON.parse(fs.readFileSync(control.specPath, "utf8")) as {
-          taskId: string;
-          agentId: string;
-          rootSessionId?: string;
-          description: string;
-          prompt: string;
-          subagentType: string;
-          scope?: string[];
-          workspace?: TaskDetail["workspace"];
-          createdAt: number;
-          timeoutMs?: number;
-          model?: string;
-          mode?: AgentTaskInput["mode"];
-          coverage?: AgentTaskInput["coverage"];
-          isolation?: AgentTaskInput["isolation"];
-        };
+        const spec = saved.spec;
         let definition: SubagentDefinition;
         try {
           definition = getBuiltinDefinition(spec.subagentType);
@@ -212,21 +183,9 @@ export class SubagentRuntime implements TaskService {
           if (!custom) throw new Error(`Subagent definition no longer exists: ${spec.subagentType}`);
           definition = custom;
         }
-        const artifacts = {
-          taskDir: path.dirname(control.specPath),
-          task: control.specPath,
-          report: control.reportPath,
-          result: control.resultPath,
-          coverage: control.coveragePath,
-          transcript: path.join(path.dirname(control.specPath), "transcript.jsonl"),
-          patch: path.join(path.dirname(control.specPath), "changes.patch"),
-        };
-        let result: TaskResult | undefined;
-        if (isTerminal(control.status) && fs.existsSync(control.resultPath)) {
-          result = JSON.parse(fs.readFileSync(control.resultPath, "utf8")) as TaskResult;
-        }
+        const terminal = Boolean(saved.result);
         const detail: TaskDetail = {
-          taskId: control.taskId,
+          taskId: spec.taskId,
           agentId: spec.agentId,
           rootSessionId: this.rootSessionId,
           description: spec.description,
@@ -234,17 +193,19 @@ export class SubagentRuntime implements TaskService {
           subagentType: spec.subagentType,
           scope: spec.scope,
           workspace: spec.workspace,
-          status: control.status,
+          status: terminal
+            ? (saved.result?.status === "finished" ? "finished" : "failed")
+            : "queued",
           createdAt: spec.createdAt,
-          startedAt: control.startedAt,
-          endedAt: control.endedAt,
-          lastActivityAt: control.updatedAt,
-          currentActivity: control.currentActivity,
-          currentTool: control.currentTool,
-          failureKind: control.failureKind,
-          pinned: control.pinned,
-          artifacts,
-          result,
+          startedAt: spec.startedAt,
+          endedAt: spec.endedAt ?? saved.result?.endedAt,
+          lastActivityAt: spec.endedAt ?? spec.startedAt ?? spec.createdAt,
+          currentActivity: terminal ? saved.result?.status : spec.currentActivity,
+          currentTool: spec.currentTool,
+          failureKind: saved.result?.failureKind ?? spec.failureKind,
+          pinned: saved.pinned,
+          artifacts: saved.paths,
+          result: saved.result,
         };
         const writer = definition.isolation === "worktree" &&
           definition.tools.some((name) => ["Write", "Edit", "Bash", "*"].includes(name));
@@ -252,18 +213,18 @@ export class SubagentRuntime implements TaskService {
           detail,
           controller: new AbortController(),
           writer,
-          terminalDelivered: isTerminal(control.status),
-          timeoutMs: control.timeoutMs,
-          accumulatedRuntimeMs: control.accumulatedRuntimeMs,
-          attempt: control.attempt,
+          terminalDelivered: terminal,
+          timeoutMs: Math.max(1, spec.timeoutMs ?? 1),
+          accumulatedRuntimeMs: spec.accumulatedRuntimeMs ?? 0,
+          attempt: spec.attempt ?? 0,
           pauseRequested: false,
         };
-        this.tasks.set(control.taskId, record);
-        if (control.status === "queued") {
-          if (control.attempt > 0) {
+        this.tasks.set(spec.taskId, record);
+        if (!terminal) {
+          if ((spec.attempt ?? 0) > 0) {
             this.artifacts.appendReportAt(
-              control.reportPath,
-              `\n\n<!-- Rubato recovery attempt ${control.attempt + 1} starting. -->\n\n`,
+              saved.paths.report,
+              `\n\n<!-- Rubato recovery attempt ${(spec.attempt ?? 0) + 1} starting. -->\n\n`,
             );
           }
           const input: AgentTaskInput = {
@@ -271,27 +232,21 @@ export class SubagentRuntime implements TaskService {
             prompt: spec.prompt,
             subagent_type: spec.subagentType,
             model: spec.model,
-            timeout_ms: spec.timeoutMs ?? control.timeoutMs,
-            mode: spec.mode,
-            coverage: spec.coverage,
-            isolation: spec.isolation,
+            timeout_ms: spec.timeoutMs ?? record.timeoutMs,
+            mode: spec.mode as AgentTaskInput["mode"],
+            coverage: spec.coverage as AgentTaskInput["coverage"],
+            isolation: spec.isolation as AgentTaskInput["isolation"],
             scope: spec.scope,
           };
           const tools = resolveSubagentTools(definition, definition.isolation === "worktree");
           this.scheduler.enqueue({
-            taskId: control.taskId,
+            taskId: spec.taskId,
             run: () => this.runRecord(record, input, definition, tools),
           });
         }
       } catch (error) {
-        this.controlPlane.updateTaskControl(control.taskId, {
-          status: "failed",
-          failureKind: "runtime_error",
-          endedAt: Date.now(),
-          currentActivity: "failed",
-        });
         this.artifacts.appendReportAt(
-          control.reportPath,
+          saved.paths.report,
           `\n\n<!-- Rubato could not recover this task: ${String(error).replace(/-->/g, "--&gt;")} -->\n`,
         );
       }
@@ -312,27 +267,26 @@ export class SubagentRuntime implements TaskService {
     reportPath: string;
     failureKind?: SubagentFailureKind;
   }> {
-    const liveDescriptions = new Map(
-      [...this.tasks.values()].map((record) => [record.detail.taskId, record.detail.description]),
-    );
-    return this.controlPlane.listTasks(this.rootSessionId).map((task) => {
-      let description = liveDescriptions.get(task.taskId);
-      if (!description) {
-        try {
-          const spec = JSON.parse(fs.readFileSync(task.specPath, "utf8")) as { description?: unknown };
-          if (typeof spec.description === "string") description = spec.description;
-        } catch {
-          // The control snapshot remains useful when the content artifact is unavailable.
-        }
-      }
-      return {
-        taskId: task.taskId,
-        description: description ?? "(description artifact unavailable)",
-        status: task.status,
-        reportPath: task.reportPath,
-        failureKind: task.failureKind,
-      };
-    });
+    const live = [...this.tasks.values()].map((record) => ({
+      taskId: record.detail.taskId,
+      description: record.detail.description,
+      status: record.detail.status,
+      reportPath: record.detail.artifacts.report,
+      failureKind: record.detail.failureKind,
+    }));
+    const seen = new Set(live.map((task) => task.taskId));
+    const fromFiles = this.artifacts.listConversationTasks(this.rootSessionId)
+      .filter((record) => !seen.has(record.spec.taskId))
+      .map((record) => ({
+        taskId: record.spec.taskId,
+        description: record.spec.description,
+        status: record.result
+          ? (record.result.status === "finished" ? "finished" as const : "failed" as const)
+          : (record.spec.status && isTerminal(record.spec.status) ? record.spec.status : "queued" as const),
+        reportPath: record.paths.report,
+        failureKind: record.result?.failureKind ?? record.spec.failureKind,
+      }));
+    return [...live, ...fromFiles].sort((left, right) => left.taskId.localeCompare(right.taskId));
   }
 
   get(taskId: string): TaskDetail | undefined {
@@ -370,7 +324,6 @@ export class SubagentRuntime implements TaskService {
       }
     }
     this.artifacts.removeTask(taskId);
-    this.controlPlane.deleteTask(taskId);
     this.tasks.delete(taskId);
   }
 
@@ -380,7 +333,7 @@ export class SubagentRuntime implements TaskService {
     this.artifacts.setPinned(taskId, pinned);
     if (record) {
       record.detail.pinned = pinned;
-      this.controlPlane.updateTaskControl(taskId, { pinned });
+      this.persistRecord(record);
       this.emit(record);
     }
   }
@@ -401,7 +354,6 @@ export class SubagentRuntime implements TaskService {
       protectedTaskIds,
     });
     for (const taskId of result.removed) this.tasks.delete(taskId);
-    for (const taskId of result.removed) this.controlPlane.deleteTask(taskId);
     return result;
   }
 
@@ -420,11 +372,7 @@ export class SubagentRuntime implements TaskService {
       record.pauseRequested = true;
       if (record.detail.status === "queued" && this.scheduler.cancelQueued(record.detail.taskId)) {
         record.detail.currentActivity = "paused";
-        this.controlPlane.updateTaskControl(record.detail.taskId, {
-          status: "queued",
-          currentActivity: "paused",
-          currentTool: null,
-        });
+        this.persistRecord(record);
         this.emit(record);
       } else {
         record.controller.abort(new Error("Runtime stopped"));
@@ -501,9 +449,6 @@ export class SubagentRuntime implements TaskService {
       this.finishWithoutRun(record, "timed_out", "Subagent safety timeout was exhausted.");
       return;
     }
-    if (!this.controlPlane.claimTask(record.detail.taskId, this.workerId, attemptStartedAt)) {
-      return;
-    }
     record.attempt++;
     record.detail.startedAt ??= attemptStartedAt;
     record.currentAttemptRunId = `${record.detail.taskId}-attempt-${record.attempt}-${randomUUID().slice(0, 8)}`;
@@ -511,17 +456,6 @@ export class SubagentRuntime implements TaskService {
     record.effectiveModel = input.model && input.model !== "inherit"
       ? input.model
       : this.config.model.model;
-    this.controlPlane.createRun({
-      runId: record.currentAttemptRunId,
-      conversationId: this.rootSessionId,
-      kind: "subagent",
-      taskId: record.detail.taskId,
-      attempt: record.attempt,
-      trigger: record.attempt === 1 ? "user_message" : "resume",
-      provider: record.effectiveProvider,
-      model: record.effectiveModel,
-      tracePath: this.trace.path,
-    }, attemptStartedAt);
     this.transition(record, "running", "starting");
     let flushReport = () => {};
     const timer = setTimeout(() => {
@@ -530,28 +464,16 @@ export class SubagentRuntime implements TaskService {
       record.controller.abort(new Error("Subagent safety timeout reached"));
     }, remainingTimeoutMs);
     timer.unref?.();
-    const heartbeat = setInterval(() => {
-      const elapsed = Date.now() - attemptStartedAt;
-      this.controlPlane.heartbeatTask(
-        record.detail.taskId,
-        this.workerId,
-        record.accumulatedRuntimeMs + elapsed,
-      );
-    }, 5_000);
-    heartbeat.unref?.();
 
     let output: TaskRunnerOutput | undefined;
     let workspaceResult: WorkspaceResult | undefined;
     let manager: WorktreeManager | undefined;
     let taskWorkingDir = this.workingDir;
+    const reportPath = record.detail.artifacts.report;
     const onActivity = (activity: string, toolName?: string) => {
       record.detail.lastActivityAt = Date.now();
       record.detail.currentActivity = activity;
       record.detail.currentTool = toolName;
-      this.controlPlane.updateTaskControl(record.detail.taskId, {
-        currentActivity: activity,
-        currentTool: toolName ?? null,
-      });
       this.emit(record);
     };
 
@@ -567,10 +489,7 @@ export class SubagentRuntime implements TaskService {
         onActivity("creating worktree");
         record.detail.workspace = manager.create(record.detail.taskId, this.rootSessionId);
         taskWorkingDir = record.detail.workspace.path;
-        this.artifacts.updateTask(record.detail);
-        this.controlPlane.updateTaskControl(record.detail.taskId, {
-          worktreePath: record.detail.workspace.path,
-        });
+        this.persistRecord(record);
       }
       output = await this.raceAbort(this.runner.run({
         rootSessionId: this.rootSessionId,
@@ -584,9 +503,10 @@ export class SubagentRuntime implements TaskService {
             ? [
                 "",
                 "Recovery instructions:",
-                `This is attempt ${record.attempt}. Read the existing report at ${record.detail.artifacts.report}.`,
+                `This is recovery attempt ${record.attempt}. You MUST Read the existing report at ${reportPath} before doing anything else.`,
+                "Use ## Plan to see unchecked work and ## Report for conclusions already written.",
+                "Continue from the first unchecked Plan item. Do not replay checked steps or clear existing Report text.",
                 "Inspect the current workspace and Git state before acting. Do not replay a tool call merely because the prior attempt ended mid-operation.",
-                "Continue remaining work and explicitly correct any stale conclusion in the report.",
               ]
             : []),
           ...(record.detail.scope?.length
@@ -613,10 +533,15 @@ export class SubagentRuntime implements TaskService {
         coverageRequired: input.coverage === "exhaustive",
         abortSignal: record.controller.signal,
         trace: this.trace,
-        appendReport: (content) => this.artifacts.appendReportAt(record.detail.artifacts.report, content),
+        appendReport: (content) => this.artifacts.appendReportAt(reportPath, content),
         registerReportFlusher: (flush) => { flushReport = flush; },
         onActivity,
         mode: input.mode,
+        reportPath,
+        writableWorkspace: record.writer,
+        editReport: (oldString, newString, replaceAll) =>
+          this.artifacts.editReport(reportPath, oldString, newString, replaceAll),
+        takePlanReminder: () => this.artifacts.takePlanReminder(reportPath),
       }), record.controller.signal);
     } catch (error) {
       output = {
@@ -628,29 +553,20 @@ export class SubagentRuntime implements TaskService {
       };
     } finally {
       clearTimeout(timer);
-      clearInterval(heartbeat);
       record.accumulatedRuntimeMs += Math.max(0, Date.now() - attemptStartedAt);
-      this.controlPlane.heartbeatTask(
-        record.detail.taskId,
-        this.workerId,
-        record.accumulatedRuntimeMs,
-      );
+      this.persistRecord(record);
     }
 
     if (record.pauseRequested) {
       flushReport();
       this.artifacts.appendReportAt(
-        record.detail.artifacts.report,
+        reportPath,
         "\n\n<!-- Rubato process paused this task; a later attempt will continue from this report. -->\n\n",
       );
       record.detail.status = "queued";
       record.detail.currentActivity = "paused";
       record.detail.currentTool = undefined;
-      this.controlPlane.pauseTask(
-        record.detail.taskId,
-        this.workerId,
-        record.accumulatedRuntimeMs,
-      );
+      this.persistRecord(record);
       if (record.currentAttemptRunId) {
         this.trace.append({
           type: "task_attempt_paused",
@@ -660,13 +576,12 @@ export class SubagentRuntime implements TaskService {
           agentId: record.detail.agentId,
           accumulatedRuntimeMs: record.accumulatedRuntimeMs,
         });
-        this.controlPlane.finishRun(record.currentAttemptRunId, "failed", {
-          failureKind: "interrupted",
-        });
       }
       this.emit(record);
       return;
     }
+
+    if (!output) return;
 
     if (record.detail.workspace && manager) {
       try {
@@ -704,18 +619,6 @@ export class SubagentRuntime implements TaskService {
     }
     flushReport();
     this.finish(record, output, workspaceResult);
-    if (record.currentAttemptRunId) {
-      this.controlPlane.finishRun(
-        record.currentAttemptRunId,
-        output.status === "finished" ? "finished" : "failed",
-        {
-          failureKind: output.failureKind,
-          inputTokens: output.usage.inputTokens,
-          outputTokens: output.usage.outputTokens,
-          toolCalls: output.usage.toolCalls,
-        },
-      );
-    }
   }
 
   private finish(
@@ -777,11 +680,6 @@ export class SubagentRuntime implements TaskService {
       coverage: input.coverage,
       isolation: input.isolation,
     });
-    this.controlPlane.upsertTask(record.detail, {
-      conversationId: this.rootSessionId,
-      originRunId: this.originRunId,
-      timeoutMs: input.timeout_ms,
-    });
     this.artifacts.appendReport(record.detail.taskId, `\nTask rejected: ${reason}\n`);
     this.finishWithoutRun(record, "runtime_error", reason);
     return { task: { ...record.detail } };
@@ -803,13 +701,7 @@ export class SubagentRuntime implements TaskService {
     record.detail.currentTool = undefined;
     record.detail.lastActivityAt = Date.now();
     if (next === "running") {
-      this.controlPlane.updateTaskControl(record.detail.taskId, {
-        status: "running",
-        attempt: record.attempt,
-        currentActivity: activity,
-        currentTool: null,
-        startedAt: record.detail.startedAt ?? null,
-      });
+      this.persistRecord(record);
       this.trace.append({
         type: "task_started",
         sessionId: this.rootSessionId,
@@ -830,16 +722,7 @@ export class SubagentRuntime implements TaskService {
       `\n\n<!-- Subagent ${next}${result.error ? `: ${result.error.replace(/-->/g, "--&gt;")}` : ""} -->\n`,
     );
     this.artifacts.finalizeTask(record.detail, result, coverage);
-    this.controlPlane.updateTaskControl(record.detail.taskId, {
-      status: next,
-      accumulatedRuntimeMs: record.accumulatedRuntimeMs,
-      leaseOwner: null,
-      leaseExpiresAt: null,
-      currentActivity: next,
-      currentTool: null,
-      failureKind: result.failureKind ?? null,
-      endedAt: result.endedAt,
-    });
+    this.persistRecord(record);
     this.trace.append({
       type: "task_terminal",
       sessionId: this.rootSessionId,
@@ -856,6 +739,20 @@ export class SubagentRuntime implements TaskService {
       record.terminalDelivered = true;
     }
     void this.trace.flush();
+  }
+
+  private persistRecord(record: TaskRecord): void {
+    this.artifacts.updateTask(record.detail, {
+      timeoutMs: record.timeoutMs,
+      accumulatedRuntimeMs: record.accumulatedRuntimeMs,
+      attempt: record.attempt,
+      status: record.detail.status,
+      startedAt: record.detail.startedAt,
+      endedAt: record.detail.endedAt,
+      currentActivity: record.detail.currentActivity,
+      currentTool: record.detail.currentTool,
+      failureKind: record.detail.failureKind,
+    });
   }
 
   private async acquireWriteSlot(signal: AbortSignal): Promise<() => void> {

@@ -179,38 +179,12 @@ export async function* agentLoop(
   const assistantDraft = persistConversation
     ? new AssistantDraftWriter(projectHash, sessionId)
     : undefined;
-  let rootLeaseHeartbeat: ReturnType<typeof setInterval> | undefined;
   const recordUserMessage = (content: string): void => {
-    const stored = sessionStore.writeMessage({ role: "user", content });
-    if (stored && rootRuntime) {
-      rootRuntime.controlPlane.createUserMessageEvent(
-        conversationId,
-        stored.event_id,
-        sessionId,
-        stored.timestamp,
-      );
-    }
+    sessionStore.writeMessage({ role: "user", content });
   };
   if (persistConversation) {
     sessionStore.init();
     recordUserMessage(prompt);
-    rootRuntime?.controlPlane.createRun({
-      runId: sessionId,
-      conversationId,
-      kind: "root",
-      trigger: options.runTrigger ?? (options.resumeSummary ? "resume" : "user_message"),
-      provider: config.model.provider,
-      model: config.model.model,
-      sessionPath: sessionStore.getFilePath(),
-      tracePath: rootRuntime.trace.path,
-      draftPath: assistantDraft?.filePath,
-    });
-    if (rootRuntime) {
-      rootLeaseHeartbeat = setInterval(() => {
-        rootRuntime.controlPlane.heartbeatRun(sessionId);
-      }, 5_000);
-      rootLeaseHeartbeat.unref();
-    }
   }
   let sessionMeta = createSessionMeta(
     sessionId,
@@ -218,9 +192,6 @@ export async function* agentLoop(
     undefined,
     { firstMessage: prompt.slice(0, 200) },
   );
-  let rootInputTokens = 0;
-  let rootOutputTokens = 0;
-  let rootToolCalls = 0;
 
   const delegationGate = isRootProfile
     ? new RootDelegationGate(prompt)
@@ -450,6 +421,10 @@ export async function* agentLoop(
     }
 
     // ---- Execute turn via StepExecutor ----
+    const planReminder = ctx.taskRuntime?.takePlanReminder?.();
+    if (planReminder) {
+      messages.push({ role: "user", content: planReminder });
+    }
     let turnResult;
     const preTurnMessageCount = messages.length;
     try {
@@ -631,10 +606,7 @@ export async function* agentLoop(
     sessionMeta.messageCount = (sessionMeta.messageCount ?? 0) + 1;
     if (usage) {
       sessionMeta.totalTokens += usage.input + usage.output;
-      rootInputTokens += usage.input;
-      rootOutputTokens += usage.output;
     }
-    rootToolCalls += toolExecutions.length;
 
     yield {
       type: "turn_end",
@@ -848,20 +820,6 @@ export async function* agentLoop(
     usage: { totalTokens: sessionMeta.totalTokens },
   });
   assistantDraft?.flush();
-  if (rootLeaseHeartbeat) clearInterval(rootLeaseHeartbeat);
-  rootRuntime?.controlPlane.finishRun(
-    sessionId,
-    new Set(["circuit_breaker", "max_retries", "stream_failed", "user_interrupt"])
-      .has(doneReason ?? "")
-      ? "failed"
-      : "finished",
-    {
-      failureKind: doneReason ?? undefined,
-      inputTokens: rootInputTokens,
-      outputTokens: rootOutputTokens,
-      toolCalls: rootToolCalls,
-    },
-  );
   await rootRuntime?.trace.flush();
   yield { type: "done", reason: doneReason };
 }
@@ -894,7 +852,7 @@ export function formatSubagentStatus(
       `  report: ${task.reportPath}`,
       ...(task.failureKind ? [`  failure_kind: ${task.failureKind}`] : []),
     ].join("\n")),
-    "Use Grep first and then a targeted Read when a report is relevant. Do not infer its contents from status or path.",
+    "Use Grep first on ## Report, then a targeted Read, when a report is relevant. Do not treat ## Plan as the deliverable.",
   ].join("\n");
 }
 

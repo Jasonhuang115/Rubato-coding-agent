@@ -4,7 +4,7 @@ import fs from "fs";
 import { createTwoFilesPatch } from "diff";
 import type { ToolDefinition } from "../shared/core-types.js";
 import { enforceReadGuard } from "./registry.js";
-import { resolveToolPath } from "./path-utils.js";
+import { resolveToolPath, isSameToolPath } from "./path-utils.js";
 
 export const editTool: ToolDefinition = {
   name: "Edit",
@@ -48,6 +48,37 @@ export const editTool: ToolDefinition = {
         content: "Error: old_string and new_string must be different",
         isError: true,
       };
+    }
+
+    if (ctx.taskRuntime?.reportPath && isSameToolPath(filePath, ctx.taskRuntime.reportPath)) {
+      const guard = enforceReadGuard(filePath, ctx);
+      if (!guard.allowed) {
+        return { content: guard.reason, isError: true };
+      }
+      if (!ctx.taskRuntime.editReport) {
+        return {
+          content: `Error: can only Edit the current task report.md: ${ctx.taskRuntime.reportPath}`,
+          isError: true,
+        };
+      }
+      try {
+        const { before, after } = ctx.taskRuntime.editReport(oldString, newString, replaceAll);
+        ctx.readGuard.markAsRead(filePath, after);
+        const patch = createTwoFilesPatch(
+          filePath,
+          filePath,
+          before,
+          after,
+          "before",
+          "after",
+        );
+        return {
+          content: `File edited: ${filePath} (report.md)\n\n${patch}`,
+        };
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        return { content: `Error editing file: ${message}`, isError: true };
+      }
     }
 
     // ReadGuard check

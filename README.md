@@ -208,19 +208,19 @@ MCP server 提供的工具会动态追加，并以 `mcp:<server>:<tool>` 命名�
 
 session 事件以 JSONL 追加，并通过 `seq`、`prev_hash`、`hash` 形成 hash chain。`-c`、`-r` 和 `/sessions resume` 从会话摘要、目标和关键事件组装紧凑恢复上下文。
 
-### 轻量 SQLite 控制面
+### 会话、任务与续跑
 
-Rubato 在每个项目的 `~/.rubato/projects/<project-sha256>/state.sqlite3` 保存轻量 Runtime 控制状态。SQLite 只索引 conversation、Root/Subagent run、任务 lease、timeout、状态和终态唤醒事件，不保存 prompt、回答、thinking、tool input/output 或报告正文。
+根会话继续写入 hash-chained session JSONL，并由 `session-catalog.tsv` 列出；`-c`、`-r` 和 `/sessions resume` 从会话摘要恢复。正在生成的根回复写入 run 目录的 `assistant-draft.md`。
 
-内容仍按用途留在文件系统：根会话写入 hash-chained session JSONL，正在生成的根回复写入 run 目录的 `assistant-draft.md`，Subagent 增量工作日志写入各自的 `report.md`，任务规格与终态结果写入 JSON artifact。进程重启后，Runtime 使用 SQLite lease 防止重复 claim，并以 `task.json + report.md + worktree` 创建新 attempt；已消耗的实际运行时间会从 timeout 中扣除。
+Subagent 续跑只靠文件系统：每个任务目录里的 `task.json`（规格、已消耗时长、attempt）和 `report.md`（`## Plan` 待办 + `## Report` 正文）。进程重启后 Runtime 扫描未写出 `result.json` 的任务，拉起新 attempt；已消耗的实际运行时间会从 timeout 中扣除。调度、lease 和根 run 互斥留在单进程内存里。终态叫醒根 Agent 靠 `result.json`；投递后在任务目录写入 `notified` 标记，避免重复叫醒。
 
-启动 reconcile 会补齐“文件已终态但数据库未更新”或“终态事件尚未投递”的状态。若数据库引用的必要 artifact 缺失，任务会明确转为 `failed/runtime_error`；session JSONL 最后的未完成半行会在恢复时丢弃，之前通过 hash chain 验证的记录保留。
+正文（prompt、回答、thinking、tool I/O、报告）不进任何数据库。以后若要跨对话检索，可以再加索引。
 
 ### Opik Trace（可选）
 
 本地 `trace.jsonl` 始终是 trace 的耐久来源。设置 `OPIK_ENABLED=true` 后，Rubato 额外把每个 Root run 和 Subagent attempt 映射为 Opik trace，把模型轮次和工具调用映射为 span；`conversation_id` 用作 Opik thread ID。远端上报不会包含 thinking/private reasoning，大文本只发送 hash、长度和短 preview，Opik 不可达也不会改变 Agent 或任务状态。
 
-可在 `.env` 配置 `OPIK_API_KEY`、`OPIK_WORKSPACE`、`OPIK_PROJECT_NAME`，自托管实例另设 `OPIK_URL_OVERRIDE`。每次 flush 的导出 sequence 只作为 SQLite 索引；重启时会从本地 trace JSONL 重放尚未导出的事件。
+可在 `.env` 配置 `OPIK_API_KEY`、`OPIK_WORKSPACE`、`OPIK_PROJECT_NAME`，自托管实例另设 `OPIK_URL_OVERRIDE`。每次 flush 的导出 sequence 写在 `trace.jsonl` 旁的 `opik-exported-seq.json`；重启时会从本地 trace JSONL 重放尚未导出的事件。
 
 ### Skill 与 MCP 扩展
 
@@ -461,7 +461,7 @@ Rubato 区分短期、中期和长期记忆。短期记忆属于上下文工程�
         └── tasks/<task-id>/...
 ```
 
-升级时旧 `~/.rubato/memory/` 数据会直接清除，不迁移或总结；session、run、task、trace 和 control-plane 数据不受影响。
+升级时旧 `~/.rubato/memory/` 数据会直接清除，不迁移或总结；session、run、task 和 trace 数据不受影响。
 
 ## 6. Git 相关操作
 
